@@ -226,11 +226,15 @@ export class MCPLModule implements Module {
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    // We don't process events directly — we push ExternalMessageEvents
-    // from the MCPL request handler. But we can handle custom events if needed.
     if (event.type === 'external-message' && event.source === this.name) {
-      // Our own push events — request inference
-      return { requestInference: true };
+      return {
+        addMessages: [{
+          participant: 'user',
+          content: [{ type: 'text', text: String(event.content) }],
+          metadata: event.metadata,
+        }],
+        requestInference: true,
+      };
     }
     return {};
   }
