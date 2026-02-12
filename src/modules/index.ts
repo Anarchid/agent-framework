@@ -21,7 +21,13 @@ export type {
 } from './files/index.js';
 
 export { MCPLModule } from './mcpl/index.js';
-export type { MCPLModuleConfig, McplClientConfig, ServerInfo } from './mcpl/index.js';
+export type {
+  MCPLModuleConfig,
+  McplClientConfig,
+  McplTcpConfig,
+  McplSpawnConfig,
+  ServerInfo,
+} from './mcpl/index.js';
 
 export { DiscordModule, DiscordJsClient } from './discord/index.js';
 export type { DiscordJsClientConfig } from './discord/index.js';

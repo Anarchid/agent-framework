@@ -10,14 +10,20 @@ import type {
   ToolResult,
   SpeechContext,
 } from '../../types/index.js';
-import { McplClient, type McplClientConfig, type ServerInfo } from './mcpl-client.js';
+import {
+  McplClient,
+  type McplClientConfig,
+  type McplTcpConfig,
+  type McplSpawnConfig,
+  type ServerInfo,
+} from './mcpl-client.js';
 
-export interface MCPLModuleConfig extends McplClientConfig {
+export type MCPLModuleConfig = McplClientConfig & {
   /** Module name for tool namespacing (e.g., "zk") */
   name: string;
   /** Which feature sets to enable (optional — enables all by default) */
   featureSets?: Record<string, boolean>;
-}
+};
 
 interface MCPLModuleState {
   serverInfo: ServerInfo | null;
@@ -31,6 +37,7 @@ interface ChannelInfo {
   type: string;
   label: string;
   direction: string;
+  address?: unknown;
   metadata?: unknown;
 }
 
@@ -58,6 +65,9 @@ export class MCPLModule implements Module {
   };
   /** Most recent incoming channel ID — used as default publish target for agent speech. */
   private defaultPublishChannel: string | null = null;
+  /** Typing indicator loop — sends periodic typing notifications while inference runs. */
+  private typingTimer: ReturnType<typeof setTimeout> | null = null;
+  private typingChannel: string | null = null;
 
   constructor(private config: MCPLModuleConfig) {
     this.name = config.name;
@@ -73,6 +83,9 @@ export class MCPLModule implements Module {
       this.state = saved;
     }
 
+    // Register as speech handler so onAgentSpeech gets called
+    ctx.registerSpeechHandler('*');
+
     // Set up event handlers for incoming MCPL messages
     this.client.on('request', (msg: { id: number | string; method: string; params: unknown }) => {
       this.handleIncomingRequest(msg.id, msg.method, msg.params).catch((err) => {
@@ -84,6 +97,10 @@ export class MCPLModule implements Module {
       this.handleIncomingNotification(msg.method, msg.params);
     });
 
+    this.client.on('connected', (serverInfo: ServerInfo) => {
+      this.onConnected(serverInfo);
+    });
+
     this.client.on('disconnected', () => {
       console.log(`[${this.name}] MCPL server disconnected`);
     });
@@ -92,44 +109,22 @@ export class MCPLModule implements Module {
       console.error(`[${this.name}] MCPL connection error:`, err.message);
     });
 
-    // Connect to MCPL server
+    // Connect to MCPL server — with reconnect enabled this won't block
+    // if the server isn't available yet; it resolves immediately and
+    // retries in the background, emitting 'connected' when successful.
     try {
       const serverInfo = await this.client.connect();
-      this.state.serverInfo = serverInfo;
-      console.log(
-        `[${this.name}] Connected to MCPL server: ${serverInfo.name} v${serverInfo.version}`,
-      );
-
-      // Fetch available tools
-      await this.refreshTools();
-
-      // Store feature sets from server capabilities
-      if (serverInfo.capabilities.featureSets) {
-        this.state.featureSets = serverInfo.capabilities.featureSets.map((fs) => fs.name);
-
-        // Send featureSets/update to enable requested sets
-        if (this.config.featureSets) {
-          const enabled = Object.entries(this.config.featureSets)
-            .filter(([, v]) => v)
-            .map(([k]) => k);
-          const disabled = Object.entries(this.config.featureSets)
-            .filter(([, v]) => !v)
-            .map(([k]) => k);
-
-          this.client.sendNotification('featureSets/update', {
-            enabled: enabled.length > 0 ? enabled : undefined,
-            disabled: disabled.length > 0 ? disabled : undefined,
-          });
-        }
+      // serverInfo is null if initial connect failed but reconnect is scheduled
+      if (!serverInfo) {
+        console.log(`[${this.name}] MCPL server not available, will retry in background...`);
       }
-
-      ctx.setState(this.state);
     } catch (err) {
       console.error(`[${this.name}] Failed to connect to MCPL server:`, err);
     }
   }
 
   async stop(): Promise<void> {
+    this.stopTyping();
     await this.client.disconnect();
   }
 
@@ -245,6 +240,9 @@ export class MCPLModule implements Module {
     content: ContentBlock[],
     context: SpeechContext,
   ): Promise<void> {
+    // Stop typing indicator — speech is being delivered
+    this.stopTyping();
+
     // If server supports stream observation, forward agent speech
     if (this.state.serverInfo?.capabilities.streamObserver) {
       const streamId = `speech_${agentName}_${Date.now()}`;
@@ -276,6 +274,39 @@ export class MCPLModule implements Module {
         }
       }
     }
+  }
+
+  private async onConnected(serverInfo: ServerInfo): Promise<void> {
+    this.state.serverInfo = serverInfo;
+    console.log(
+      `[${this.name}] Connected to MCPL server: ${serverInfo.name} v${serverInfo.version}`,
+    );
+
+    try {
+      await this.refreshTools();
+    } catch (err) {
+      console.error(`[${this.name}] Failed to fetch tools:`, err);
+    }
+
+    if (serverInfo.capabilities.featureSets) {
+      this.state.featureSets = serverInfo.capabilities.featureSets.map((fs) => fs.name);
+
+      if (this.config.featureSets) {
+        const enabled = Object.entries(this.config.featureSets)
+          .filter(([, v]) => v)
+          .map(([k]) => k);
+        const disabled = Object.entries(this.config.featureSets)
+          .filter(([, v]) => !v)
+          .map(([k]) => k);
+
+        this.client.sendNotification('featureSets/update', {
+          enabled: enabled.length > 0 ? enabled : undefined,
+          disabled: disabled.length > 0 ? disabled : undefined,
+        });
+      }
+    }
+
+    this.ctx?.setState(this.state);
   }
 
   // ── Private: MCPL incoming message handlers ──
@@ -320,6 +351,14 @@ export class MCPLModule implements Module {
         }
         this.ctx?.setState(this.state);
         this.client.sendResponse(id, {});
+
+        // Auto-open registered channels so messages arrive via channels/incoming
+        // rather than push/event — this enables speech-to-channel routing.
+        for (const ch of channels) {
+          this.autoOpenChannel(ch).catch((err) => {
+            console.error(`[${this.name}] Failed to auto-open channel ${ch.id}:`, (err as Error).message);
+          });
+        }
         break;
       }
 
@@ -357,9 +396,11 @@ export class MCPLModule implements Module {
           results.push({ messageId: msg.messageId, accepted: true });
         }
 
-        // Track the most recent incoming channel for speech routing
+        // Track the most recent incoming channel for speech routing + typing
         if (messages.length > 0) {
-          this.defaultPublishChannel = messages[messages.length - 1].channelId;
+          const channelId = messages[messages.length - 1].channelId;
+          this.defaultPublishChannel = channelId;
+          this.startTyping(channelId);
         }
 
         this.client.sendResponse(id, { results });
@@ -458,6 +499,36 @@ export class MCPLModule implements Module {
         isError: true,
       };
     }
+  }
+
+  private startTyping(channelId: string): void {
+    this.stopTyping();
+    this.typingChannel = channelId;
+    const sendTyping = () => {
+      if (this.typingChannel !== channelId) return;
+      this.client.sendNotification('notifications/typing', { channelId });
+      // Discord typing lasts ~10s, re-send every 7s
+      this.typingTimer = setTimeout(sendTyping, 7000);
+    };
+    sendTyping();
+  }
+
+  private stopTyping(): void {
+    if (this.typingTimer) {
+      clearTimeout(this.typingTimer);
+      this.typingTimer = null;
+    }
+    this.typingChannel = null;
+  }
+
+  private async autoOpenChannel(ch: ChannelInfo): Promise<void> {
+    const result = (await this.client.sendRequest('channels/open', {
+      type: ch.type,
+      address: ch.address,
+    })) as { channel: ChannelInfo };
+    this.state.channels[result.channel.id] = result.channel;
+    this.ctx?.setState(this.state);
+    console.log(`[${this.name}] Auto-opened channel: ${result.channel.id} (${result.channel.label})`);
   }
 
   private async handleChannelOpen(input: Record<string, unknown>): Promise<ToolResult> {
@@ -585,4 +656,4 @@ export class MCPLModule implements Module {
   }
 }
 
-export type { McplClientConfig, ServerInfo };
+export type { McplClientConfig, McplTcpConfig, McplSpawnConfig, ServerInfo };

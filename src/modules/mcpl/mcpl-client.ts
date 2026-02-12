@@ -1,11 +1,33 @@
 import * as net from 'node:net';
+import { spawn, type ChildProcess } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 
-export interface McplClientConfig {
+/** TCP connection config. */
+export interface McplTcpConfig {
   host: string;
   port: number;
+}
+
+/** Spawn a child process and communicate over stdio. */
+export interface McplSpawnConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+export type McplClientConfig = (McplTcpConfig | McplSpawnConfig) & {
   reconnect?: boolean;
   reconnectInterval?: number;
+};
+
+function isTcpConfig(config: McplClientConfig): config is McplTcpConfig & McplClientConfig {
+  return 'host' in config && 'port' in config;
+}
+
+function isSpawnConfig(config: McplClientConfig): config is McplSpawnConfig & McplClientConfig {
+  return 'command' in config;
 }
 
 interface PendingRequest {
@@ -68,9 +90,16 @@ export interface ServerInfo {
 }
 
 /**
- * MCPL client — JSON-RPC 2.0 over TCP with newline-delimited framing.
+ * MCPL client — JSON-RPC 2.0 with newline-delimited framing.
+ *
+ * Supports two transports:
+ *   - TCP: connect to an existing server at host:port
+ *   - Spawn: start a child process, communicate over stdin/stdout
  */
 export class McplClient extends EventEmitter {
+  private readable: Readable | null = null;
+  private writable: Writable | null = null;
+  private child: ChildProcess | null = null;
   private socket: net.Socket | null = null;
   private buffer = '';
   private nextId = 1;
@@ -91,19 +120,105 @@ export class McplClient extends EventEmitter {
   }
 
   async connect(): Promise<ServerInfo> {
+    if (isSpawnConfig(this.config)) {
+      return this.connectSpawn();
+    } else if (isTcpConfig(this.config)) {
+      return this.connectTcp();
+    }
+    throw new Error('McplClientConfig must specify either host+port (TCP) or command (spawn)');
+  }
+
+  private async connectSpawn(): Promise<ServerInfo> {
+    const cfg = this.config as McplSpawnConfig & McplClientConfig;
+
+    const child = spawn(cfg.command, cfg.args ?? [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...cfg.env },
+      cwd: cfg.cwd,
+    });
+
+    this.child = child;
+
+    // Forward stderr for diagnostics
+    child.stderr?.setEncoding('utf-8');
+    child.stderr?.on('data', (data: string) => {
+      for (const line of data.split('\n')) {
+        if (line.trim()) {
+          console.error(`[mcpl:child] ${line}`);
+        }
+      }
+    });
+
+    child.on('error', (err) => {
+      this.emit('error', err);
+    });
+
+    child.on('exit', (code, signal) => {
+      this.connected = false;
+      this.child = null;
+      this.readable = null;
+      this.writable = null;
+      this.emit('disconnected');
+      this.rejectAllPending('Child process exited');
+
+      if (this.config.reconnect) {
+        console.error(`[mcpl] Child exited (code=${code}, signal=${signal}), respawning...`);
+        this.scheduleReconnect();
+      }
+    });
+
+    this.readable = child.stdout!;
+    this.writable = child.stdin!;
+
+    this.readable.setEncoding('utf-8');
+    this.readable.on('data', (data: string) => {
+      this.buffer += data;
+      this.processBuffer();
+    });
+
+    this.connected = true;
+
+    try {
+      const info = await this.initialize();
+      this.serverInfo = info;
+      this.emit('connected', info);
+      return info;
+    } catch (err) {
+      this.connected = false;
+      child.kill();
+      this.child = null;
+      throw err;
+    }
+  }
+
+  private async connectTcp(): Promise<ServerInfo> {
+    const cfg = this.config as McplTcpConfig & McplClientConfig;
+
     return new Promise((resolve, reject) => {
+      let resolved = false;
+
       const socket = net.createConnection(
-        { host: this.config.host, port: this.config.port },
+        { host: cfg.host, port: cfg.port },
         async () => {
           this.socket = socket;
+          this.readable = socket;
+          this.writable = socket;
           this.connected = true;
 
           try {
             const info = await this.initialize();
             this.serverInfo = info;
-            resolve(info);
+            this.emit('connected', info);
+            if (!resolved) {
+              resolved = true;
+              resolve(info);
+            }
           } catch (err) {
-            reject(err);
+            socket.destroy();
+            if (!resolved && !this.config.reconnect) {
+              resolved = true;
+              reject(err as Error);
+            }
           }
         },
       );
@@ -116,41 +231,60 @@ export class McplClient extends EventEmitter {
       });
 
       socket.on('error', (err) => {
+        if (!this.connected && this.config.reconnect && !resolved) {
+          // Initial connection failed — resolve start() so the module isn't blocked,
+          // then retry in the background.
+          resolved = true;
+          resolve(null as unknown as ServerInfo);
+          this.scheduleReconnect();
+          return;
+        }
         this.emit('error', err);
-        if (!this.connected) {
+        if (!this.connected && !resolved) {
+          resolved = true;
           reject(err);
         }
       });
 
       socket.on('close', () => {
         this.connected = false;
+        this.socket = null;
+        this.readable = null;
+        this.writable = null;
         this.emit('disconnected');
-        // Reject all pending requests
-        for (const [key, pending] of this.pending) {
-          pending.reject(new Error('Connection closed'));
-          this.pending.delete(key);
-        }
+        this.rejectAllPending('Connection closed');
         if (this.config.reconnect) {
-          setTimeout(() => {
-            this.connect().catch((err) => this.emit('error', err));
-          }, this.config.reconnectInterval ?? 5000);
+          this.scheduleReconnect();
         }
       });
     });
   }
 
+  private scheduleReconnect(): void {
+    const interval = this.config.reconnectInterval ?? 5000;
+    setTimeout(() => {
+      this.connect().catch((err) => this.emit('error', err));
+    }, interval);
+  }
+
   async disconnect(): Promise<void> {
     this.config.reconnect = false;
+    if (this.child) {
+      this.child.kill();
+      this.child = null;
+    }
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
+    this.readable = null;
+    this.writable = null;
     this.connected = false;
   }
 
   /** Send a JSON-RPC request and wait for the response. */
   async sendRequest(method: string, params?: unknown): Promise<unknown> {
-    if (!this.socket || !this.connected) {
+    if (!this.writable || !this.connected) {
       throw new Error('Not connected');
     }
 
@@ -165,21 +299,21 @@ export class McplClient extends EventEmitter {
 
   /** Send a JSON-RPC notification (no response expected). */
   sendNotification(method: string, params?: unknown): void {
-    if (!this.socket || !this.connected) return;
+    if (!this.writable || !this.connected) return;
     const msg: JsonRpcNotification = { jsonrpc: '2.0', method, params };
     this.writeLine(JSON.stringify(msg));
   }
 
   /** Send a JSON-RPC response (answering an incoming request). */
   sendResponse(id: JsonRpcId, result: unknown): void {
-    if (!this.socket || !this.connected) return;
+    if (!this.writable || !this.connected) return;
     const msg: JsonRpcResponse = { jsonrpc: '2.0', id, result };
     this.writeLine(JSON.stringify(msg));
   }
 
   /** Send a JSON-RPC error response. */
   sendErrorResponse(id: JsonRpcId, code: number, message: string): void {
-    if (!this.socket || !this.connected) return;
+    if (!this.writable || !this.connected) return;
     const msg: JsonRpcResponse = {
       jsonrpc: '2.0',
       id,
@@ -223,7 +357,7 @@ export class McplClient extends EventEmitter {
   }
 
   private writeLine(json: string): void {
-    this.socket?.write(json + '\n');
+    this.writable?.write(json + '\n');
   }
 
   private processBuffer(): void {
@@ -278,6 +412,13 @@ export class McplClient extends EventEmitter {
         method: msg.method as string,
         params: msg.params ?? {},
       });
+    }
+  }
+
+  private rejectAllPending(reason: string): void {
+    for (const [key, pending] of this.pending) {
+      pending.reject(new Error(reason));
+      this.pending.delete(key);
     }
   }
 }
