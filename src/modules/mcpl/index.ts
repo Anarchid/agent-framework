@@ -590,10 +590,12 @@ export class MCPLModule implements Module {
 
   private async handleChannelPublish(input: Record<string, unknown>): Promise<ToolResult> {
     try {
+      // Stringify text if the model passed a JSON object instead of a string
+      const text = typeof input.text === 'string' ? input.text : JSON.stringify(input.text);
       const result = (await this.client.sendRequest('channels/publish', {
         conversationId: 'default',
         channelId: input.channelId,
-        content: [{ type: 'text', text: input.text }],
+        content: [{ type: 'text', text }],
       })) as { delivered: boolean; messageId?: string; error?: string };
 
       if (result.delivered) {
