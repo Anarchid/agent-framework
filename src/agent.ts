@@ -103,7 +103,8 @@ export class Agent {
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
 
     // Build request
-    const messages = await this.contextManager.compile(budget);
+    const compiled = await this.contextManager.compile(budget);
+    const messages = [...compiled.messages];
 
     // If we have pending tool results, add them
     if (this._state.status === 'ready') {
@@ -197,10 +198,10 @@ export class Agent {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
-    const messages = await this.contextManager.compile(budget);
+    const compiled = await this.contextManager.compile(budget);
 
     const request: NormalizedRequest = {
-      messages,
+      messages: compiled.messages,
       system: this.systemPrompt,
       config: {
         model: this.model,
