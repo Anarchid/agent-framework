@@ -705,6 +705,16 @@ export class AgentFramework {
       await this.applyProcessResponse(response, event, moduleName);
     }
 
+    // Handle inference-request events — directly queue inference
+    if (event.type === 'inference-request') {
+      this.pendingRequests.push({
+        agentName: event.agentName,
+        reason: event.reason,
+        source: event.source,
+        timestamp: Date.now(),
+      });
+    }
+
     // Handle tool results specially
     if (event.type === 'tool-result') {
       const agent = this.agents.get(event.agentName);

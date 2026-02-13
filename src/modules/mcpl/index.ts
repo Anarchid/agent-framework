@@ -236,7 +236,10 @@ export class MCPLModule implements Module {
           content: [{ type: 'text', text: String(event.content) }],
           metadata: event.metadata,
         }],
-        requestInference: true,
+        // Respect the triggerInference flag set by shouldTriggerInference callback.
+        // Messages are always added to context; inference is only requested when
+        // the flag is not explicitly false.
+        requestInference: event.triggerInference !== false,
       };
     }
     return {};
