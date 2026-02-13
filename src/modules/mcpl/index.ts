@@ -594,13 +594,14 @@ export class MCPLModule implements Module {
         conversationId: 'default',
         channelId: input.channelId,
         content: [{ type: 'text', text: input.text }],
-      })) as { delivered: boolean; messageId?: string };
+      })) as { delivered: boolean; messageId?: string; error?: string };
 
+      if (result.delivered) {
+        return { success: true, data: `Delivered (${result.messageId ?? 'ok'})` };
+      }
       return {
-        success: true,
-        data: result.delivered
-          ? `Delivered (${result.messageId ?? 'ok'})`
-          : 'Delivery failed',
+        success: false,
+        error: result.error ?? 'Delivery failed',
       };
     } catch (err) {
       return {
