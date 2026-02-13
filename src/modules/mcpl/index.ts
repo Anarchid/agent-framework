@@ -23,6 +23,9 @@ export type MCPLModuleConfig = McplClientConfig & {
   name: string;
   /** Which feature sets to enable (optional — enables all by default) */
   featureSets?: Record<string, boolean>;
+  /** Filter which incoming channel messages trigger inference.
+   *  Receives message text and metadata. Default: always true. */
+  shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
 };
 
 interface MCPLModuleState {
@@ -382,19 +385,23 @@ export class MCPLModule implements Module {
             .map((c) => (c.type === 'text' ? c.text : `[${c.type}]`))
             .join('\n');
 
+          const meta = {
+            mcplMethod: 'channels/incoming',
+            channelId: msg.channelId,
+            messageId: msg.messageId,
+            author: msg.author,
+            timestamp: msg.timestamp,
+            channelMetadata: msg.metadata,
+          };
+
           this.ctx?.pushEvent({
             type: 'external-message',
             source: this.name,
             content: `[channel:${msg.channelId}] ${msg.author.name}: ${text}`,
-            metadata: {
-              mcplMethod: 'channels/incoming',
-              channelId: msg.channelId,
-              messageId: msg.messageId,
-              author: msg.author,
-              timestamp: msg.timestamp,
-              channelMetadata: msg.metadata,
-            },
-            triggerInference: true,
+            metadata: meta,
+            triggerInference: this.config.shouldTriggerInference
+              ? this.config.shouldTriggerInference(text, meta)
+              : true,
           });
 
           results.push({ messageId: msg.messageId, accepted: true });
