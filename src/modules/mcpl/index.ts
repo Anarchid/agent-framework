@@ -1,4 +1,5 @@
 import type { ContentBlock } from 'membrane';
+import type { ContextInjection } from '@connectome/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -33,6 +34,7 @@ interface MCPLModuleState {
   tools: ToolDefinition[];
   channels: Record<string, ChannelInfo>;
   featureSets: string[];
+  enabledHuds: string[];
 }
 
 interface ChannelInfo {
@@ -65,6 +67,7 @@ export class MCPLModule implements Module {
     tools: [],
     channels: {},
     featureSets: [],
+    enabledHuds: [],
   };
   /** Most recent incoming channel ID — used as default publish target for agent speech. */
   private defaultPublishChannel: string | null = null;
@@ -185,6 +188,40 @@ export class MCPLModule implements Module {
       );
     }
 
+    // Add HUD overlay tools
+    tools.push(
+      {
+        name: 'hud_enable',
+        description: 'Enable a HUD overlay. Enabled HUDs are queried automatically before every inference and their compact summaries are injected into your context.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            name: { type: 'string', description: 'HUD source name (e.g. "economy", "roster", "intel", "threat", "squads")' },
+          },
+          required: ['name'],
+        },
+      },
+      {
+        name: 'hud_disable',
+        description: 'Disable a HUD overlay',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            name: { type: 'string', description: 'HUD source name to disable' },
+          },
+          required: ['name'],
+        },
+      },
+      {
+        name: 'hud_list',
+        description: 'List currently enabled HUD overlays',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {},
+        },
+      },
+    );
+
     // Add rollback tool if server supports it
     if (this.state.serverInfo?.capabilities.rollback) {
       tools.push({
@@ -205,13 +242,11 @@ export class MCPLModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    const toolName = call.name.includes(':')
-      ? call.name.split(':').slice(1).join(':')
-      : call.name;
+    // call.name is already un-prefixed by the module registry (e.g. "economy:snapshot", not "zk:economy:snapshot")
     const input = call.input as Record<string, unknown>;
 
-    // Handle synthesized channel/rollback tools
-    switch (toolName) {
+    // Handle synthesized channel/rollback/HUD tools
+    switch (call.name) {
       case 'channel_open':
         return this.handleChannelOpen(input);
       case 'channel_close':
@@ -222,9 +257,15 @@ export class MCPLModule implements Module {
         return this.handleChannelList();
       case 'rollback':
         return this.handleRollback(input);
+      case 'hud_enable':
+        return this.handleHudEnable(input);
+      case 'hud_disable':
+        return this.handleHudDisable(input);
+      case 'hud_list':
+        return this.handleHudList();
       default:
         // Forward to MCPL server as tools/call
-        return this.forwardToolCall(toolName, input);
+        return this.forwardToolCall(call.name, input);
     }
   }
 
@@ -479,6 +520,28 @@ export class MCPLModule implements Module {
         // Not needed in Phase 0
         break;
       }
+
+      case 'notifications/tools/list_changed': {
+        // Server's tool list changed (e.g. dynamic widget tools registered)
+        const oldToolNames = new Set(this.state.tools.map((t) => t.name));
+        this.refreshTools().then(() => {
+          // Compute what changed
+          const newTools = this.state.tools.filter((t) => !oldToolNames.has(t.name));
+          if (newTools.length > 0) {
+            const listing = newTools
+              .map((t) => `- ${this.name}:${t.name} — ${t.description}`)
+              .join('\n');
+            this.ctx?.pushEvent({
+              type: 'external-message',
+              source: this.name,
+              content: `New tools available:\n${listing}`,
+              metadata: { mcplMethod: 'notifications/tools/list_changed' },
+              triggerInference: false,
+            });
+          }
+        });
+        break;
+      }
     }
   }
 
@@ -654,6 +717,53 @@ export class MCPLModule implements Module {
         error: err instanceof Error ? err.message : String(err),
       };
     }
+  }
+
+  // ── HUD overlay handlers ──
+
+  private handleHudEnable(input: Record<string, unknown>): ToolResult {
+    const name = String(input.name);
+    if (!this.state.enabledHuds.includes(name)) {
+      this.state.enabledHuds.push(name);
+      this.ctx?.setState(this.state);
+    }
+    return { success: true, data: `HUD "${name}" enabled. Active HUDs: ${this.state.enabledHuds.join(', ')}` };
+  }
+
+  private handleHudDisable(input: Record<string, unknown>): ToolResult {
+    const name = String(input.name);
+    this.state.enabledHuds = this.state.enabledHuds.filter(h => h !== name);
+    this.ctx?.setState(this.state);
+    return { success: true, data: `HUD "${name}" disabled. Active HUDs: ${this.state.enabledHuds.join(', ') || 'none'}` };
+  }
+
+  private handleHudList(): ToolResult {
+    return { success: true, data: { enabledHuds: this.state.enabledHuds } };
+  }
+
+  async gatherContext(_agentName: string): Promise<ContextInjection[]> {
+    if (this.state.enabledHuds.length === 0) return [];
+
+    const results: { name: string; text: string }[] = [];
+    await Promise.all(this.state.enabledHuds.map(async (hudName) => {
+      try {
+        const result = await Promise.race([
+          this.forwardToolCall(`${hudName}:hud`, {}),
+          new Promise<ToolResult>((_, rej) => setTimeout(() => rej(new Error('hud timeout')), 3000)),
+        ]);
+        if (result.success && result.data) {
+          results.push({ name: hudName, text: String(result.data) });
+        }
+      } catch { /* skip failed HUDs */ }
+    }));
+
+    if (results.length === 0) return [];
+    const lines = results.map(r => `[${r.name}] ${r.text}`);
+    return [{
+      namespace: 'hud',
+      position: 'afterUser',
+      content: [{ type: 'text', text: `--- HUD ---\n${lines.join('\n')}\n--- /HUD ---` }],
+    }];
   }
 
   private async refreshTools(): Promise<void> {
