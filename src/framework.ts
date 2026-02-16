@@ -857,9 +857,10 @@ export class AgentFramework {
 
     try {
       const tools = this.moduleRegistry.getAllTools().filter((t) => agent.canUseTool(t.name));
-      const stream = await agent.startStream(tools);
+      const injections = await this.moduleRegistry.gatherContext(agent.name);
+      const { stream, request } = await agent.startStream(tools, undefined, injections);
 
-      const handle = this.driveStream(agent, stream, trigger, attempt);
+      const handle = this.driveStream(agent, stream, trigger, attempt, request);
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -885,7 +886,8 @@ export class AgentFramework {
     agent: Agent,
     stream: YieldingStream,
     trigger?: InferenceRequest,
-    attempt = 0
+    attempt = 0,
+    compiledRequest?: unknown
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -944,7 +946,7 @@ export class AgentFramework {
               agentName: agent.name,
               requestId,
               success: true,
-              request: { note: 'streaming request' },
+              request: compiledRequest,
               response: response.raw ?? { note: 'streaming response' },
               durationMs,
               tokenUsage,
@@ -989,7 +991,7 @@ export class AgentFramework {
               requestId,
               success: false,
               error: err.message,
-              request: { note: 'streaming request failed' },
+              request: compiledRequest,
               durationMs,
             });
 

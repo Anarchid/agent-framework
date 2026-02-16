@@ -5,6 +5,7 @@ import type {
   MessageQuery,
   MessageQueryResult,
   StoredMessage,
+  ContextInjection,
 } from '@connectome/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 
@@ -57,6 +58,13 @@ export interface Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void>;
+
+  /**
+   * Gather context injections before agent inference.
+   * Called before each inference to collect data (e.g., HUD overlays)
+   * that should be injected into the compiled context.
+   */
+  gatherContext?(agentName: string): Promise<ContextInjection[]>;
 }
 
 /**

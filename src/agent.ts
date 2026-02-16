@@ -1,5 +1,5 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from 'membrane';
-import type { ContextManager, TokenBudget } from '@connectome/context-manager';
+import type { ContextManager, TokenBudget, ContextInjection } from '@connectome/context-manager';
 import type {
   AgentConfig,
   AgentState,
@@ -188,17 +188,18 @@ export class Agent {
 
   /**
    * Start a yielding stream for inference.
-   * Returns the stream — the caller (framework) iterates it.
+   * Returns the stream and the compiled request (for logging/forensics).
    */
   async startStream(
     availableTools: ToolDefinition[],
-    budget?: TokenBudget
-  ): Promise<YieldingStream> {
+    budget?: TokenBudget,
+    injections?: ContextInjection[]
+  ): Promise<{ stream: YieldingStream; request: NormalizedRequest }> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
-    const compiled = await this.contextManager.compile(budget);
+    const compiled = await this.contextManager.compile(budget, injections);
 
     const request: NormalizedRequest = {
       messages: compiled.messages,
@@ -218,7 +219,7 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return stream;
+    return { stream, request };
   }
 
   /**
