@@ -304,19 +304,31 @@ export class MCPLModule implements Module {
       });
     }
 
-    // If there's a default publish channel, also publish speech there
+    // Publish speech to default channel
     if (this.defaultPublishChannel && this.state.channels[this.defaultPublishChannel]) {
       const text = content
         .filter((b) => b.type === 'text')
         .map((b) => (b as { type: 'text'; text: string }).text)
         .join('\n');
       if (text) {
+        const isGameChannel = this.defaultPublishChannel.startsWith('game:');
         try {
-          await this.client.sendRequest('channels/publish', {
-            conversationId: context.trigger?.source ?? 'default',
-            channelId: this.defaultPublishChannel,
-            content: [{ type: 'text', text }],
-          });
+          if (isGameChannel) {
+            // Send as spectator chat so thoughts are embedded in the replay
+            // without leaking to the opponent. s: prefix = spectator channel.
+            const chatText = text.length > 500 ? text.substring(0, 497) + '...' : text;
+            await this.client.sendRequest('channels/publish', {
+              conversationId: context.trigger?.source ?? 'default',
+              channelId: this.defaultPublishChannel,
+              content: [{ type: 'text', text: JSON.stringify({ type: 'send_chat', text: `s: ${chatText}` }) }],
+            });
+          } else {
+            await this.client.sendRequest('channels/publish', {
+              conversationId: context.trigger?.source ?? 'default',
+              channelId: this.defaultPublishChannel,
+              content: [{ type: 'text', text }],
+            });
+          }
         } catch (err) {
           console.error(
             `[${this.name}] Failed to publish speech to channel:`,
