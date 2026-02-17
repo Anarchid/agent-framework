@@ -930,8 +930,14 @@ export class AgentFramework {
                 block.type === 'text'
             );
 
-            const tokenUsage = response.usage
-              ? { input: response.usage.inputTokens, output: response.usage.outputTokens }
+            const usage = response.usage as { inputTokens: number; outputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number } | undefined;
+            const tokenUsage = usage
+              ? {
+                  input: usage.inputTokens,
+                  output: usage.outputTokens,
+                  cacheCreation: usage.cacheCreationTokens,
+                  cacheRead: usage.cacheReadTokens,
+                }
               : undefined;
             this.emitTrace({
               type: 'inference:completed',

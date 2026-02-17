@@ -210,6 +210,7 @@ export class Agent {
         temperature: this.temperature,
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
+      promptCaching: true,
     };
 
     const stream = this.membrane.streamYielding(request, {
