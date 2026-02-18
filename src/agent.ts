@@ -211,6 +211,7 @@ export class Agent {
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: true,
+      assistantParticipant: this.name,
     };
 
     const stream = this.membrane.streamYielding(request, {

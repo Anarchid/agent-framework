@@ -725,7 +725,37 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
-          if (currentState.stream) {
+          // Check if any tool wants to end the current inference turn
+          const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
+
+          if (shouldEndTurn) {
+            // Save assistant message (tool_use blocks) to context
+            const assistantContent = currentState.toolResults.map(tc => ({
+              type: 'tool_use' as const,
+              id: tc.id,
+              name: tc.name,
+              input: tc.input as Record<string, unknown>,
+            }));
+            agent.addAssistantResponse(assistantContent);
+
+            // Save tool results as user message
+            const toolResultContent = currentState.toolResults.map(tc => ({
+              type: 'tool_result' as const,
+              toolUseId: tc.id,
+              content: tc.result.isError
+                ? (tc.result.error ?? 'Unknown error')
+                : (JSON.stringify(tc.result.data) ?? ''),
+              isError: tc.result.isError ?? false,
+            }));
+            agent.getContextManager().addMessage('user', toolResultContent);
+
+            // Cancel the stream and reset agent to idle
+            if (currentState.stream) {
+              currentState.stream.cancel();
+            }
+            agent.reset();
+            this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
+          } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream
             const membraneResults = currentState.toolResults.map(tc =>
               this.toMembraneToolResult(tc.id, tc.result)
@@ -1042,7 +1072,7 @@ export class AgentFramework {
       toolUseId: callId,
       content: afResult.isError
         ? (afResult.error ?? 'Unknown error')
-        : JSON.stringify(afResult.data),
+        : (JSON.stringify(afResult.data) ?? ''),
       isError: afResult.isError,
     };
   }

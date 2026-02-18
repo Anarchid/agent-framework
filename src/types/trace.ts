@@ -65,6 +65,10 @@ export type TraceEvent =
       type: 'inference:stream_resumed';
       agentName: string;
     })
+  | (TraceEventBase & {
+      type: 'inference:turn_ended';
+      agentName: string;
+    })
 
   // Tool lifecycle
   | (TraceEventBase & {

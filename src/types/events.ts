@@ -168,6 +168,10 @@ export interface ToolResult {
   error?: string;
   /** Whether this was an error (for LLM) */
   isError?: boolean;
+  /** If true, end the current inference turn after delivering this result.
+   *  The tool calls + results are saved to history but the stream is not resumed.
+   *  Use for "sleep" primitives where the LLM expects the call to block. */
+  endTurn?: boolean;
 }
 
 /**
