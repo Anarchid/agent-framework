@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
   MessageId,
@@ -2135,17 +2135,49 @@ export class AgentFramework {
   }
 
   private toMembraneToolResult(callId: string, afResult: ToolResult, maxChars?: number): MembraneToolResult {
-    let content: string;
     if (afResult.isError) {
-      content = afResult.error ?? 'Unknown error';
-    } else {
-      content = JSON.stringify(afResult.data);
-      if (maxChars && content.length > maxChars) {
-        content = safeSlice(content, 0, maxChars)
-          + '\n\n[truncated — original was ' + content.length + ' chars]';
-      }
+      return { toolUseId: callId, content: afResult.error ?? 'Unknown error', isError: true };
+    }
+    // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
+    // blocks natively rather than JSON-stringifying them away. Anything else
+    // (objects, scalars) falls through to JSON.
+    const blocks = this.tryNativeToolResultContent(afResult.data);
+    if (blocks) {
+      return { toolUseId: callId, content: blocks, isError: afResult.isError };
+    }
+    let content = JSON.stringify(afResult.data);
+    if (maxChars && content.length > maxChars) {
+      content = safeSlice(content, 0, maxChars)
+        + '\n\n[truncated — original was ' + content.length + ' chars]';
     }
     return { toolUseId: callId, content, isError: afResult.isError };
+  }
+
+  /**
+   * If `data` is an MCP tool-result content array carrying at least one image,
+   * convert to Membrane's native ToolResultContentBlock[]. Returns null when
+   * the array is text-only (let JSON path handle it; saves a code path).
+   */
+  private tryNativeToolResultContent(data: unknown): ToolResultContentBlock[] | null {
+    if (!Array.isArray(data)) return null;
+    let hasImage = false;
+    const blocks: ToolResultContentBlock[] = [];
+    for (const b of data) {
+      if (!b || typeof b !== 'object') return null;
+      const type = (b as any).type;
+      if (type === 'text' && typeof (b as any).text === 'string') {
+        blocks.push({ type: 'text', text: (b as any).text });
+      } else if (type === 'image' && typeof (b as any).data === 'string' && typeof (b as any).mimeType === 'string') {
+        hasImage = true;
+        blocks.push({
+          type: 'image',
+          source: { type: 'base64', data: (b as any).data, mediaType: (b as any).mimeType },
+        });
+      } else {
+        return null; // unknown shape — bail to JSON path
+      }
+    }
+    return hasImage ? blocks : null;
   }
 
   private getMaxToolResultChars(agent: Agent): number | undefined {
