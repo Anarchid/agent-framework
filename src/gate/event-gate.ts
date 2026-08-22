@@ -532,6 +532,8 @@ export class EventGate {
   // Inference buffering
   private inferring = new Set<string>();
   private inferenceBuffer: PendingEvent[] = [];
+  /** Host quiesce suppression — see setQuiesced. */
+  private quiesced = false;
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
@@ -1470,8 +1472,11 @@ export class EventGate {
     const events = state.events;
     this.debounceTimers.delete(policyName);
 
-    // If any agent is currently inferring, buffer for later (with cap)
-    if (this.inferring.size > 0) {
+    // If any agent is currently inferring — or the host is quiesced — buffer
+    // for later (with cap). While quiesced, delivering would write a
+    // "[Gate: N events]" message into the very context being operated on
+    // mid-surgery; buffering composes them and they land at resume.
+    if (this.inferring.size > 0 || this.quiesced) {
       this.bufferForInference(events);
       return;
     }
@@ -1563,8 +1568,26 @@ export class EventGate {
 
   onInferenceEnded(agentName: string): void {
     this.inferring.delete(agentName);
+    this.flushInferenceBufferIfClear();
+  }
 
-    // Flush inference buffer if no agents are inferring
+  /**
+   * Host quiesce suppression (issue #122). While set, debounce firings buffer
+   * instead of writing gate messages into context; clearing it flushes the
+   * buffer through the same path a turn's end uses. Self-wake and sleep-expiry
+   * timers deliberately do NOT route through this — their inference requests
+   * are per-agent targeted pushes that the framework's quiesce wake gate parks
+   * and releases at resume, whereas the buffer's deliverEvents broadcasts a
+   * wake to every agent.
+   */
+  setQuiesced(quiesced: boolean): void {
+    if (this.quiesced === quiesced) return;
+    this.quiesced = quiesced;
+    if (!quiesced) this.flushInferenceBufferIfClear();
+  }
+
+  private flushInferenceBufferIfClear(): void {
+    if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
       // Defer to avoid re-entrancy inside trace callbacks

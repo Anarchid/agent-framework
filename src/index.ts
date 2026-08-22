@@ -2,8 +2,8 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError } from './framework.js';
-export type { RuntimeSettingsPreview } from './framework.js';
+export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
