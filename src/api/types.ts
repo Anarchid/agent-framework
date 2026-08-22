@@ -539,4 +539,10 @@ export interface ApiServerConfig {
   path?: string;
   /** Enable HTTP endpoints alongside WebSocket (default: true) */
   enableHttp?: boolean;
+  /** Opt-in shared secret for the HTTP host verbs (POST /quiesce, /resume,
+   *  /maintenance/tick). When set, those requests must carry it in the
+   *  `x-admin-token` header (401 otherwise). Unset preserves the historical
+   *  bind-address-is-the-security-model behavior — the default bind is
+   *  localhost; deployments that front the port with a proxy should set this. */
+  adminToken?: string;
 }

@@ -10,6 +10,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
+import { ResumeBlockedError } from '../framework.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
   ApiServerConfig,
@@ -46,7 +47,7 @@ import type {
 
 export * from './types.js';
 
-const DEFAULT_CONFIG: Required<ApiServerConfig> = {
+const DEFAULT_CONFIG: Required<Omit<ApiServerConfig, 'adminToken'>> & Pick<ApiServerConfig, 'adminToken'> = {
   port: 8765,
   host: 'localhost',
   path: '/ws',
@@ -60,7 +61,7 @@ const SUBSCRIPTION_POLL_INTERVAL = 50;
  * API Server for the agent framework.
  */
 export class ApiServer {
-  private config: Required<ApiServerConfig>;
+  private config: Required<Omit<ApiServerConfig, 'adminToken'>> & Pick<ApiServerConfig, 'adminToken'>;
   private framework: AgentFramework;
   private wss: WebSocketServer | null = null;
   private httpServer: ReturnType<typeof createServer> | null = null;
@@ -356,6 +357,17 @@ export class ApiServer {
         return this.cmdEventsSearch(params as unknown as EventsSearchParams);
       case 'events.subscribe':
         return this.cmdEventsSubscribe(params as unknown as EventsSubscribeParams);
+
+      // Host quiesce/maintenance mode (issue #122)
+      case 'host.quiesce':
+        return this.framework.quiesce(params as
+          { reason?: string; timeoutMs?: number; abandon?: boolean } | undefined);
+      case 'host.resume':
+        return this.framework.resume(params as { force?: boolean } | undefined);
+      case 'host.status':
+        return this.framework.getHostModeStatus();
+      case 'host.maintenanceTick':
+        return this.framework.maintenanceTick();
 
       default:
         throw new Error(`Unknown command: ${command}`);
@@ -861,8 +873,65 @@ export class ApiServer {
           agents: agents.map((a) => ({ name: a.name, status: a.state.status })),
           clients: this.clients.size,
           queueDepth: this.framework.getQueueDepth(),
+          quiesced: this.framework.getHostModeStatus().quiesced,
         })
       );
+      return;
+    }
+
+    // Host quiesce/maintenance mode (issue #122). Options ride the query
+    // string — this file has no body parser and these verbs don't warrant
+    // introducing one. Auth: opt-in shared secret (config.adminToken); the
+    // default bind is localhost and the WS surface carries the same authority,
+    // so no ambient remoteAddress check is attempted (it breaks behind
+    // proxies both ways and adds nothing on a local bind).
+    if (url.pathname === '/hostmode') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(this.framework.getHostModeStatus()));
+      return;
+    }
+    const hostVerb = req.method === 'POST'
+      && ['/quiesce', '/resume', '/maintenance/tick'].includes(url.pathname);
+    if (hostVerb) {
+      if (this.config.adminToken !== undefined
+        && req.headers['x-admin-token'] !== this.config.adminToken) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'x-admin-token required' }));
+        return;
+      }
+      const respond = (code: number, body: unknown) => {
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      void (async () => {
+        try {
+          if (url.pathname === '/quiesce') {
+            const timeoutMs = url.searchParams.get('timeoutMs');
+            respond(200, await this.framework.quiesce({
+              ...(url.searchParams.get('reason')
+                ? { reason: url.searchParams.get('reason')! } : {}),
+              ...(timeoutMs ? { timeoutMs: Number(timeoutMs) } : {}),
+              ...(url.searchParams.get('abandon') === 'true' ? { abandon: true } : {}),
+            }));
+          } else if (url.pathname === '/resume') {
+            respond(200, await this.framework.resume(
+              url.searchParams.get('force') === 'true' ? { force: true } : undefined,
+            ));
+          } else {
+            respond(200, await this.framework.maintenanceTick());
+          }
+        } catch (error) {
+          if (error instanceof ResumeBlockedError) {
+            respond(409, {
+              error: error.message,
+              verdicts: error.verdicts,
+              hostMode: this.framework.getHostModeStatus(),
+            });
+          } else {
+            respond(500, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      })();
       return;
     }
 
