@@ -444,6 +444,56 @@ class DiscordAwarenessAccountingError extends Error {
   }
 }
 
+/**
+ * Feasibility verdict for a runtime-settings patch, derived through the SAME
+ * settings→config mapping the live apply path uses (`Agent.planRuntimeSettings`
+ * → `previewContextSettings`). The `effective` verdict is for the budget the
+ * next compile actually plans at — for a paced descent that is the UNCHANGED
+ * live budget, with the descent target reported separately as `advisory`.
+ */
+export interface RuntimeSettingsPreview {
+  /** False when no verdict could be computed (no strategy support, preview
+   * overlap, stale branch generation, …) — see `reason`. Never silently
+   * swallowed: an unavailable preview is an answer, not an error. */
+  available: boolean;
+  reason?:
+    | 'no_preview_support'
+    | 'preview_in_flight'
+    | 'branch_generation_changed'
+    | 'no_adaptive_resolution'
+    | string;
+  path: 'immediate' | 'paced' | 'none';
+  /** Verdict at the effective compile budget (spread of the strategy's
+   * PreviewResult: finalTokens, fits, headTokens, tailTokens, middleTokens,
+   * deepestLevel, exhausted, …). */
+  effective?: { budgetTokens: number; fits: boolean; finalTokens: number } & Record<string, unknown>;
+  /** Best-effort verdict at a paced-descent target. Advisory only — a target
+   * below the folded floor does not block the patch; the descent simply
+   * converges as far as the floor allows. */
+  advisory?: { targetTokens: number; fits: boolean } & Record<string, unknown>;
+  transition: 'stable' | 'converging' | 'blocked';
+  transitionReason?: string;
+}
+
+/**
+ * Thrown by `updateAgentRuntimeSettings` when an immediate budget change would
+ * put the agent in an un-compilable layout: the folded floor renders more
+ * tokens than the hard budget admits, so every subsequent compile would
+ * OverBudget-wedge the agent (2026-08-21: mythos, 550k→260k set live against a
+ * ~450k floor — hours of hard-down). Overridable with `{ allowInfeasible: true }`.
+ * Paced descents never throw this: a non-immediate decrease leaves the compile
+ * budget untouched and converges only as far as the floor allows.
+ */
+export class BudgetPreflightError extends Error {
+  constructor(
+    message: string,
+    readonly preview: RuntimeSettingsPreview,
+  ) {
+    super(message);
+    this.name = 'BudgetPreflightError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
@@ -2166,10 +2216,45 @@ export class AgentFramework {
   updateAgentRuntimeSettings(
     agentName: string,
     patch: AgentRuntimeSettingsPatch,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; allowInfeasible?: boolean },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    // Feasibility preflight — only a budget-bearing patch can wedge, and only
+    // on the immediate path (a paced descent leaves the compile budget alone
+    // and converges only as far as the folded floor allows). Boot restore
+    // deliberately bypasses this wrapper (createAgent → restoreRuntimeSettings),
+    // so a persisted-but-now-infeasible budget can never brick startup.
+    if (patch.contextBudgetTokens !== undefined) {
+      const preview = this.previewAgentRuntimeSettings(agentName, patch);
+      if (preview.available && preview.effective) {
+        const e = preview.effective;
+        if (preview.path === 'immediate' && !e.fits) {
+          const msg =
+            `[budget-preflight] contextBudgetTokens=${patch.contextBudgetTokens} would NOT fit ` +
+            `${agentName}: the folded floor renders ${e.finalTokens} tokens against hard budget ` +
+            `${e.budgetTokens} (head=${e.headTokens ?? '?'} tail=${e.tailTokens ?? '?'} ` +
+            `middle=${e.middleTokens ?? '?'}, deepest L${e.deepestLevel ?? '?'}` +
+            `${e.exhausted ? ', picker exhausted' : ''}). Every compile at this budget would ` +
+            `OverBudget-wedge the agent. Lower the floor first (drain compression quarantine / ` +
+            `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
+          if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
+          console.warn(`${msg} — applying anyway (allowInfeasible).`);
+        } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
+          console.warn(
+            `[budget-preflight] paced descent for ${agentName} targets ` +
+            `${preview.advisory.targetTokens} tokens, below the current folded floor — the ` +
+            `transition will converge only as far as the floor allows (drain quarantine / ` +
+            `advance merges to go lower). Applying; the live compile budget is unchanged.`,
+          );
+        }
+      } else if (preview.reason) {
+        console.warn(
+          `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
+          `applying without preflight`,
+        );
+      }
+    }
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
@@ -2340,6 +2425,100 @@ export class AgentFramework {
       overrides,
       opts,
     );
+  }
+
+  /**
+   * Feasibility preview for a runtime-settings patch — or, with no patch, for
+   * the agent's CURRENT settings (the resume-gate case: quiesce maintenance
+   * may have moved the folded floor and the branch generation, so the verdict
+   * must be computed fresh at resume time).
+   *
+   * Models the patch through the same immediate-vs-paced semantics as the
+   * apply path (`Agent.planRuntimeSettings`): a non-immediate budget decrease
+   * is previewed at the UNCHANGED live compile budget, with a best-effort
+   * advisory verdict at the descent target. This is what the superseded
+   * `feat/budget-preflight-guard` got wrong — it previewed the patch value as
+   * the compile budget and rejected safe-by-construction paced descents.
+   *
+   * Never throws for preview-layer reasons: strategy without previewContext,
+   * preview overlap, stale branch generation, and the hierarchical (non-
+   * adaptive) path all come back as `{available: false, reason}`. Unknown
+   * agent still throws, matching the sibling accessors.
+   */
+  previewAgentRuntimeSettings(
+    agentName: string,
+    patch?: AgentRuntimeSettingsPatch,
+  ): RuntimeSettingsPreview {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const plan = agent.planRuntimeSettings(patch);
+    const settings = agent.getRuntimeSettings();
+    const base: RuntimeSettingsPreview = {
+      available: false,
+      path: plan.path,
+      transition: settings.transition,
+      ...(settings.transitionReason ? { transitionReason: settings.transitionReason } : {}),
+    };
+
+    const runPreview = (budgetTokens: number): {
+      result?: Record<string, unknown>;
+      reason?: string;
+    } => {
+      try {
+        const result = this.previewContextSettings(
+          agentName,
+          budgetTokens,
+          Object.keys(plan.overrides).length > 0 ? plan.overrides : undefined,
+        );
+        if (result === null || typeof result !== 'object') {
+          return { reason: 'no_preview_support' };
+        }
+        return { result: result as Record<string, unknown> };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Structured mapping of the strategy's known throw paths. Message
+        // matching is fragile by nature, so unknown messages surface verbatim
+        // as the reason rather than being swallowed or rethrown.
+        if (message.includes('requires reinitialization for the current branch generation')) {
+          return { reason: 'branch_generation_changed' };
+        }
+        if (message.includes('already running; previews must not overlap')) {
+          return { reason: 'preview_in_flight' };
+        }
+        if (message.includes('requires adaptiveResolution')) {
+          return { reason: 'no_adaptive_resolution' };
+        }
+        return { reason: message };
+      }
+    };
+
+    const effective = runPreview(plan.effectiveBudgetTokens);
+    if (!effective.result) {
+      return { ...base, reason: effective.reason };
+    }
+    const preview: RuntimeSettingsPreview = {
+      ...base,
+      available: true,
+      effective: {
+        ...effective.result,
+        budgetTokens: plan.effectiveBudgetTokens,
+        fits: effective.result.fits === true,
+        finalTokens: Number(effective.result.finalTokens ?? 0),
+      },
+    };
+    if (plan.advisoryTargetTokens !== undefined) {
+      // Best-effort: an advisory failure never flips `available` — the
+      // effective verdict above is the one that gates anything.
+      const advisory = runPreview(plan.advisoryTargetTokens);
+      if (advisory.result) {
+        preview.advisory = {
+          ...advisory.result,
+          targetTokens: plan.advisoryTargetTokens,
+          fits: advisory.result.fits === true,
+        };
+      }
+    }
+    return preview;
   }
 
   /**

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, BudgetPreflightError } from '../src/index.js';
 
 const membrane = {} as any;
 
@@ -290,6 +290,212 @@ it('immediate: a budget decrease with immediate=true applies now — no descent,
     const overrides = framework.getAgent('agent')!.getRuntimeSettingsOverrides() as Record<string, unknown>;
     assert.equal(overrides.immediate, undefined, 'immediate is a mode, not a setting');
     assert.equal(overrides.contextBudgetTokens, 50_000);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Budget preflight (issue #122; supersedes feat/budget-preflight-guard).
+// The preview stub stands in for the strategy's previewContext so verdicts are
+// deterministic; the mapping under test is the framework's, not the picker's.
+// ---------------------------------------------------------------------------
+
+function stubPreview(
+  framework: AgentFramework,
+  agentName: string,
+  impl: ((budget: { maxTokens: number }) => Record<string, unknown>) | undefined,
+): void {
+  const cm = framework.getAgent(agentName)!.getContextManager() as unknown as {
+    previewContext?: (budget: { maxTokens: number }) => unknown;
+  };
+  if (impl === undefined) {
+    cm.previewContext = undefined;
+  } else {
+    cm.previewContext = (budget) => impl(budget);
+  }
+}
+
+const infeasibleAt = (floor: number) => (budget: { maxTokens: number }) => ({
+  finalTokens: floor,
+  budgetTokens: budget.maxTokens,
+  fits: floor <= budget.maxTokens,
+  exhausted: floor > budget.maxTokens,
+  headTokens: 10_000,
+  tailTokens: 30_000,
+  middleTokens: floor - 40_000,
+  middleChunkCount: 7,
+  deepestLevel: 3,
+  resolutions: {},
+  moves: 0,
+  producedCount: 0,
+});
+
+async function withPreflightFramework(
+  fn: (framework: AgentFramework) => Promise<void> | void,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-preflight-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{
+      name: 'agent',
+      model: 'test-model',
+      systemPrompt: 'test',
+      strategy: strategy(),
+      contextBudgetTokens: 550_000,
+      maxTokens: 10_000,
+    }],
+    modules: [],
+  });
+  try {
+    await fn(framework);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+it('preflight: an immediate infeasible budget throws typed, allowInfeasible overrides', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', infeasibleAt(450_000));
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', {
+        contextBudgetTokens: 260_000,
+        immediate: true,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof BudgetPreflightError);
+        assert.equal(error.preview.path, 'immediate');
+        assert.equal(error.preview.effective?.fits, false);
+        assert.equal(error.preview.effective?.finalTokens, 450_000);
+        assert.match(error.message, /450000 tokens against hard budget 260000/);
+        return true;
+      },
+    );
+    // The refused patch must not have been applied.
+    assert.equal(framework.getAgentRuntimeSettings('agent').contextBudgetTokens, 550_000);
+
+    const applied = framework.updateAgentRuntimeSettings(
+      'agent',
+      { contextBudgetTokens: 260_000, immediate: true },
+      { allowInfeasible: true },
+    );
+    assert.equal(applied.contextBudgetTokens, 260_000);
+  });
+});
+
+it('preflight: a paced descent below the floor NEVER blocks — the compile budget is unchanged', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', infeasibleAt(450_000));
+    // 260k < 550k live, no `immediate` → paced. The superseded branch guard
+    // previewed 260k as the compile budget and refused this exact patch; the
+    // real compile stays at 550k (feasible), so it must apply.
+    const applied = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 260_000,
+    });
+    assert.equal(applied.transition, 'converging');
+    assert.equal(applied.contextBudgetTokens, 260_000, 'snapshot reports the target');
+  });
+});
+
+it('preflight: a feasible immediate change applies without ceremony', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', infeasibleAt(200_000));
+    const applied = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 260_000,
+      immediate: true,
+    });
+    assert.equal(applied.contextBudgetTokens, 260_000);
+  });
+});
+
+it('preflight: preview-unavailable applies with a warn, never blocks', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', undefined);
+    const applied = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 260_000,
+      immediate: true,
+    });
+    assert.equal(applied.contextBudgetTokens, 260_000);
+  });
+});
+
+it('previewAgentRuntimeSettings: structured reasons for the strategy throw paths', async () => {
+  await withPreflightFramework(async (framework) => {
+    const cases: Array<[string, string]> = [
+      [
+        'AutobiographicalStrategy.previewContext requires reinitialization for the current branch generation',
+        'branch_generation_changed',
+      ],
+      ['previewContext is already running; previews must not overlap', 'preview_in_flight'],
+      [
+        'previewContext requires adaptiveResolution; the hierarchical path has no fold plan to preview',
+        'no_adaptive_resolution',
+      ],
+      ['some novel failure', 'some novel failure'],
+    ];
+    for (const [message, reason] of cases) {
+      stubPreview(framework, 'agent', () => { throw new Error(message); });
+      const preview = framework.previewAgentRuntimeSettings('agent', {
+        contextBudgetTokens: 600_000,
+      });
+      assert.equal(preview.available, false, message);
+      assert.equal(preview.reason, reason);
+    }
+  });
+});
+
+it('previewAgentRuntimeSettings: paced patches report effective=live plus an advisory target', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', infeasibleAt(450_000));
+    const preview = framework.previewAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 260_000,
+    });
+    assert.equal(preview.path, 'paced');
+    assert.equal(preview.available, true);
+    assert.equal(preview.effective?.budgetTokens, 550_000, 'effective = UNCHANGED live budget');
+    assert.equal(preview.effective?.fits, true);
+    assert.equal(preview.advisory?.targetTokens, 260_000);
+    assert.equal(preview.advisory?.fits, false);
+
+    // No patch = the resume-gate case: verdict for current settings.
+    const current = framework.previewAgentRuntimeSettings('agent');
+    assert.equal(current.path, 'none');
+    assert.equal(current.effective?.budgetTokens, 550_000);
+  });
+});
+
+it('preflight: boot restore is never preflighted — an infeasible persisted budget cannot brick startup', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-preflight-boot-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane,
+    agents: [{
+      name: 'agent',
+      model: 'test-model',
+      systemPrompt: 'test',
+      strategy: strategy(),
+      contextBudgetTokens: 550_000,
+      maxTokens: 10_000,
+    }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  try {
+    stubPreview(framework, 'agent', infeasibleAt(450_000));
+    framework.updateAgentRuntimeSettings(
+      'agent',
+      { contextBudgetTokens: 260_000, immediate: true },
+      { allowInfeasible: true },
+    );
+    await framework.stop();
+    // Recreate WITHOUT a stub: restore goes through Agent.restoreRuntimeSettings,
+    // bypassing the framework wrapper — must not throw regardless of feasibility.
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getAgentRuntimeSettings('agent').contextBudgetTokens, 260_000);
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

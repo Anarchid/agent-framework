@@ -271,6 +271,69 @@ export class Agent {
     return { ...this.runtimeSettingsOverrides };
   }
 
+  /**
+   * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
+   * the next compile would actually plan at if `patch` were applied, WITHOUT
+   * mutating anything. This is the settings→config mapping a feasibility
+   * preview must share with the live path — previewing `patch.contextBudgetTokens`
+   * directly models the wrong compile for a paced descent (a non-immediate
+   * decrease never changes the compile budget; it only arms a prepared-window
+   * transition — see the else-branch in updateRuntimeSettings).
+   *
+   * - `path: 'immediate'` — the patch changes the compile budget (increase, or
+   *   decrease with `immediate: true`); `effectiveBudgetTokens` = patch value.
+   * - `path: 'paced'` — non-immediate decrease; `effectiveBudgetTokens` stays
+   *   at the live budget and `advisoryTargetTokens` carries the descent target.
+   * - `path: 'none'` — patch absent or budget untouched.
+   *
+   * `overrides` uses strategy-config names (`recentWindowTokens`,
+   * `kvStableReachTokens`) suitable for `previewContext`. `preparedWindowTokens`
+   * is deliberately never mapped: it is strategy instance state, not config,
+   * and cannot be simulated by a preview. A `kvStableReachTokens` override is
+   * omitted while a prepared window is in flight — the live runtime pace
+   * shadows the config value there, so the override would not be observed.
+   */
+  planRuntimeSettings(patch?: AgentRuntimeSettingsPatch): {
+    effectiveBudgetTokens: number;
+    advisoryTargetTokens?: number;
+    path: 'immediate' | 'paced' | 'none';
+    overrides: Record<string, unknown>;
+  } {
+    if (patch && Object.keys(patch).length > 0) {
+      this.validateRuntimeSettingsPatch(patch);
+    }
+    const hot = this.getHotContextSettings();
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+
+    const overrides: Record<string, unknown> = {};
+    if (patch?.tailTokens !== undefined) {
+      overrides.recentWindowTokens = patch.tailTokens;
+    }
+    if (
+      patch?.transitionPaceTokens !== undefined &&
+      hot?.preparedWindowTokens === undefined
+    ) {
+      overrides.kvStableReachTokens = patch.transitionPaceTokens;
+    }
+
+    if (patch?.contextBudgetTokens === undefined) {
+      return { effectiveBudgetTokens: live, path: 'none', overrides };
+    }
+    if (patch.contextBudgetTokens >= live || patch.immediate) {
+      return {
+        effectiveBudgetTokens: patch.contextBudgetTokens,
+        path: 'immediate',
+        overrides,
+      };
+    }
+    return {
+      effectiveBudgetTokens: live,
+      advisoryTargetTokens: patch.contextBudgetTokens,
+      path: 'paced',
+      overrides,
+    };
+  }
+
   getEffectiveSameRoundThinkTextPolicy(): SameRoundThinkTextPolicy {
     return this.runtimeSettingsOverrides.sameRoundThinkTextPolicy
       ?? this.configuredSameRoundThinkTextPolicy
