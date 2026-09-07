@@ -78,7 +78,15 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
-import { ToolImageLedger, parseImagePlaceholders, sha256Hex, type ParsedImagePlaceholder } from './tool-image-ledger.js';
+import {
+  TOOL_IMAGE_REF_RE,
+  ToolImageLedger,
+  formatPreservedImageSlots,
+  parseImagePlaceholders,
+  sha256Hex,
+  splitPreservingImageSlots,
+  type ParsedImagePlaceholder,
+} from './tool-image-ledger.js';
 import { randomUUID } from 'node:crypto';
 import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
 import {
@@ -1356,6 +1364,9 @@ export class AgentFramework {
       record.runner.dispose();
     }
     this.backgroundScripts.clear();
+    // Retained tool images are per-process by design; a retained stopped
+    // framework must not keep up to the whole ledger budget referenced.
+    this.toolImageLedgers.clear();
 
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
@@ -2866,14 +2877,15 @@ export class AgentFramework {
       'Save one or more recent images from your own context to workspace files. ' +
       'Images are counted back from the most recent (index 0), across BOTH ' +
       'attachments in messages and images returned by tools (their history ' +
-      'placeholder shows a ref like `[image: image/png, ~691KB, ref img_7]`; pass ' +
+      'placeholder shows a ref like `[image: image/png, ~691KB, ref img_k7x3q2_7]`; pass ' +
       '`ref` to save that exact image regardless of position). A single image is ' +
       'written to `path` as given (e.g. "project/photos/cat.png"); when `count` > 1 ' +
       'the range index..index+count-1 is saved with numeric suffixes ' +
       '("cat-0.png", "cat-1.png", …; 0 = the newest of the range). If the image at ' +
       'the requested position is no longer retained (evicted, or from before a ' +
       'restart) the call fails and writes nothing — it never substitutes an older ' +
-      'image. Receipts carry source tool call, MIME, byte size and SHA-256. Saved ' +
+      'image. When other tool calls in the same batch are still running, the save ' +
+      'waits for them so their images are counted. Receipts carry source tool call, MIME, byte size and SHA-256. Saved ' +
       'files are visible via workspace tools and the /files/ endpoint.',
     inputSchema: {
       type: 'object',
@@ -2893,7 +2905,7 @@ export class AgentFramework {
         ref: {
           type: 'string',
           description:
-            'Save a specific tool-result image by its history ref (e.g. "img_7") instead of by position. ' +
+            'Save a specific tool-result image by its history ref (e.g. "img_k7x3q2_7", as shown in its placeholder in your context) instead of by position. ' +
             'Mutually exclusive with `index`/`count`.',
         },
       },
@@ -8127,6 +8139,13 @@ export class AgentFramework {
     label: string,
   ): Promise<{ text: string; filePath: string | null }> {
     if (!cap || content.length <= cap) return { text: content, filePath: null };
+    // The stored text is the only place save_recent_image discovers tool
+    // images, and the live wire delivers every image regardless of text
+    // length — so an image slot dropped by the cut is an image the resident
+    // saw that the index would silently slide past (issue #104). Keep the
+    // slots at or past the cut, re-appended after the notice.
+    const { head, tail } = splitPreservingImageSlots(content, cap);
+    const kept = formatPreservedImageSlots(tail);
 
     const workspace = this.getWorkspaceModule();
     const mountName = workspace ? this.firstWritableMountName(workspace) : null;
@@ -8138,10 +8157,11 @@ export class AgentFramework {
         const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
         if (result.success) {
           return {
-            text: safeSlice(content, 0, cap)
-              + `\n\n[truncated — showing ${cap} of ${content.length} chars; full content: workspace file ${path}. `
+            text: head
+              + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}. `
               + 'Read/grep it with your file tools, or raise the inline cap via '
-              + 'agent_settings update tool_result_inline_max_chars.]',
+              + 'agent_settings update tool_result_inline_max_chars.]'
+              + kept,
             filePath: path,
           };
         }
@@ -8164,15 +8184,17 @@ export class AgentFramework {
         `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
       );
       return {
-        text: safeSlice(content, 0, cap)
-          + `\n\n[truncated — showing ${cap} of ${content.length} chars; spill to workspace file ${path} FAILED`
-          + ` (${failure}); content over the cap was not retained]`,
+        text: head
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${path} FAILED`
+          + ` (${failure}); content over the cap was not retained]`
+          + kept,
         filePath: null,
       };
     }
     return {
-      text: safeSlice(content, 0, cap)
-        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace, full content not retained]',
+      text: head
+        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace, full content not retained]'
+        + kept,
       filePath: null,
     };
   }
@@ -11376,6 +11398,41 @@ export class AgentFramework {
   }
 
   /**
+   * `save_recent_image` barrier. Module tool calls in a batch are only
+   * ENQUEUED by dispatch, while the save runs at once — so a [snap, save]
+   * round would inventory before the snapshot exists and silently save the
+   * newest OLDER image (issue #104, same-batch representation). Wait for
+   * every sibling in the round to settle; if one never does, fail closed
+   * rather than trust an index the batch may still change. Sibling saves
+   * produce no images and are not waited on (two saves in one batch would
+   * otherwise deadlock into a double timeout). Script-inner calls
+   * (`pytc-…`) run sequentially inside their script host and skip the
+   * barrier — the host call itself is the only pending sibling they'd see.
+   */
+  private async awaitSiblingToolCalls(agent: Agent, call: ToolCall): Promise<void> {
+    if (call.id.startsWith('pytc-')) return;
+    const BARRIER_MS = 120_000;
+    const POLL_MS = 20;
+    const startedAt = Date.now();
+    for (;;) {
+      const state = agent.state;
+      // Idle (puppet path) or the round was torn down: nothing to wait on.
+      if (state.status !== 'waiting_for_tools') return;
+      const open = [...state.pending.values()].filter((p) => p.id !== call.id && p.name !== 'save_recent_image');
+      if (open.length === 0) return;
+      if (Date.now() - startedAt > BARRIER_MS) {
+        throw new Error(
+          `save_recent_image: ${open.length} sibling tool call(s) in this batch still pending after ` +
+          `${Math.round(BARRIER_MS / 1000)}s (${open.map((p) => `${p.name} (call ${p.id})`).join(', ')}) — their results ` +
+          'may carry newer images than anything in your context, so no index can be trusted yet. Nothing written. ' +
+          'Save again once they have finished.',
+        );
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+  }
+
+  /**
    * Handle the synthesized `save_recent_image` tool (issue #104): build ONE
    * ordered inventory of every image the calling agent has seen — attachment
    * image blocks (blobs re-inlined) AND tool-result images (their history
@@ -11479,7 +11536,8 @@ export class AgentFramework {
           if (candidate.ref === null) {
             throw new Error(
               `save_recent_image: image at index ${position} is a tool-result image from ${describeTool(candidate)} ` +
-              'recorded before tool-image retention existed — its bytes are not available. Nothing written. ' +
+              'recorded without a retention ref (written before tool-image retention existed, or inside a ' +
+              'script run, where tool images are not retained) — its bytes are not available. Nothing written. ' +
               'Re-run the tool for a fresh image rather than saving an older one.',
             );
           }
@@ -11522,32 +11580,24 @@ export class AgentFramework {
           };
         };
 
+        // Barrier: a save dispatched alongside other calls in one batch must
+        // not inventory before their results exist — those are the newest
+        // images. Waits (bounded) for every sibling to settle, or fails closed.
+        await this.awaitSiblingToolCalls(agent, call);
+
         const found: Resolved[] = [];
         let index = 0;
         let count = 1;
+        /** Direct-ref mode: the one ref to find in the scannable context. */
+        let wantedRef: string | null = null;
         if (input.ref !== undefined) {
-          if (typeof input.ref !== 'string' || !/^img_\d+$/.test(input.ref)) {
-            throw new Error('save_recent_image: `ref` must look like "img_7" (see the image placeholder in your context)');
+          if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
+            throw new Error('save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)');
           }
           if (input.index !== undefined || input.count !== undefined) {
             throw new Error('save_recent_image: `ref` is mutually exclusive with `index`/`count`');
           }
-          const lookup = ledger.lookup(input.ref);
-          if (lookup.status !== 'retained') {
-            throw new Error(
-              `save_recent_image: ref ${input.ref}` +
-              (lookup.status === 'evicted' ? ` (from ${describeTool(lookup.image)})` : '') +
-              ` cannot be saved — ${unavailable(lookup.status)}. Nothing written.`,
-            );
-          }
-          found.push(resolve({
-            kind: 'tool',
-            ref: input.ref,
-            toolCallId: lookup.image.toolCallId,
-            toolName: lookup.image.toolName,
-            mediaType: lookup.image.mediaType,
-            messagesBack: 0,
-          }, 0));
+          wantedRef = input.ref;
         } else {
           index = input.index === undefined ? 0 : Number(input.index);
           if (!Number.isInteger(index) || index < 0) {
@@ -11558,115 +11608,134 @@ export class AgentFramework {
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
             throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
           }
-          const lastWanted = index + count - 1;
-          let seen = 0;
-          const consider = (candidate: Candidate): void => {
-            if (seen >= index && seen <= lastWanted) {
-              const resolved = resolve(candidate, seen);
-              resolved.rangeOffset = seen - index;
-              found.push(resolved);
+        }
+        const lastWanted = index + count - 1;
+        let seen = 0;
+        const collecting = (): boolean => (wantedRef !== null ? found.length === 0 : found.length < count);
+        // One walk serves both modes. By index: the requested range of the
+        // ordered inventory. By ref: the slot whose placeholder cites that
+        // ref — the ref is resolved THROUGH its occurrence in context, so
+        // the same provenance cross-check applies (a ref that is not visible
+        // in the scannable window — an undone branch, quoted text naming a
+        // real ref — is not saveable by name either).
+        const consider = (candidate: Candidate): void => {
+          if (wantedRef !== null) {
+            if (candidate.kind === 'tool' && candidate.ref === wantedRef && found.length === 0) {
+              found.push(resolve(candidate, seen));
             }
-            seen++;
-          };
-          const considerToolResultImages = (
-            toolCallId: string,
-            toolName: string,
-            placeholders: ParsedImagePlaceholder[],
-            messagesBack: number,
-          ): void => {
-            for (let p = placeholders.length - 1; p >= 0 && found.length < count; p--) {
-              const ph = placeholders[p]!;
-              if (ph.kind === 'inline') {
-                consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
-                continue;
-              }
-              // Reference stub: the registry's testimony (when this process
-              // still has the record) says whether it was an image; the
-              // sniffed stub text is the fallback. Non-image references
-              // are not slots.
-              const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
-              if (!testimony || !testimony.startsWith('image/')) continue;
-              consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+          } else if (seen >= index && seen <= lastWanted) {
+            const resolved = resolve(candidate, seen);
+            resolved.rangeOffset = seen - index;
+            found.push(resolved);
+          }
+          seen++;
+        };
+        const considerToolResultImages = (
+          toolCallId: string,
+          toolName: string,
+          placeholders: ParsedImagePlaceholder[],
+          messagesBack: number,
+        ): void => {
+          for (let p = placeholders.length - 1; p >= 0 && collecting(); p--) {
+            const ph = placeholders[p]!;
+            if (ph.kind === 'inline') {
+              consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
+              continue;
             }
-          };
+            // Reference stub: the registry's testimony (when this process
+            // still has the record) says whether it was an image; the
+            // sniffed stub text is the fallback. Non-image references
+            // are not slots.
+            const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
+            if (!testimony || !testimony.startsWith('image/')) continue;
+            consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+          }
+        };
 
-          // Same-batch results that completed before this call (e.g. a
-          // snapshot dispatched alongside the save) are not in the store
-          // yet but ARE the newest images. Retain them now — retention is
-          // idempotent per block, so the placeholder written at commit time
-          // carries the same ref.
-          const state = agent.state;
-          if (state.status === 'waiting_for_tools') {
-            for (let i = state.completed.length - 1; i >= 0 && found.length < count; i--) {
-              const tc = state.completed[i]!;
-              if (tc.result.isError || !Array.isArray(tc.result.data)) continue;
-              const placeholders: ParsedImagePlaceholder[] = [];
-              for (const [blockIndex, raw] of tc.result.data.entries()) {
-                const b = raw as { type?: unknown; data?: unknown; mimeType?: unknown };
-                if (b?.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
-                  const retained = ledger.retain({
-                    toolCallId: tc.id, toolName: tc.name, blockIndex, data: b.data, mediaType: b.mimeType,
-                  });
-                  placeholders.push({
-                    kind: 'inline', mediaType: retained.mediaType, sizeLabel: '', ref: retained.ref, offset: blockIndex,
-                  });
-                }
+        // Same-batch results (e.g. a snapshot dispatched alongside the save)
+        // are not in the store yet but ARE the newest images. Classify them
+        // with the very serializer the commit path will run — contradiction
+        // blocks withheld, uri-form blocks as reference stubs, unknown shapes
+        // as no slot at all — so the inventory means the same thing before
+        // and after commit. Retention is idempotent per block, so the
+        // placeholder written at commit time carries the same ref.
+        const state = agent.state;
+        if (state.status === 'waiting_for_tools') {
+          for (let i = state.completed.length - 1; i >= 0 && collecting(); i--) {
+            const tc = state.completed[i]!;
+            if (tc.result.isError) continue;
+            const text = toolResultDataToHistoryString(tc.result.data, undefined, {
+              imageRef: (blockIndex, image) => ledger.retain({
+                toolCallId: tc.id, toolName: tc.name, blockIndex, data: image.data, mediaType: image.mimeType,
+              }).ref,
+            });
+            considerToolResultImages(tc.id, tc.name, parseImagePlaceholders(text), 0);
+          }
+        }
+
+        // Walk the message store tail-first in bounded windows, re-inlining
+        // blob media, until we've collected the requested range. Scanning is
+        // capped so a pathological index can't drag the whole store through
+        // blob resolution.
+        const MAX_SCAN = 500;
+        const WINDOW = 25;
+        const cm = agent.getContextManager();
+        const total = cm.getMessageCount();
+        let scanned = 0;
+        for (let end = total; end > 0 && scanned < MAX_SCAN && collecting(); end -= WINDOW) {
+          const start = Math.max(0, end - WINDOW);
+          // By ref, attachment bytes are never needed — skip blob resolution.
+          const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: wantedRef === null });
+          scanned += end - start;
+          for (let i = messages.length - 1; i >= 0 && collecting(); i--) {
+            const content = messages[i]?.content;
+            if (!Array.isArray(content)) continue;
+            const messagesBack = total - (start + i);
+            for (let b = content.length - 1; b >= 0 && collecting(); b--) {
+              const block = content[b] as {
+                type?: string;
+                source?: { type?: string; data?: string; mediaType?: string };
+                toolUseId?: string;
+                toolName?: string;
+                content?: unknown;
+              };
+              if (block?.type === 'image') {
+                const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
+                consider({
+                  kind: 'attachment',
+                  data: inline ? block.source!.data! : null,
+                  mediaType: block.source?.mediaType ?? 'image/png',
+                  messagesBack,
+                });
+              } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
+                considerToolResultImages(
+                  block.toolUseId ?? 'unknown',
+                  block.toolName ?? 'unknown tool',
+                  parseImagePlaceholders(block.content),
+                  messagesBack,
+                );
               }
-              considerToolResultImages(tc.id, tc.name, placeholders, 0);
             }
           }
-
-          // Walk the message store tail-first in bounded windows, re-inlining
-          // blob media, until we've collected the requested range. Scanning is
-          // capped so a pathological index can't drag the whole store through
-          // blob resolution.
-          const MAX_SCAN = 500;
-          const WINDOW = 25;
-          const cm = agent.getContextManager();
-          const total = cm.getMessageCount();
-          let scanned = 0;
-          for (let end = total; end > 0 && scanned < MAX_SCAN && found.length < count; end -= WINDOW) {
-            const start = Math.max(0, end - WINDOW);
-            const { messages } = cm.getMessageWindow(start, end - start, { resolveBlobs: true });
-            scanned += end - start;
-            for (let i = messages.length - 1; i >= 0 && found.length < count; i--) {
-              const content = messages[i]?.content;
-              if (!Array.isArray(content)) continue;
-              const messagesBack = total - (start + i);
-              for (let b = content.length - 1; b >= 0 && found.length < count; b--) {
-                const block = content[b] as {
-                  type?: string;
-                  source?: { type?: string; data?: string; mediaType?: string };
-                  toolUseId?: string;
-                  toolName?: string;
-                  content?: unknown;
-                };
-                if (block?.type === 'image') {
-                  const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
-                  consider({
-                    kind: 'attachment',
-                    data: inline ? block.source!.data! : null,
-                    mediaType: block.source?.mediaType ?? 'image/png',
-                    messagesBack,
-                  });
-                } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
-                  considerToolResultImages(
-                    block.toolUseId ?? 'unknown',
-                    block.toolName ?? 'unknown tool',
-                    parseImagePlaceholders(block.content),
-                    messagesBack,
-                  );
-                }
-              }
-            }
-          }
-          if (found.length === 0) {
+        }
+        if (found.length === 0) {
+          if (wantedRef !== null) {
+            const lookup = ledger.lookup(wantedRef);
             throw new Error(
-              seen === 0
-                ? `save_recent_image: no images found in the most recent ${Math.min(scanned, MAX_SCAN)} messages`
-                : `save_recent_image: only ${seen} image(s) found in the most recent ${Math.min(scanned, MAX_SCAN)} messages (asked for index ${index})`,
+              lookup.status === 'unknown'
+                ? `save_recent_image: ref ${wantedRef} cannot be saved — ${unavailable('unknown')}. Nothing written.`
+                : `save_recent_image: ref ${wantedRef} (from ${describeTool(lookup.image)}) does not appear in your recent ` +
+                  `context (scanned ${Math.min(scanned, MAX_SCAN)} messages) — a ref is saved through its placeholder, ` +
+                  'which must be visible to you' +
+                  (lookup.status === 'evicted' ? '; its bytes were also evicted from the bounded retention budget' : '') +
+                  '. Nothing written.',
             );
           }
+          throw new Error(
+            seen === 0
+              ? `save_recent_image: no images found in the most recent ${Math.min(scanned, MAX_SCAN)} messages`
+              : `save_recent_image: only ${seen} image(s) found in the most recent ${Math.min(scanned, MAX_SCAN)} messages (asked for index ${index})`,
+          );
         }
 
         // Single image → path as given. Range → numeric suffix before the

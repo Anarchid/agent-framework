@@ -14,3 +14,16 @@
   `fetch_reference`) it fails **at that index** and writes nothing — it never
   substitutes an older image. New `ref` argument saves by provenance; receipts
   report source, tool call, MIME, byte size and SHA-256.
+  Second review round (#140) closed three more representations of the same
+  failure: truncation/spill now re-appends every image slot that fell past the
+  cut (the stored text is the only place the inventory finds tool images, and
+  the wire delivered them regardless); a save dispatched in the same batch as
+  the tool that produced the image waits for its siblings to settle (bounded,
+  fail-closed) and classifies their results with the commit-path serializer;
+  refs are namespaced per ledger (`img_k7x3q2_7`) so a placeholder from a
+  previous process resolves to nothing rather than to today's seventh image,
+  and a direct `ref` is saved through its visible placeholder (same provenance
+  cross-check as by index). Mime types normalize to a type/subtype essence
+  (parameters dropped, nonconforming → `application/octet-stream`) so the
+  placeholder always re-parses; large payloads are digested chunked; the
+  ledgers are released on framework `stop()`.

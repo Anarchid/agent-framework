@@ -14,9 +14,8 @@
  * For anything else it falls back to JSON.
  */
 
-import { safeSlice } from './safe-slice.js';
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
-import { formatToolImagePlaceholder } from './tool-image-ledger.js';
+import { formatPreservedImageSlots, formatToolImagePlaceholder, splitPreservingImageSlots } from './tool-image-ledger.js';
 
 export interface HistorySerializeOptions {
   /**
@@ -57,11 +56,14 @@ export function toolResultDataToHistoryString(
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
 
-/** Bounded copy of an arbitrary string with the standard truncation notice. */
+/** Bounded copy of an arbitrary string with the standard truncation notice.
+ *  Image slots past the cut are re-appended, never dropped (issue #104). */
 export function truncateForHistory(str: string, maxChars: number): string {
   if (str.length <= maxChars) return str;
-  return safeSlice(str, 0, maxChars)
-    + '\n\n[truncated — original was ' + str.length + ' chars]';
+  const { head, tail } = splitPreservingImageSlots(str, maxChars);
+  return head
+    + '\n\n[truncated — original was ' + str.length + ' chars]'
+    + formatPreservedImageSlots(tail);
 }
 
 /**
