@@ -12,6 +12,43 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.13.0 — 2026-09-07
+
+### Added
+
+- **Tune-out (#77): subconscious summaries instead of unsubscribing.** A third
+  channel state between subscribed and gone: `tune_out` diverts a channel's
+  traffic to a persistent same-model side-agent (participant `Subconscious`)
+  that summarizes on a cadence in its own voice, judges wakes (addressed
+  messages and gate-privileged authors, both preconditioned by the resident's
+  wake gate), and can cancel. Suppressed mentions get a deterministic
+  `channels/acknowledge` reaction; wake budgets are durable in the
+  `mcpl/channel-lifecycle` log with max-wakes auto-cancel; optional
+  `durationSeconds` gives a tune-out a restart-surviving deadline. Cancel
+  delivers a capped `<tuned-out-backlog>` dump plus a subconscious report;
+  diverted messages never enter the residents' compiled view (cm `viewFilter`)
+  and stay excluded after cancel. Standing dispositions ride a fixed
+  system-position injection on the subconscious's compiles. Requires
+  `@animalabs/context-manager` with strategy-view composition
+  (context-manager#54); designer review record in #115.
+- **`targetAgents` honored on the channel-incoming fan-out** (was declared but
+  dead); untargeted events keep the historical broadcast.
+- **Per-agent message delivery**: `addMessage(…, {forAgent})` with deferral and
+  turn-alive guards evaluated against the target agent; gate self-wake notices
+  deliver to the waking agent. Default path unchanged.
+
+- Add a default-off, per-agent guard that contains an exact whole-response textual wrapper for a tool registered on that inference. The wrapper is neither executed, published, nor stored as assistant continuity; a content-free system receipt records that no tool was called.
+
+### Fixed
+
+- `read_image` / workspace `read_image` no longer reject a JPEG that carries
+  padding after its EOI marker (#143). Hardware encoders such as the Raspberry
+  Pi camera pad every still to a 4-byte boundary (`ff d9 00 00 00`), and
+  decoders stop at EOI, so these are valid images; the validator used to
+  require EOI to be the final byte and reported them as `Invalid JPEG image`,
+  which made an rpi camera unviewable for a resident. The SOI..EOI stream is
+  still fully validated.
+
 ## 0.12.0 — 2026-09-05
 
 ### Added
