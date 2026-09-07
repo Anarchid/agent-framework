@@ -115,6 +115,14 @@ describe('tune-out end to end', () => {
     assert.ok(entered.ok, 'enter succeeds');
     assert.equal(i.channelRegistry!.getDesiredState('disc', CHANNEL), 'tuned-out');
 
+    // The resident's tool board carries tune_out exactly once, and stays
+    // that way across calls (getAllTools must not mutate the registry's
+    // shared channel-tool array).
+    const tuneOutCount = () => framework.getAllTools().filter((t) => t.name === 'tune_out').length;
+    assert.equal(tuneOutCount(), 1);
+    assert.equal(tuneOutCount(), 1, 'a second call appends nothing');
+    assert.equal(tuneOutCount(), 1, 'nor a third');
+
     // ---- ambient traffic: stamped, stored, no resident wake --------------
     emit('ambient', 'a1', 'release chatter one');
     emit('ambient', 'a2', 'release chatter two');
