@@ -81,6 +81,13 @@ interface PendingEvent {
   /** Author id of the event (discord snowflake etc.), when the metadata carries
    *  one — a debounced wake names the newest such author as its counterparty. */
   authorId?: string;
+  /** MCPL server id the event came from — the namespace for the counterparty
+   *  (`<serverId>:user:<id>`), same as the direct channel-incoming path. */
+  serverId?: string;
+  /** `chat:addressed` (mention / reply-to-bot / DM): an addressed event outranks
+   *  newer ambient chatter when a batched wake picks its provenance — the same
+   *  rule the framework applies to the turn's speech locus. */
+  addressed: boolean;
 }
 
 /**
@@ -90,9 +97,11 @@ interface PendingEvent {
  */
 export interface WakeProvenance {
   channelId?: string;
-  /** Adapter-namespaced author id: `<adapter>:user:<id>`, adapter = the
-   *  channel id's first segment (`discord:...`). */
+  /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
+   *  channel id's first segment only when the event carried no server id). */
   counterparty?: string;
+  /** True when the chosen event was `chat:addressed`. */
+  addressed?: boolean;
 }
 
 interface DebounceState {
@@ -164,22 +173,31 @@ function isMetadataTruthy(value: unknown): boolean {
   return Boolean(value);
 }
 
-/** Compact, log-friendly serialization of a GateBehavior. */
-/** Newest channel-bearing event of a batch → channel + namespaced author (ids only). */
+/**
+ * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
+ * wins (mention / reply / DM outranks newer ambient chatter — the framework's
+ * own locus rule); else the newest channel-bearing event. Channel, author and
+ * addressed all come from that one event, so they can never disagree.
+ */
 export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
-  let pick: PendingEvent | undefined;
+  let newest: PendingEvent | undefined;
+  let newestAddressed: PendingEvent | undefined;
   for (const e of events) {
     if (!e.channelId) continue;
-    if (!pick || e.timestamp >= pick.timestamp) pick = e;
+    if (!newest || e.timestamp >= newest.timestamp) newest = e;
+    if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
+  const pick = newestAddressed ?? newest;
   if (!pick) return undefined;
-  const adapter = pick.channelId!.split(':')[0] || 'channel';
+  const ns = pick.serverId || pick.channelId!.split(':')[0] || 'channel';
   return {
     channelId: pick.channelId,
-    ...(pick.authorId ? { counterparty: `${adapter}:user:${pick.authorId}` } : {}),
+    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
+    ...(pick.addressed ? { addressed: true } : {}),
   };
 }
 
+/** Compact, log-friendly serialization of a GateBehavior. */
 function formatBehavior(b: import('./types.js').GateBehavior): string {
   if (typeof b === 'string') return b;
   if ('debounce' in b) return `debounce:${b.debounce}`;
@@ -1416,6 +1434,8 @@ export class EventGate {
           ? (info.metadata.channelName as string)
           : undefined,
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
+      serverId: info.serverId || undefined,
+      addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
     };
 
     const existing = this.debounceTimers.get(policy.name);

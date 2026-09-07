@@ -30,7 +30,7 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: { initialConfig?: GateConfig }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -384,16 +384,51 @@ describe('debounce', () => {
     });
     const { gate, inferenceRequests } = makeGate(path);
 
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', channelId: 'discord:g:alice-room', content: 'a',
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:alice-room', content: 'a',
       metadata: { author: { id: '111', name: 'alice' } } }));
-    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', channelId: 'discord:g:bob-room', content: 'b',
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'b',
       metadata: { authorId: '222' } }));
     await new Promise(r => setTimeout(r, 150));
 
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].reason, 'gate:debounce');
-    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:bob-room', 'newest channel event wins');
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:bob-room', 'newest channel event wins when none is addressed');
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:222', 'author comes from the SAME event as the channel');
+    assert.strictEqual(inferenceRequests[0].addressed, undefined);
+  });
+
+  it('an older ADDRESSED event outranks newer ambient chatter — channel, author and addressed stay together', async () => {
+    const path = writeConfig('debounce-addressed.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:alice-room', content: 'hey agent',
+      tags: ['chat:addressed'], metadata: { author: { id: '111' } } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'ambient',
+      metadata: { authorId: '222' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:alice-room');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:111');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
+  });
+
+  it('the counterparty is namespaced by the event\'s server id, not the channel id\'s first segment', async () => {
+    const path = writeConfig('debounce-namespace.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'beta', channelId: 'shared', content: 'x',
+      metadata: { authorId: '42' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests[0].channelId, 'shared');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'beta:user:42');
   });
 
   it('a batched wake with no channel-bearing event carries no provenance', async () => {

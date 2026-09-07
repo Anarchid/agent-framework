@@ -1243,6 +1243,7 @@ export class AgentFramework {
             // name the channel and counterparty instead of just 'gate'
             ...(provenance?.channelId ? { channelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
+            ...(provenance?.addressed ? { addressed: true } : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
