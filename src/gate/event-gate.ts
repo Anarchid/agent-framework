@@ -96,12 +96,19 @@ interface PendingEvent {
  * "who woke the agent" from it). Ids only, never content or display names.
  */
 export interface WakeProvenance {
+  /** Composite channel id of the chosen event — telemetry only, never a
+   *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
+   *  are raw server ids (unroutable and a second spelling of the same
+   *  channel); the framework derives the composite id on the direct path. */
   channelId?: string;
   /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
    *  channel id's first segment only when the event carried no server id). */
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
+  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+   *  requests can order by event recency, not by flush order. */
+  at?: number;
 }
 
 interface DebounceState {
@@ -183,17 +190,21 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
   for (const e of events) {
-    if (!e.channelId) continue;
+    if (!e.channelId && !e.authorId) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const pick = newestAddressed ?? newest;
   if (!pick) return undefined;
-  const ns = pick.serverId || pick.channelId!.split(':')[0] || 'channel';
+  // push-event channel ids are the adapter's raw ids (a Discord snowflake):
+  // not a composite channel id, so not reported as one
+  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
+  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
   return {
-    channelId: pick.channelId,
+    ...(channelId ? { channelId } : {}),
     ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
     ...(pick.addressed ? { addressed: true } : {}),
+    at: pick.timestamp,
   };
 }
 
@@ -1523,10 +1534,11 @@ export class EventGate {
       policies: policyNames,
     });
 
-    // Provenance of the batched wake: the newest event that names a channel
-    // (and, when it carries one, its author). A batch is one wake; the newest
-    // channel-bearing event is what the framework's own locus rule prefers,
-    // and channel + author come from the SAME event so they never disagree.
+    // Provenance of the batched wake (telemetry: who/where woke the agent):
+    // the newest ADDRESSED event first, else the newest event naming a
+    // channel or an author; channel + author + addressed from that ONE
+    // event. It does not set the turn's speech locus — the framework keeps
+    // its own routing rule for that.
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);

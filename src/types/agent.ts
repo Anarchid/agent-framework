@@ -326,4 +326,14 @@ export interface InferenceRequest {
    * so a household ledger can say who woke whom; carries no content.
    */
   counterparty?: string;
+  /**
+   * Where the wake came from, for telemetry ONLY — never a speech locus.
+   * Set by the EventGate for batched wakes (composite channel id of the
+   * chosen event when the event carried one; push-event raw ids are not
+   * used). Routing keeps reading `channelId`, which only the direct channel
+   * paths set from normalized ids — a gate wake leaves it unset, as before.
+   */
+  wakeChannelId?: string;
+  /** Timestamp of the event the wake provenance was taken from (ms). */
+  wakeAt?: number;
 }

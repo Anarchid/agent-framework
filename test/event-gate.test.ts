@@ -30,7 +30,7 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: { initialConfig?: GateConfig }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -429,6 +429,25 @@ describe('debounce', () => {
     await new Promise(r => setTimeout(r, 150));
     assert.strictEqual(inferenceRequests[0].channelId, 'shared');
     assert.strictEqual(inferenceRequests[0].counterparty, 'beta:user:42');
+    assert.ok(typeof inferenceRequests[0].at === 'number', 'provenance carries the chosen event\'s timestamp');
+  });
+
+  it('a push-event wake (raw adapter channel id) names its author but reports no channel', async () => {
+    const path = writeConfig('debounce-push-raw.json', {
+      policies: [
+        { name: 'all', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    // exactly what PushHandler builds for a discord-mcpl DM push event
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '123456789012345678', content: 'hi',
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'], metadata: { authorId: '42', channelId: '123456789012345678' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, undefined, 'a raw snowflake is not a composite channel id — not reported');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
   });
 
   it('a batched wake with no channel-bearing event carries no provenance', async () => {

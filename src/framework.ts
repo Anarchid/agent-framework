@@ -1239,11 +1239,12 @@ export class AgentFramework {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
-            // so the turn's trigger — and the host's telemetry stamp — can
-            // name the channel and counterparty instead of just 'gate'
-            ...(provenance?.channelId ? { channelId: provenance.channelId } : {}),
+            // as TELEMETRY fields — the host's stamp reads them; the turn's
+            // speech locus (channelId / addressed) is deliberately NOT set
+            // here, so a batched wake routes exactly as it did before.
+            ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
-            ...(provenance?.addressed ? { addressed: true } : {}),
+            ...(provenance?.at ? { wakeAt: provenance.at } : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
@@ -5640,6 +5641,17 @@ export class AgentFramework {
         if (r.addressed) addressedReq = r;
       }
       const channelReq = addressedReq ?? ambientReq;
+      // Telemetry provenance (who/where woke the agent): from the routing
+      // winner when it carries one; else from the most recent request that
+      // does (gate wakes name a counterparty without setting a locus),
+      // ordered by the event's own time (wakeAt) rather than flush order.
+      let provReq: InferenceRequest | undefined = channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined;
+      if (!provReq) {
+        for (const r of requests) {
+          if (!r.counterparty && !r.wakeChannelId) continue;
+          if (!provReq || (r.wakeAt ?? r.timestamp) >= (provReq.wakeAt ?? provReq.timestamp)) provReq = r;
+        }
+      }
       await this.startAgentStream(agent, {
         ...trigger,
         channelId: channelReq?.channelId,
@@ -5648,7 +5660,9 @@ export class AgentFramework {
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
         // provenance.
-        counterparty: budgetRestart ? undefined : channelReq?.counterparty,
+        counterparty: budgetRestart ? undefined : provReq?.counterparty,
+        wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
+        wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
       });
     }
   }
