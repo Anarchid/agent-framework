@@ -351,6 +351,10 @@ export type TraceEvent =
       toolUseId: string;
       isError: boolean;
       durationMs: number;
+      /** The pair was queued behind a turn that replaced the puppet's
+       *  reservation (provider-admission re-entry) instead of stored
+       *  directly; it lands at that turn's end flush. */
+      deferred?: boolean;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
