@@ -6110,6 +6110,23 @@ export class AgentFramework {
             this.releasePrimaryProviderGate(agent.name);
             return;
           }
+          // The scheduler's turn-alive test passed BEFORE the park; the wait
+          // is the one gap in which another turn-alive holder can take the
+          // agent (puppetToolCall's reservation, #145). Never replace its
+          // token — the re-entry would set ours over it, and a short turn
+          // here ends and flushes before the puppeted tool returns, leaving
+          // its pair queued behind a flush that already happened. Give
+          // admission back and hand the wake to the scheduler, which keeps
+          // it queued while the agent is turn-alive and starts it normally
+          // once the holder releases.
+          if (this.activeTurnTokens.has(agent.name)) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: turn-alive while parked — wake requeued, not started`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -7856,13 +7873,13 @@ export class AgentFramework {
       const toolUse: ContentBlock[] = [
         { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
       ];
-      // Residual: a turn that had already passed the scheduler's busy check
-      // and was parked on provider admission (auxiliary in flight) re-enters
-      // startAgentStream without re-testing turn-alive and replaces our
-      // token. The side effect has happened, so the pair must still be
-      // stored — but not under that turn: queue it as a unit for the turn's
-      // end flush (drainDeferredFor keeps order; the tool_result entry is
+      // Defensive: no path replaces a live token any more (the provider-
+      // admission re-entry re-tests turn-alive and requeues instead), but
+      // if one ever does, the side effect has happened and the pair must
+      // still be stored — not under that turn: queue it as a unit for the
+      // next flush (drainDeferredFor keeps order; the tool_result entry is
       // never split from its tool_use because both ride the same drain).
+      // The finally below flushes it itself if that turn is already over.
       ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
       if (ownedToEnd) {
         const cm = agent.getContextManager();
@@ -7890,17 +7907,19 @@ export class AgentFramework {
       );
       return { toolUseId, result };
     } finally {
-      if (this.activeTurnTokens.get(agentName) === turnToken) {
-        this.activeTurnTokens.delete(agentName);
-        // Messages deferred while we held the token land now, after the
-        // pair — the same end-of-turn flush driveStream performs, under the
-        // same tool-cycle guard. (No wake is requested: the agent sees the
-        // pair, and anything that arrived meanwhile, on its next turn.)
-        if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-          for (const msg of this.drainDeferredFor(agentName)) {
-            this.addMessage(msg.participant, msg.content, msg.metadata,
-              msg.forAgent ? { forAgent: msg.forAgent } : undefined);
-          }
+      if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
+      // Messages deferred while we held the token land now, after the pair
+      // — the same end-of-turn flush driveStream performs, under the same
+      // tool-cycle guard. (No wake is requested: the agent sees the pair,
+      // and anything that arrived meanwhile, on its next turn.) Keyed on
+      // "no turn alive", not on token ownership: if a turn did replace us
+      // and has already ended, its flush ran before our pair was queued —
+      // nobody else will flush it, so we do.
+      if (!this.activeTurnTokens.has(agentName)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agentName)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata,
+            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
         }
       }
     }
