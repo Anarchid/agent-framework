@@ -78,6 +78,37 @@ interface PendingEvent {
    *  metadata carries one — batched-wake lines render this instead of the raw
    *  composite channel id. */
   channelLabel?: string;
+  /** Author id of the event (discord snowflake etc.), when the metadata carries
+   *  one — a debounced wake names the newest such author as its counterparty. */
+  authorId?: string;
+  /** MCPL server id the event came from — the namespace for the counterparty
+   *  (`<serverId>:user:<id>`), same as the direct channel-incoming path. */
+  serverId?: string;
+  /** `chat:addressed` (mention / reply-to-bot / DM): an addressed event outranks
+   *  newer ambient chatter when a batched wake picks its provenance — the same
+   *  rule the framework applies to the turn's speech locus. */
+  addressed: boolean;
+}
+
+/**
+ * Where a gate-requested wake came from, handed to the framework alongside the
+ * reason so the turn's InferenceRequest can carry it (host telemetry stamps
+ * "who woke the agent" from it). Ids only, never content or display names.
+ */
+export interface WakeProvenance {
+  /** Composite channel id of the chosen event — telemetry only, never a
+   *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
+   *  are raw server ids (unroutable and a second spelling of the same
+   *  channel); the framework derives the composite id on the direct path. */
+  channelId?: string;
+  /** Server-namespaced author id: `<serverId>:user:<id>` (falls back to the
+   *  channel id's first segment only when the event carried no server id). */
+  counterparty?: string;
+  /** True when the chosen event was `chat:addressed`. */
+  addressed?: boolean;
+  /** Timestamp (ms) of the chosen event, so a consumer coalescing several
+   *  requests can order by event recency, not by flush order. */
+  at?: number;
 }
 
 interface DebounceState {
@@ -147,6 +178,34 @@ function isMetadataTruthy(value: unknown): boolean {
   if (Array.isArray(value)) return value.length > 0;
   if (typeof value === 'object') return Object.keys(value).length > 0;
   return Boolean(value);
+}
+
+/**
+ * Provenance of a batched wake: the newest ADDRESSED channel-bearing event
+ * wins (mention / reply / DM outranks newer ambient chatter — the framework's
+ * own locus rule); else the newest channel-bearing event. Channel, author and
+ * addressed all come from that one event, so they can never disagree.
+ */
+export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
+  let newest: PendingEvent | undefined;
+  let newestAddressed: PendingEvent | undefined;
+  for (const e of events) {
+    if (!e.channelId && !e.authorId) continue;
+    if (!newest || e.timestamp >= newest.timestamp) newest = e;
+    if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
+  }
+  const pick = newestAddressed ?? newest;
+  if (!pick) return undefined;
+  // push-event channel ids are the adapter's raw ids (a Discord snowflake):
+  // not a composite channel id, so not reported as one
+  const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
+  const ns = pick.serverId || (pick.channelId ? pick.channelId.split(':')[0] : '') || 'channel';
+  return {
+    ...(channelId ? { channelId } : {}),
+    ...(pick.authorId ? { counterparty: `${ns}:user:${pick.authorId}` } : {}),
+    ...(pick.addressed ? { addressed: true } : {}),
+    at: pick.timestamp,
+  };
 }
 
 /** Compact, log-friendly serialization of a GateBehavior. */
@@ -522,7 +581,7 @@ export class EventGate {
     /** Registry agent to deliver into; absent = primary (historical). */
     forAgent?: string,
   ) => unknown;
-  private requestInferenceFn: (agentName: string, reason: string, source: string) => void;
+  private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
@@ -539,7 +598,7 @@ export class EventGate {
       metadata?: Record<string, unknown>,
       forAgent?: string,
     ) => unknown;
-    requestInference: (agentName: string, reason: string, source: string) => void;
+    requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
@@ -1385,6 +1444,9 @@ export class EventGate {
         typeof info.metadata?.channelName === 'string' && info.metadata.channelName
           ? (info.metadata.channelName as string)
           : undefined,
+      authorId: this.extractAuthorId(info.metadata) ?? undefined,
+      serverId: info.serverId || undefined,
+      addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1472,8 +1534,14 @@ export class EventGate {
       policies: policyNames,
     });
 
+    // Provenance of the batched wake (telemetry: who/where woke the agent):
+    // the newest ADDRESSED event first, else the newest event naming a
+    // channel or an author; channel + author + addressed from that ONE
+    // event. It does not set the turn's speech locus — the framework keeps
+    // its own routing rule for that.
+    const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate');
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
 

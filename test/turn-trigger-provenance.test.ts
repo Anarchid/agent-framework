@@ -82,6 +82,26 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it('a gate-batched wake (telemetry provenance only) names its author without pinning a speech locus', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t,
+        counterparty: 'discord:user:7', wakeChannelId: 'discord:g:room', wakeAt: t - 500 },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.channelId, undefined, 'a gate wake sets no locus');
+    assert.equal(captured.handed?.addressed, false);
+    assert.equal(captured.handed?.counterparty, 'discord:user:7');
+    assert.equal(captured.handed?.wakeChannelId, 'discord:g:room');
+    assert.equal(captured.exposed?.counterparty, 'discord:user:7');
+    await framework.stop();
+  });
+
   it('a context-budget restart keeps the channel for routing but names no author', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
     const framework = await makeFramework();

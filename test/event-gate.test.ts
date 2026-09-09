@@ -30,14 +30,14 @@ interface TraceEntry {
 function makeGate(configPath: string, opts?: { initialConfig?: GateConfig }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number }> = [];
 
   const gate = new EventGate({
     configPath,
     initialConfig: opts?.initialConfig,
     emitTrace: (e) => traces.push(e as TraceEntry),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
-    requestInference: (a, r, s) => inferenceRequests.push({ agentName: a, reason: r, source: s }),
+    requestInference: (a, r, s, p) => inferenceRequests.push({ agentName: a, reason: r, source: s, ...(p ?? {}) }),
     getAgentNames: () => ['agent'],
   });
 
@@ -373,6 +373,96 @@ describe('debounce', () => {
     assert.ok(!text.includes('edit 1'), 'must not re-quote in-context event content');
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].agentName, 'agent');
+  });
+
+  it('a batched wake carries the newest channel event\'s channel AND author together (provenance)', async () => {
+    const path = writeConfig('debounce-provenance.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:alice-room', content: 'a',
+      metadata: { author: { id: '111', name: 'alice' } } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'b',
+      metadata: { authorId: '222' } }));
+    await new Promise(r => setTimeout(r, 150));
+
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].reason, 'gate:debounce');
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:bob-room', 'newest channel event wins when none is addressed');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:222', 'author comes from the SAME event as the channel');
+    assert.strictEqual(inferenceRequests[0].addressed, undefined);
+  });
+
+  it('an older ADDRESSED event outranks newer ambient chatter — channel, author and addressed stay together', async () => {
+    const path = writeConfig('debounce-addressed.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:alice-room', content: 'hey agent',
+      tags: ['chat:addressed'], metadata: { author: { id: '111' } } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:bob-room', content: 'ambient',
+      metadata: { authorId: '222' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, 'discord:g:alice-room');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:111');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
+  });
+
+  it('the counterparty is namespaced by the event\'s server id, not the channel id\'s first segment', async () => {
+    const path = writeConfig('debounce-namespace.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'beta', channelId: 'shared', content: 'x',
+      metadata: { authorId: '42' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests[0].channelId, 'shared');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'beta:user:42');
+    assert.ok(typeof inferenceRequests[0].at === 'number', 'provenance carries the chosen event\'s timestamp');
+  });
+
+  it('a push-event wake (raw adapter channel id) names its author but reports no channel', async () => {
+    const path = writeConfig('debounce-push-raw.json', {
+      policies: [
+        { name: 'all', match: { scope: ['mcpl:push-event', 'mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    // exactly what PushHandler builds for a discord-mcpl DM push event
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '123456789012345678', content: 'hi',
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'], metadata: { authorId: '42', channelId: '123456789012345678' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, undefined, 'a raw snowflake is not a composite channel id — not reported');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
+  });
+
+  it('a batched wake with no channel-bearing event carries no provenance', async () => {
+    const path = writeConfig('debounce-noprov.json', {
+      policies: [
+        { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ content: 'edit' }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, undefined);
+    assert.strictEqual(inferenceRequests[0].counterparty, undefined);
   });
 
   it('quotes content for non-MCPL events (no context entry of their own)', async () => {
