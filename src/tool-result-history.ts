@@ -46,6 +46,41 @@ export interface HistorySerializeOptions {
  */
 export const DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS = 24000;
 
+/**
+ * Body to write into a spill file, given the string that would have gone into
+ * history.
+ *
+ * Spill files exist to be read back, and they are read back with the workspace
+ * file tools — which page by LINE (`workspace--read` takes offset/limit in
+ * lines). A tool result that fell through to the `JSON.stringify` branch above
+ * is a single line however many megabytes it is, so an agent handed such a
+ * spill can see the first screenful and never the rest: `offset` has nothing
+ * to move through, and an unbounded read of the whole line is itself over the
+ * inline cap, so reading the spill spills again. Re-indenting gives the file
+ * lines to page and grep.
+ *
+ * Only single-line JSON is touched. Anything that already has newlines is
+ * already pageable and is written byte-for-byte; anything that is not JSON is
+ * written byte-for-byte, because a spill file's contract is that it holds what
+ * the tool actually returned.
+ */
+export function pageableSpillBody(content: string): string {
+  const trimmed = content.trim();
+  if (trimmed.includes('\n')) return content;
+  // Cheap gate before parsing: only objects and arrays gain lines from
+  // re-indenting, and a bare scalar or a giant unquoted blob is not worth the
+  // parse attempt.
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return content;
+  try {
+    const reindented = JSON.stringify(JSON.parse(trimmed), null, 2);
+    // JSON.stringify returns undefined for some inputs (it cannot here, but
+    // the type says it can) and a one-line result for an empty container.
+    return typeof reindented === 'string' && reindented.includes('\n') ? reindented : content;
+  } catch {
+    return content;
+  }
+}
+
 export function toolResultDataToHistoryString(
   data: unknown,
   maxChars?: number,

@@ -306,6 +306,71 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
+  it('writes a JSON spill re-indented so the file tools can page it', async () => {
+    // The reason this matters: workspace--read pages by LINE. A JSON result is
+    // one line at any size, so a one-line spill is a file the agent can open
+    // and never finish reading — and an unbounded read of it is itself over
+    // the cap, so reading the spill spills again.
+    const h = await startSpillTurn({
+      prefix: 'spill-pageable-',
+      result: {
+        success: true,
+        data: { rows: Array.from({ length: 900 }, (_, i) => ({ id: i, blob: 'q'.repeat(50) })) },
+      },
+      withWorkspace: true,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.match(stored.content, /re-indented so it pages by line/);
+
+      const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(refMatch, 'reference should name the spill file');
+      const file = await h.workspace!.readBinary(refMatch[1]);
+      assert.ok('data' in file, 'spill file should be readable');
+      const body = (file as { data: Buffer }).data.toString('utf8');
+
+      const lines = body.split('\n');
+      assert.ok(lines.length > 1000, `spill must have lines to page, got ${lines.length}`);
+      // Every line has to be individually readable, which is the whole point.
+      const longest = Math.max(...lines.map((l) => l.length));
+      assert.ok(longest < 500, `no line may be a wall of text, longest was ${longest}`);
+      // Re-indenting must not change what the result said.
+      assert.deepStrictEqual(
+        JSON.parse(body),
+        { rows: Array.from({ length: 900 }, (_, i) => ({ id: i, blob: 'q'.repeat(50) })) },
+      );
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes a non-JSON spill byte-for-byte and does not claim to have re-indented it', async () => {
+    // Text results already have lines, and a spill file's contract is that it
+    // holds what the tool actually returned.
+    const body = Array.from({ length: 3000 }, (_, i) => `line ${i}: ${'t'.repeat(20)}`).join('\n');
+    const h = await startSpillTurn({
+      prefix: 'spill-verbatim-',
+      result: { success: true, data: [{ type: 'text', text: body }] },
+      withWorkspace: true,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.doesNotMatch(stored.content, /re-indented/);
+
+      const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(refMatch, 'reference should name the spill file');
+      const file = await h.workspace!.readBinary(refMatch[1]);
+      assert.ok('data' in file, 'spill file should be readable');
+      assert.strictEqual((file as { data: Buffer }).data.toString('utf8'), body, 'verbatim');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to EXPLICIT plain truncation with no writable workspace', async () => {
     const h = await startSpillTurn({
       prefix: 'spill-nows-',
