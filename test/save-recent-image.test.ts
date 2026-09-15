@@ -527,6 +527,35 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
+  it('[save, snap] — a save dispatched BEFORE its sibling snapshot still waits for it (#140 follow-up)', async () => {
+    // The mirror of the test above, in the order a model is at least as
+    // likely to emit. The round loop dispatches synchronously, so the save
+    // starts first and finds no snapshot in the inventory; the sibling
+    // barrier's first poll must still yield to the snap that follows it in
+    // the same batch. Pinned separately because it was verified by reading
+    // at review time and never by a test.
+    const h = await startTurn({
+      prefix: 'sri-same-batch-rev-',
+      world: (world) => { world.snapDelayMs = 150; },
+      responses: [
+        [saveCall('call_save', { path: 'files/batched-rev.png', index: 0 }), snapCall('call_snap')],
+        done,
+      ],
+    });
+    try {
+      const receipt = saved(await waitForToolResult(h.framework, 'call_save'));
+      assert.strictEqual(receipt[0]!.source, 'tool-result');
+      assert.strictEqual(receipt[0]!.toolCallId, 'call_snap', 'the sibling snapshot, not the older attachment');
+      assert.strictEqual(receipt[0]!.sha256, sha(PNG));
+      assert.ok((await fileBytes(h, 'files/batched-rev.png'))?.equals(PNG));
+      const snap = await waitForToolResult(h.framework, 'call_snap');
+      assert.match(snap.content, new RegExp(`ref ${receipt[0]!.ref}\\]`));
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('same-batch siblings are classified like the commit path: withheld data is no slot, a uri image is a reference slot', async () => {
     const h = await startTurn({
       prefix: 'sri-same-batch-class-',
