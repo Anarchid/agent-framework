@@ -6132,6 +6132,23 @@ export class AgentFramework {
             this.releasePrimaryProviderGate(agent.name);
             return;
           }
+          // The scheduler's turn-alive test passed BEFORE the park; the wait
+          // is the one gap in which another turn-alive holder can take the
+          // agent (puppetToolCall's reservation, #145). Never replace its
+          // token — the re-entry would set ours over it, and a short turn
+          // here ends and flushes before the puppeted tool returns, leaving
+          // its pair queued behind a flush that already happened. Give
+          // admission back and hand the wake to the scheduler, which keeps
+          // it queued while the agent is turn-alive and starts it normally
+          // once the holder releases.
+          if (this.activeTurnTokens.has(agent.name)) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: turn-alive while parked — wake requeued, not started`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -7786,8 +7803,11 @@ export class AgentFramework {
    * affordance to a model that cannot find it (older models especially).
    *
    * Semantics:
-   * - Refused unless the agent is idle: puppeting mid-turn would corrupt
-   *   the turn state machine and the live stream's wire ordering.
+   * - Refused unless the agent is idle with no turn alive: puppeting
+   *   mid-turn would corrupt the turn state machine and the live stream's
+   *   wire ordering. For its own duration the puppet HOLDS the turn-alive
+   *   marker (wakes requeue, cross-turn writers defer), so a wake landing
+   *   during the tool's execution cannot start a turn underneath the pair.
    * - Refused for tools outside the agent's own surface (canUseTool): the
    *   stored pair must be an act the agent could genuinely have taken.
    * - The call executes FOR REAL through the shared dispatch (MCPL,
@@ -7811,9 +7831,13 @@ export class AgentFramework {
   ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-    if (agent.state.status !== 'idle') {
+    // Idle AND no turn alive: status reads 'idle' from dequeue until the
+    // stream registers, and again while a turn's teardown is pending
+    // (the scheduler's own busy test, 'idle+turn-alive').
+    if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
+      const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
       throw new Error(
-        `puppet refused: agent ${agentName} is ${agent.state.status} (requires idle — ` +
+        `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
         `injecting a turn under an active stream corrupts wire ordering)`,
       );
     }
@@ -7833,44 +7857,94 @@ export class AgentFramework {
     for (let i = 0; i < 22; i++) suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
     const toolUseId = `toolu_01${suffix}`;
 
-    const started = Date.now();
-    const result = await this.executeToolCall({
-      id: toolUseId,
-      name: toolName,
-      input,
-      callerAgentName: agentName,
-    });
-    const durationMs = Date.now() - started;
+    // Reserve the agent against turn start for the WHOLE operation, before
+    // the first await (#145). The idle check above is a point in time; the
+    // tool execution and the result build both await, and a wake arriving
+    // in either gap used to start a real turn — then the pair below wrote
+    // straight through the context manager into a turn that never saw it,
+    // the exact wire-order corruption this method exists to avoid. Holding
+    // a turn token is the same invariant the scheduler respects (turn-alive
+    // requeues wakes) and the addMessage guard reads (cross-turn writers
+    // defer), so for the duration this behaves like a turn with no stream.
+    // Token-matched release in finally, same leak-proofing as
+    // startAgentStream: a token nobody clears wedges the agent.
+    const turnToken = this.nextTurnToken++;
+    this.activeTurnTokens.set(agentName, turnToken);
+    let ownedToEnd = false;
+    try {
+      const started = Date.now();
+      const result = await this.executeToolCall({
+        id: toolUseId,
+        name: toolName,
+        input,
+        callerAgentName: agentName,
+      });
+      const durationMs = Date.now() - started;
 
-    // Store the pair through the same shapes the ordinary path uses. Build
-    // the result blocks BEFORE storing the tool_use: the spill path awaits,
-    // and a message arriving during that await must land before the pair,
-    // never between tool_use and its tool_result. The two addMessage calls
-    // below are synchronous and adjacent — nothing can interleave.
-    const { blocks } = await this.buildStoredToolResultContent(
-      agentName,
-      [{ id: toolUseId, name: toolName, input, result, durationMs }],
-      this.resolveToolResultInlineCap(agent).cap,
-    );
-    const cm = agent.getContextManager();
-    cm.addMessage(agentName, [
-      { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
-    ]);
-    cm.addMessage('user', blocks);
+      // Store the pair through the same shapes the ordinary path uses. Build
+      // the result blocks BEFORE storing the tool_use: the spill path awaits.
+      // A message arriving during either await is deferred by the turn
+      // token (as during a real tool call) and lands AFTER the pair, never
+      // between tool_use and its tool_result. The two addMessage calls
+      // below are synchronous and adjacent — nothing can interleave.
+      const { blocks } = await this.buildStoredToolResultContent(
+        agentName,
+        [{ id: toolUseId, name: toolName, input, result, durationMs }],
+        this.resolveToolResultInlineCap(agent).cap,
+      );
+      const toolUse: ContentBlock[] = [
+        { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
+      ];
+      // Defensive: no path replaces a live token any more (the provider-
+      // admission re-entry re-tests turn-alive and requeues instead), but
+      // if one ever does, the side effect has happened and the pair must
+      // still be stored — not under that turn: queue it as a unit for the
+      // next flush (drainDeferredFor keeps order; the tool_result entry is
+      // never split from its tool_use because both ride the same drain).
+      // The finally below flushes it itself if that turn is already over.
+      ownedToEnd = this.activeTurnTokens.get(agentName) === turnToken;
+      if (ownedToEnd) {
+        const cm = agent.getContextManager();
+        cm.addMessage(agentName, toolUse);
+        cm.addMessage('user', blocks);
+      } else {
+        this.deferredMessages.push(
+          { participant: agentName, content: toolUse, forAgent: agentName },
+          { participant: 'user', content: blocks, forAgent: agentName },
+        );
+      }
 
-    this.emitTrace({
-      type: 'puppet:tool-call',
-      agentName,
-      toolName,
-      toolUseId,
-      isError: !!result.isError,
-      durationMs,
-    });
-    console.log(
-      `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
-      `in ${durationMs}ms (${toolUseId})`,
-    );
-    return { toolUseId, result };
+      this.emitTrace({
+        type: 'puppet:tool-call',
+        agentName,
+        toolName,
+        toolUseId,
+        isError: !!result.isError,
+        durationMs,
+        ...(ownedToEnd ? {} : { deferred: true }),
+      });
+      console.log(
+        `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
+        `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — deferred behind a live turn'}`,
+      );
+      return { toolUseId, result };
+    } finally {
+      if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
+      // Messages deferred while we held the token land now, after the pair
+      // — the same end-of-turn flush driveStream performs, under the same
+      // tool-cycle guard. (No wake is requested: the agent sees the pair,
+      // and anything that arrived meanwhile, on its next turn.) Keyed on
+      // "no turn alive", not on token ownership: if a turn did replace us
+      // and has already ended, its flush ran before our pair was queued —
+      // nobody else will flush it, so we do.
+      if (!this.activeTurnTokens.has(agentName)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agentName)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata,
+            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+        }
+      }
+    }
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {

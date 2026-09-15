@@ -43,6 +43,23 @@ function puppetHarness(opts?: {
   (framework as unknown as { agents: Map<string, unknown> }).agents =
     new Map([['princess', agent]]);
   (framework as unknown as { toolImageLedgers: Map<string, unknown> }).toolImageLedgers = new Map();
+  // Turn-alive machinery the puppet reserves through (#145).
+  const fw = framework as unknown as Record<string, unknown>;
+  fw.activeTurnTokens = new Map<string, number>();
+  fw.nextTurnToken = 1;
+  fw.deferredMessages = [];
+  fw.pendingAssistantBlocks = new Map();
+  fw.primaryAgentName = 'princess';
+  // Cross-turn writer path (what a channel message goes through): defers
+  // while a turn is alive, else stores — the real guard, reduced.
+  fw.addMessage = (participant: string, content: Array<Record<string, unknown>>, _m?: unknown, opts?: { forAgent?: string }) => {
+    if ((fw.activeTurnTokens as Map<string, number>).has('princess')) {
+      (fw.deferredMessages as unknown[]).push({ participant, content, forAgent: opts?.forAgent });
+      return '';
+    }
+    stored.push({ participant, content });
+    return `msg-${stored.length}`;
+  };
   (framework as unknown as Record<string, unknown>).getToolsForAgent =
     () => surface.map((name) => ({ name }));
   (framework as unknown as Record<string, unknown>).executeToolCall =
@@ -55,7 +72,27 @@ function puppetHarness(opts?: {
   (framework as unknown as Record<string, unknown>).emitTrace =
     (e: Record<string, unknown>) => { traces.push(e); };
 
-  return { framework, stored, traces, executed };
+  const turn = fw as unknown as {
+    activeTurnTokens: Map<string, number>;
+    deferredMessages: Array<{ participant: string; content: Array<Record<string, unknown>>; forAgent?: string }>;
+    nextTurnToken: number;
+  };
+  return { framework, stored, traces, executed, fw: turn };
+}
+
+/** A harness whose executeToolCall stays open until `release()` is called. */
+function heldHarness() {
+  const h = puppetHarness();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const executed: Array<Record<string, unknown>> = [];
+  (h.framework as unknown as Record<string, unknown>).executeToolCall =
+    async (call: Record<string, unknown>) => {
+      executed.push(call);
+      await gate;
+      return { success: true, data: [{ type: 'text', text: 'done' }], isError: false };
+    };
+  return { ...h, executed, release };
 }
 
 test('puppetToolCall executes with agent provenance and stores the pair', async () => {
@@ -133,6 +170,96 @@ test('puppetToolCall stores an error result as isError, still paired', async () 
     assert.equal(stored.length, 2, 'error results are stored too — same as a real turn');
     assert.equal(stored[1].content[0].isError, true);
     assert.match(String(stored[1].content[0].content), /unreachable/);
+  } finally {
+    console.log = quiet;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #145 — the idle guard is a point in time; the reservation must span the
+// awaits, or a wake starts a turn underneath the pair.
+// ---------------------------------------------------------------------------
+
+test('puppetToolCall holds the turn-alive marker across tool execution and releases it after the pair is stored', async () => {
+  const { framework, stored, fw, release, executed } = heldHarness();
+  const quiet = console.log;
+  console.log = () => {};
+  try {
+    assert.equal(fw.activeTurnTokens.has('princess'), false, 'nothing reserved before the call');
+    const p = framework.puppetToolCall('princess', 'mcpl--eido--look', {});
+    await new Promise((r) => setImmediate(r));
+    assert.equal(executed.length, 1, 'tool is executing');
+    assert.equal(fw.activeTurnTokens.has('princess'), true,
+      'while the tool runs the agent is turn-alive — the scheduler requeues wakes on exactly this');
+    release();
+    await p;
+    assert.equal(fw.activeTurnTokens.has('princess'), false, 'released once the pair is stored');
+    assert.equal(stored.length, 2, 'the pair, stored directly');
+    assert.equal(stored[0].content[0].type, 'tool_use');
+    assert.equal(stored[1].content[0].type, 'tool_result');
+  } finally {
+    console.log = quiet;
+  }
+});
+
+test('puppetToolCall releases the reservation when the tool throws', async () => {
+  const { framework, fw } = puppetHarness();
+  (framework as unknown as Record<string, unknown>).executeToolCall =
+    async () => { throw new Error('boom'); };
+  await assert.rejects(() => framework.puppetToolCall('princess', 'mcpl--eido--look', {}), /boom/);
+  assert.equal(fw.activeTurnTokens.has('princess'), false, 'no leaked token (the idle+turn-alive wedge)');
+});
+
+test('puppetToolCall refuses an idle agent whose turn is still alive (teardown pending)', async () => {
+  const { framework, stored, fw } = puppetHarness();
+  fw.activeTurnTokens.set('princess', 41);
+  await assert.rejects(
+    () => framework.puppetToolCall('princess', 'mcpl--eido--look', {}),
+    /idle\+turn-alive.*requires idle/,
+  );
+  assert.equal(stored.length, 0);
+  assert.equal(fw.activeTurnTokens.get('princess'), 41, 'someone else\'s token untouched');
+});
+
+test('a message arriving while the puppet holds the agent lands AFTER the pair, never between', async () => {
+  const { framework, stored, fw, release } = heldHarness();
+  const quiet = console.log;
+  console.log = () => {};
+  try {
+    const p = framework.puppetToolCall('princess', 'mcpl--eido--look', {});
+    await new Promise((r) => setImmediate(r));
+    // a channel message for the agent, mid-execution: the cross-turn writer defers
+    (framework as unknown as { addMessage: (p: string, c: unknown[]) => unknown })
+      .addMessage('user', [{ type: 'text', text: 'hey, you there?' }]);
+    assert.equal(stored.length, 0, 'deferred, not stored mid-puppet');
+    assert.equal(fw.deferredMessages.length, 1);
+    release();
+    await p;
+    assert.equal(fw.deferredMessages.length, 0, 'flushed at the puppet\'s end, like a turn\'s end');
+    assert.deepEqual(stored.map((m) => m.content[0].type), ['tool_use', 'tool_result', 'text'],
+      'pair first and adjacent; the deferred message follows');
+  } finally {
+    console.log = quiet;
+  }
+});
+
+test('if a turn replaced the reservation mid-flight, the pair is queued as a unit behind it, not written into it', async () => {
+  const { framework, stored, traces, fw, release } = heldHarness();
+  const quiet = console.log;
+  console.log = () => {};
+  try {
+    const p = framework.puppetToolCall('princess', 'mcpl--eido--look', {});
+    await new Promise((r) => setImmediate(r));
+    // the provider-admission re-entry: a turn takes the marker without re-testing it
+    fw.activeTurnTokens.set('princess', 9999);
+    release();
+    await p;
+    assert.equal(stored.length, 0, 'nothing written under the live turn');
+    assert.equal(fw.activeTurnTokens.get('princess'), 9999, 'the turn\'s token is not clobbered');
+    assert.deepEqual(fw.deferredMessages.map((m) => [m.forAgent, m.content[0].type]),
+      [['princess', 'tool_use'], ['princess', 'tool_result']],
+      'both halves queued, adjacent, addressed to the agent');
+    assert.equal(traces[0].deferred, true, 'trace says so');
   } finally {
     console.log = quiet;
   }
