@@ -932,13 +932,19 @@ export class WorkspaceModule implements Module {
     return [
       {
         name: 'read',
-        description: 'Read a file from the workspace. Returns content with line numbers. Reads at most 2000 lines per call by default — use offset/limit to page through larger files.',
+        description: 'Read a file from the workspace. Returns content with line numbers. '
+          + 'Reads at most 2000 lines per call by default — use offset/limit to page through larger files. '
+          + 'For long lines or spill files, use offsetChars/limitChars instead: returns raw text without '
+          + 'line numbers, with nextOffsetChars (null at EOF). Keep limitChars when continuing. '
+          + 'Character offsets count UTF-16 code units; do not mix character and line parameters.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' },
             offset: { type: 'number', description: 'Starting line number (1-indexed)' },
             limit: { type: 'number', description: 'Maximum number of lines to return (default 2000)' },
+            offsetChars: { type: 'integer', description: 'Character paging: zero-based UTF-16 offset (default 0); use nextOffsetChars to continue' },
+            limitChars: { type: 'integer', description: 'Character paging: code units to return (default 2000), plus at most one to keep a surrogate pair intact. Use the limit suggested by a spill notice.' },
           },
           required: ['path'],
         },
@@ -1741,6 +1747,19 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
 
   private async handleRead(input: ReadInput): Promise<ToolResult> {
+    const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
+    const offsetChars = input.offsetChars ?? 0;
+    const limitChars = input.limitChars ?? 2000;
+    if (characterPaging) {
+      if (input.offset !== undefined || input.limit !== undefined) {
+        return { success: false, isError: true, error: 'Use either offset/limit (lines) or offsetChars/limitChars (characters), not both.' };
+      }
+      if (!Number.isSafeInteger(offsetChars) || offsetChars < 0
+          || !Number.isSafeInteger(limitChars) || limitChars < 1
+          || input.offsetChars === null || input.limitChars === null) {
+        return { success: false, isError: true, error: 'offsetChars must be a non-negative safe integer and limitChars a positive safe integer.' };
+      }
+    }
     const { mount, relativePath } = this.parsePath(input.path);
     const store = this.getStore();
 
@@ -1757,6 +1776,28 @@ export class WorkspaceModule implements Module {
     }
 
     const content = blob.toString('utf-8');
+    if (characterPaging) {
+      const start = Math.min(offsetChars, content.length);
+      const splitsPair = (at: number): boolean =>
+        at > 0 && at < content.length
+        && content.charCodeAt(at - 1) >= 0xd800 && content.charCodeAt(at - 1) <= 0xdbff
+        && content.charCodeAt(at) >= 0xdc00 && content.charCodeAt(at) <= 0xdfff;
+      if (splitsPair(start)) {
+        return { success: false, isError: true, error: 'offsetChars splits a surrogate pair; use nextOffsetChars from the previous page.' };
+      }
+      let end = start + Math.min(limitChars, content.length - start);
+      if (splitsPair(end)) end++;
+      return {
+        success: true,
+        data: {
+          path: input.path,
+          totalChars: content.length,
+          offsetChars: start,
+          nextOffsetChars: end < content.length ? end : null,
+          content: content.slice(start, end),
+        },
+      };
+    }
     const lines = content.split('\n');
 
     // Apply offset/limit. An unlimited read of a large file would inject the

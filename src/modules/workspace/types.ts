@@ -133,6 +133,11 @@ export interface ReadInput {
   offset?: number;
   /** Number of lines to read (optional) */
   limit?: number;
+  /** Zero-based UTF-16 offset; selects character paging. Cannot mix with line offset/limit. */
+  offsetChars?: number;
+  /** Character page size in UTF-16 code units (default 2000); selects character paging.
+   * May include one extra code unit to keep a surrogate pair intact. */
+  limitChars?: number;
 }
 
 export interface ReadImageInput {
