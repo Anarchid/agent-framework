@@ -1,8 +1,6 @@
-- Oversized tool results that spill to a workspace file are now written
-  re-indented when they serialize as single-line JSON, so the file has lines
-  for `workspace--read` to page through. A one-line spill was effectively
-  unreadable past the first screenful: `offset`/`limit` count lines and there
-  was only one, and an unbounded read of the whole line went over the inline
-  cap and spilled again. Spills that already contain newlines, and spills that
-  are not JSON, are still written byte-for-byte. The truncation notice says
-  when a file was re-indented.
+- Oversized tool-result spill files can now be read in bounded character
+  ranges with `workspace--read` (`offsetChars`/`limitChars`). Spill notices
+  include a read command sized for the inline cap and explain how to continue.
+  This makes single-line JSON, large string values, and non-JSON long lines
+  recoverable without rewriting the stored result or expanding it past the
+  workspace file-size limit. Existing line-based reads keep their behavior.

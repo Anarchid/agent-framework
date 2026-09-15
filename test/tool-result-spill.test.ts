@@ -306,40 +306,95 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
-  it('writes a JSON spill re-indented so the file tools can page it', async () => {
-    // The reason this matters: workspace--read pages by LINE. A JSON result is
-    // one line at any size, so a one-line spill is a file the agent can open
-    // and never finish reading — and an unbounded read of it is itself over
-    // the cap, so reading the spill spills again.
+  for (const [name, body, cap, maxFileSize] of [
+    ['JSON tokens', '{"id":12345678901234567890,"n":1.0,"e":1e+09,"k":0,"k":1,"escaped":"\\u0061","rows":['
+      + Array.from({ length: 900 }, (_, i) => `{"i":${i},"pad":"${'x'.repeat(60)}"}`).join(',') + ']}', 24_000, undefined],
+    ['one huge JSON string', JSON.stringify({ blob: '😀'.repeat(12_000) }), 24_000, undefined],
+    ['non-JSON and JSON escaping at a low cap', ('plain text\t\r\x01"\\😀').repeat(500), 1000, undefined],
+    ['compact JSON at the mount limit', JSON.stringify(Array(21_000).fill(0)), 24_000, 42_001],
+  ] as const) {
+    it(`recovers ${name} exactly through bounded read-back pages`, async () => {
+      const h = await startSpillTurn({
+        prefix: 'spill-pageable-',
+        result: { success: true, data: [{ type: 'text', text: body }] },
+        withWorkspace: true,
+        toolResultInlineMaxChars: cap,
+        workspaceMaxFileSize: maxFileSize,
+      });
+      try {
+        const stored = await waitForStoredToolResult(h.framework);
+        assert.ok(stored);
+        assert.doesNotMatch(stored.content, /re-indented|not retained/);
+        const command = stored.content.match(/Page with workspace--read (\{[^\n]*?\});/);
+        assert.ok(command, 'notice supplies a concrete bounded read');
+        const input = JSON.parse(command[1]) as { path: string; offsetChars: number; limitChars: number };
+        const file = await h.workspace!.readBinary(input.path);
+        assert.ok('data' in file);
+        assert.deepStrictEqual(file.data, Buffer.from(body), 'saved bytes are unchanged');
+        if (maxFileSize !== undefined) {
+          assert.ok(Buffer.byteLength(JSON.stringify(JSON.parse(body), null, 2)) > maxFileSize,
+            'old formatting would have lost this result');
+        }
+
+        let recovered = '';
+        let pages = 0;
+        while (true) {
+          const result = await h.framework.executeToolCall({
+            id: `page-${pages}`, name: 'workspace--read', input, callerAgentName: 'prime',
+          });
+          assert.strictEqual(result.success, true, result.error);
+          const page = result.data as { content: string; offsetChars: number; nextOffsetChars: number | null };
+          assert.strictEqual(page.offsetChars, recovered.length);
+          assert.ok(page.content.length > 0);
+          // Exercise the actual stored/live spill policy on each read result.
+          const storage = await (h.framework as unknown as {
+            buildStoredToolResultContent(agent: string, calls: unknown[], cap: number): Promise<{
+              spilled: Map<string, { text: string; filePath: string | null }>;
+            }>;
+          }).buildStoredToolResultContent('prime', [{
+            id: `page-${pages}`, name: 'workspace--read', input, result, durationMs: 0,
+          }], cap);
+          const outcome = storage.spilled.get(`page-${pages}`)!;
+          assert.strictEqual(outcome.filePath, null, 'read-back must not spill again');
+          assert.ok(outcome.text.length <= cap);
+          assert.strictEqual(JSON.parse(outcome.text).content, page.content);
+          recovered += page.content;
+          pages++;
+          if (page.nextOffsetChars === null) break;
+          assert.ok(page.nextOffsetChars > input.offsetChars, 'cursor must advance');
+          input.offsetChars = page.nextOffsetChars;
+          assert.ok(pages <= body.length, 'paging must terminate');
+        }
+        assert.ok(pages > 1);
+        assert.strictEqual(recovered, body, 'all original text remains reachable, without token changes');
+      } finally {
+        await h.framework.stop();
+        rmSync(h.tempDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('retains the review reproduction under the default 5 MiB mount limit', async () => {
+    const data = Array(1_100_000).fill(0);
+    const expected = Buffer.from(JSON.stringify(data));
+    assert.strictEqual(expected.length, 2_200_001);
+    assert.ok(Buffer.byteLength(JSON.stringify(data, null, 2)) > 5 * 1024 * 1024);
     const h = await startSpillTurn({
-      prefix: 'spill-pageable-',
-      result: {
-        success: true,
-        data: { rows: Array.from({ length: 900 }, (_, i) => ({ id: i, blob: 'q'.repeat(50) })) },
-      },
-      withWorkspace: true,
+      prefix: 'spill-default-mount-limit-', result: { success: true, data }, withWorkspace: true,
     });
     try {
       const stored = await waitForStoredToolResult(h.framework);
-      assert.ok(stored, 'tool result should be stored');
-      assert.match(stored.content, /re-indented so it pages by line/);
-
-      const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
-      assert.ok(refMatch, 'reference should name the spill file');
-      const file = await h.workspace!.readBinary(refMatch[1]);
-      assert.ok('data' in file, 'spill file should be readable');
-      const body = (file as { data: Buffer }).data.toString('utf8');
-
-      const lines = body.split('\n');
-      assert.ok(lines.length > 1000, `spill must have lines to page, got ${lines.length}`);
-      // Every line has to be individually readable, which is the whole point.
-      const longest = Math.max(...lines.map((l) => l.length));
-      assert.ok(longest < 500, `no line may be a wall of text, longest was ${longest}`);
-      // Re-indenting must not change what the result said.
-      assert.deepStrictEqual(
-        JSON.parse(body),
-        { rows: Array.from({ length: 900 }, (_, i) => ({ id: i, blob: 'q'.repeat(50) })) },
-      );
+      assert.ok(stored);
+      const ref = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(ref);
+      const file = await h.workspace!.readBinary(ref[1]);
+      assert.ok('data' in file);
+      assert.deepStrictEqual(file.data, expected);
+      const lastPage = await h.workspace!.handleToolCall({
+        id: 'tail', name: 'read', input: { path: ref[1], offsetChars: expected.length - 100, limitChars: 100 },
+      });
+      assert.strictEqual(lastPage.success, true);
+      assert.deepStrictEqual((lastPage.data as { content: string }).content, expected.toString().slice(-100));
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

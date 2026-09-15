@@ -76,7 +76,6 @@ import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
-  pageableSpillBody,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -8392,17 +8391,20 @@ export class AgentFramework {
     if (workspace && mountName) {
       const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
       const path = `${mountName}/tool-results/${safeLabel}.txt`;
-      const fileBody = pageableSpillBody(content);
-      const reindented = fileBody !== content;
       let failure: string;
       try {
-        const result = await workspace.writeBinary(path, Buffer.from(fileBody, 'utf8'), 'text/plain');
+        const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
         if (result.success) {
+          // JSON serialization can expand each read-back code unit to six
+          // chars (\\u0000). Leave room for the page's metadata and a possible
+          // extra code unit at a surrogate-pair boundary.
+          const pageOverhead = JSON.stringify(path).length + 256;
+          const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
           return {
             text: head
               + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-              + (reindented ? ' (re-indented so it pages by line)' : '')
-              + '. Read/grep it with your file tools, or raise the inline cap via '
+              + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+              + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
               + 'agent_settings update tool_result_inline_max_chars.]'
               + kept,
             filePath: path,
