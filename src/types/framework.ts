@@ -99,6 +99,15 @@ export interface FrameworkConfig {
   discordAwarenessEmoji?: string;
 
   /**
+   * Durable JSONL record of operator-initiated mutations (rollback, suppress,
+   * undo/hide, settings, quiesce). Defaults to
+   * `<storePath>/operator-actions.jsonl`; set explicitly when providing an
+   * app-owned `store` without `storePath`. `false` disables the file (actions
+   * still emit `operator:action` traces).
+   */
+  operatorLogPath?: string | false;
+
+  /**
    * Mandatory deadline for each Discord awareness marker tools/call. This is
    * independent of MCPL requestTimeoutMs and cannot be disabled with 0.
    * Values are clamped to 50..60000ms; 0 selects the 10000ms default.

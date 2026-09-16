@@ -266,6 +266,20 @@ export type TraceEvent =
       toBranch: string;
     })
 
+  // Operator-initiated mutation (rollback/suppress/undo/hide/settings/quiesce…).
+  // Mirrors the durable operator-actions.jsonl record so live UIs see the
+  // same entry the file keeps.
+  | (TraceEventBase & {
+      type: 'operator:action';
+      agentName?: string;
+      kind: string;
+      requester?: { via: string; name?: string; id?: string };
+      note?: string;
+      params?: Record<string, unknown>;
+      result?: Record<string, unknown>;
+      error?: string;
+    })
+
   // MCPL subprocess stderr (one trace per line, for receipts when things break)
   | (TraceEventBase & {
       type: 'mcpl:server-stderr';

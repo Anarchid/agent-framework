@@ -227,6 +227,14 @@ test('message-granular undo prepares markers before switching branches', async (
     let currentBranch = 'main';
     const contextManager = {
       getAllMessages: () => messages,
+      // Windowed reads — what the live rollback path uses so it never
+      // re-inflates every attachment on the branch.
+      getMessageCount: () => messages.length,
+      getMessageWindow: (offset: number, limit: number) => ({
+        messages: messages.slice(offset, offset + limit),
+        startIndex: offset,
+        totalCount: messages.length,
+      }),
       branchAt: (_id: string, name: string) => { calls.push(`branch:${name}`); return name; },
       switchBranch: async (name: string) => { calls.push(`switch:${name}`); currentBranch = name; },
     };

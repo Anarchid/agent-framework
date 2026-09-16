@@ -394,6 +394,14 @@ import {
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
+import {
+  OperatorActionError,
+  OperatorLog,
+  defaultOperatorLogPath,
+  type OperatorLogEntry,
+  type OperatorLogInput,
+  type OperatorRequester,
+} from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
@@ -464,6 +472,76 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
+}
+
+/** Minimal read surface the live-surgery helpers need from a ContextManager. */
+interface SurgeryReadableCm {
+  getMessageCount(): number;
+  getMessageWindow(
+    offset: number,
+    limit: number,
+    opts?: { resolveBlobs?: boolean },
+  ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
+}
+
+const SURGERY_SCAN_WINDOW = 500;
+
+/**
+ * Slot index of `messageId` on the active branch, or -1. Scans from the tail
+ * in blob-free windows: operator targets are almost always recent, and a
+ * full `getAllMessages()` re-inflates every attachment on the branch.
+ */
+function locateMessageIndex(cm: SurgeryReadableCm, messageId: string): number {
+  const hit = locateMessageIndices(cm, new Set([messageId])).get(messageId);
+  return hit ? hit.index : -1;
+}
+
+/** Tail-first scan resolving many ids at once; stops as soon as all are found. */
+function locateMessageIndices(
+  cm: SurgeryReadableCm,
+  ids: Set<string>,
+): Map<string, { index: number; bodyGroupId?: string }> {
+  const found = new Map<string, { index: number; bodyGroupId?: string }>();
+  const total = cm.getMessageCount();
+  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
+    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
+    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const id = String(messages[i].id);
+      if (ids.has(id) && !found.has(id)) {
+        found.set(id, {
+          index: startIndex + i,
+          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+/** Inclusive slot range of the contiguous body-group run containing `index`. */
+function bodyGroupRun(cm: SurgeryReadableCm, index: number, groupId: string): { from: number; to: number } {
+  const total = cm.getMessageCount();
+  const at = (i: number): string | undefined =>
+    cm.getMessageWindow(i, 1, { resolveBlobs: false }).messages[0]?.bodyGroupId;
+  let from = index;
+  while (from > 0 && at(from - 1) === groupId) from--;
+  let to = index;
+  while (to + 1 < total && at(to + 1) === groupId) to++;
+  return { from, to };
+}
+
+function describeRequester(r: OperatorRequester | undefined): string {
+  if (!r) return 'unknown';
+  return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
+}
+
+function hostCommandRequester(serverId: string, params: HostCommandParams): OperatorRequester {
+  return {
+    via: `host-command:${serverId}`,
+    ...(params.requesterName ? { name: params.requesterName } : {}),
+    ...(params.requesterId ? { id: params.requesterId } : {}),
+  };
 }
 
 function isPermanentDiscordReactionFailure(message: string): boolean {
@@ -998,6 +1076,8 @@ export class AgentFramework {
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
+  /** Durable JSONL record of operator-initiated mutations (see operator-log.ts). */
+  private readonly operatorLog: OperatorLog;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -1026,7 +1106,9 @@ export class AgentFramework {
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
     discordAwarenessDeadlineMs: number,
+    operatorLog: OperatorLog = new OperatorLog(undefined),
   ) {
+    this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
     this.membrane = membrane;
@@ -1132,6 +1214,11 @@ export class AgentFramework {
       ? new DiscordAwarenessOutbox(discordAwarenessOutboxPath)
       : null;
 
+    const operatorLogPath = config.operatorLogPath === false
+      ? undefined
+      : config.operatorLogPath
+        ?? (config.storePath ? defaultOperatorLogPath(config.storePath) : undefined);
+
     const framework = new AgentFramework(
       store,
       ownsStore,
@@ -1146,6 +1233,7 @@ export class AgentFramework {
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
+      new OperatorLog(operatorLogPath),
     );
 
     // If an offline recovery process crashed after switching Chronicle but
@@ -2166,7 +2254,7 @@ export class AgentFramework {
   updateAgentRuntimeSettings(
     agentName: string,
     patch: AgentRuntimeSettingsPatch,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -2174,13 +2262,20 @@ export class AgentFramework {
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
     }
+    this.recordOperatorAction({
+      kind: 'settings-update',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+      ...(opts?.note ? { note: opts.note } : {}),
+      params: { patch: { ...patch }, persist: opts?.persist !== false },
+    });
     return result;
   }
 
   resetAgentRuntimeSettings(
     agentName: string,
     keys?: Array<keyof AgentRuntimeSettingsPatch>,
-    opts?: { persist?: boolean },
+    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -2188,14 +2283,29 @@ export class AgentFramework {
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
     }
+    this.recordOperatorAction({
+      kind: 'settings-reset',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+      ...(opts?.note ? { note: opts.note } : {}),
+      params: { keys: keys ?? 'all', persist: opts?.persist !== false },
+    });
     return result;
   }
 
-  cancelAgentRuntimeSettingsTransition(agentName: string): AgentRuntimeSettingsSnapshot {
+  cancelAgentRuntimeSettingsTransition(
+    agentName: string,
+    opts?: { requester?: OperatorRequester },
+  ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.cancelRuntimeSettingsTransition();
     this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    this.recordOperatorAction({
+      kind: 'settings-cancel-transition',
+      agent: agentName,
+      ...(opts?.requester ? { requester: opts.requester } : {}),
+    });
     return result;
   }
 
@@ -3422,6 +3532,12 @@ export class AgentFramework {
       timestamp: Date.now(),
     });
     console.error(`[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}`);
+    this.recordOperatorAction({
+      kind: 'nudge',
+      agent: name,
+      requester: { via: 'nudge', ...(requestedBy ? { name: requestedBy } : {}) },
+      result: { agentStatus },
+    });
     return { ok: true, agentName: name, agentStatus };
   }
 
@@ -3515,6 +3631,13 @@ export class AgentFramework {
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
       );
+      this.recordOperatorAction({
+        kind: 'unstick',
+        agent: agentName,
+        requester: hostCommandRequester(serverId, params),
+        params: { cap },
+        result: { started: true },
+      });
       return { ok: true, started: true, cap };
     }
 
@@ -3565,11 +3688,19 @@ export class AgentFramework {
           }
           const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
           const refs = refsIn(lo, hi);
+          const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
           cm.removeMessages(all[lo].id, all[hi].id);
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
           );
+          this.recordOperatorAction({
+            kind: 'hide',
+            agent: agentName,
+            requester: hostCommandRequester(serverId, params),
+            params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
+            result: { branch: this.store.currentBranch().name, hidden: hi - lo + 1, removedIds: rangeIds },
+          });
           return {
             ok: true,
             hidden: hi - lo + 1,
@@ -3578,11 +3709,19 @@ export class AgentFramework {
           };
         }
         const refs = refsIn(fromIdx, fromIdx);
+        const hiddenId = String(all[fromIdx].id);
         cm.removeMessage(all[fromIdx].id);
         console.error(
           `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
+        this.recordOperatorAction({
+          kind: 'hide',
+          agent: agentName,
+          requester: hostCommandRequester(serverId, params),
+          params: { fromMessageId: params.fromMessageId },
+          result: { branch: this.store.currentBranch().name, hidden: 1, removedIds: [hiddenId] },
+        });
         return {
           ok: true,
           hidden: 1,
@@ -3605,62 +3744,36 @@ export class AgentFramework {
       }
       const n = Math.max(1, Math.min(50, Math.floor(params.messages)));
       const cm = agent.getContextManager();
-      const allMessages = cm.getAllMessages();
-      if (n >= allMessages.length) {
+      const total = cm.getMessageCount();
+      if (n >= total) {
         return {
           ok: false,
-          error: `Cannot remove ${n} message(s) — history has ${allMessages.length}; at least one must remain.`,
+          error: `Cannot remove ${n} message(s) — history has ${total}; at least one must remain.`,
         };
       }
-      const target = allMessages[allMessages.length - 1 - n];
-      const discarded = allMessages.slice(allMessages.length - n);
-      const removedRefs = extractDiscordAwarenessRefs(discarded);
-      const sourceBranch = this.store.currentBranch().name;
-      const targetBranch = `undo-msgs/${agentName}/${Date.now()}`;
-
-      // Prepare the external side effect before switching Chronicle. If the
-      // process dies after the switch but before activate(), startup promotes
-      // this batch by matching targetBranch to the active branch.
-      const markerBatch = this.discordAwarenessOutbox?.prepare({
-        agentName,
-        sourceBranch,
-        targetBranch,
-        refs: removedRefs,
-        emoji: this.discordAwarenessEmoji,
-      }) ?? null;
-
-      const branchName = cm.branchAt(target.id, targetBranch);
-      await cm.switchBranch(branchName);
-      if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-      await this.syncDiscordAwarenessMarkers();
-
-      // Materialize config files from the new branch (fire-and-forget; gate
-      // picks up via mtime) — mirrors undoLastTurn.
-      const wsUndo = this.moduleRegistry.getModule('workspace');
-      if (wsUndo && 'materializeMount' in wsUndo) {
-        (wsUndo as { materializeMount: (m: string) => Promise<void> })
-          .materializeMount('_config')
-          .catch(() => {});
+      const target = cm.getMessageWindow(total - 1 - n, 1, { resolveBlobs: false }).messages[0];
+      try {
+        const r = await this.rollbackToMessage(agentName, {
+          messageId: String(target.id),
+          branchName: `undo-msgs/${agentName}/${Date.now()}`,
+          requester: hostCommandRequester(serverId, params),
+        });
+        return {
+          ok: true,
+          messagesRemoved: r.messagesRemoved,
+          removedRefs: r.removedRefs,
+          lastVisible: r.lastVisible,
+        };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
-
-      console.error(
-        `[host-command] undo-messages agent=${agentName} removed=${n} branch=${branchName}` +
-          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
-      );
-
-      return {
-        ok: true,
-        messagesRemoved: n,
-        removedRefs,
-        lastVisible: await this.lastVisiblePreview(agentName),
-      };
     }
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     let undone = 0;
     try {
       for (let i = 0; i < requested; i++) {
-        const r = this.undoLastTurn(agentName);
+        const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
         if (!r.undone) break;
         undone++;
       }
@@ -3998,7 +4111,7 @@ export class AgentFramework {
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
    */
-  undoLastTurn(agentName: string): {
+  undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
     turnIndex?: number;
     fromBranch?: string;
@@ -4047,6 +4160,13 @@ export class AgentFramework {
       fromBranch: currentBranch.name,
       toBranch: undoBranchName,
     });
+    this.recordOperatorAction({
+      kind: 'undo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      params: { turnIndex: checkpoint.turnIndex },
+      result: { sourceBranch: currentBranch.name, targetBranch: undoBranchName },
+    });
 
     return {
       undone: true,
@@ -4062,7 +4182,7 @@ export class AgentFramework {
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
    */
-  redo(agentName: string): {
+  redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
     fromBranch?: string;
     toBranch?: string;
@@ -4102,12 +4222,317 @@ export class AgentFramework {
       fromBranch: currentBranch.name,
       toBranch: branchName,
     });
+    this.recordOperatorAction({
+      kind: 'redo-turn',
+      agent: agentName,
+      ...(requester ? { requester } : {}),
+      result: { sourceBranch: currentBranch.name, targetBranch: branchName },
+    });
 
     return {
       redone: true,
       fromBranch: currentBranch.name,
       toBranch: branchName,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Live operator surgery — rollback / suppress on the OPEN store, without a
+  // restart — plus the durable action log every operator mutation writes to.
+  //
+  // Both follow the same idiom the offline surgeries use (recovery/
+  // offline-branch.ts): fork first, mutate the fork, and make the fork the
+  // active branch. The parent branch keeps everything, so restore is a
+  // checkout. Mutations are refused (never queued) while the agent is not
+  // idle — quiesce the host first if it is busy.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Append a record to the operator action log and broadcast it as an
+   * `operator:action` trace. Hosts use this directly for actions the
+   * framework does not own (e.g. a WebUI toggling quiesce). Never throws.
+   */
+  recordOperatorAction(input: OperatorLogInput): OperatorLogEntry {
+    // Observability never fails the action: tolerate a missing log (partially
+    // constructed framework in tests) and any trace-listener misbehavior.
+    const entry: OperatorLogEntry = this.operatorLog
+      ? this.operatorLog.append(input)
+      : { ...input, at: input.at ?? new Date().toISOString() };
+    try {
+      this.emitTrace({
+        type: 'operator:action',
+        kind: entry.kind,
+        ...(entry.agent !== undefined ? { agentName: entry.agent } : {}),
+        ...(entry.requester !== undefined ? { requester: entry.requester } : {}),
+        ...(entry.note !== undefined ? { note: entry.note } : {}),
+        ...(entry.params !== undefined ? { params: entry.params } : {}),
+        ...(entry.result !== undefined ? { result: entry.result } : {}),
+        ...(entry.error !== undefined ? { error: entry.error } : {}),
+      });
+    } catch {
+      // swallowed by design
+    }
+    return entry;
+  }
+
+  /** Newest `limit` operator-log entries, oldest first. */
+  getOperatorLog(opts?: { limit?: number }): OperatorLogEntry[] {
+    return this.operatorLog.readTail(opts?.limit ?? 100);
+  }
+
+  /** Where the operator log is written, or undefined when disabled. */
+  getOperatorLogPath(): string | undefined {
+    return this.operatorLog.path;
+  }
+
+  /**
+   * Roll the active branch back so `messageId` becomes its tail: fork the
+   * chronicle at that message (origin-sequence time-travel branch) and switch
+   * to the fork. Everything after the message stays on the source branch.
+   * Discord messages that left the live context get awareness markers via the
+   * durable outbox, exactly as message-granular `undo` does.
+   *
+   * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
+   * agent must be idle; nothing is queued.
+   */
+  async rollbackToMessage(
+    agentName: string,
+    opts: {
+      messageId: string;
+      requester?: OperatorRequester;
+      note?: string;
+      /** Branch name for the fork (default `rollback/<agent>/<ts>`). */
+      branchName?: string;
+    },
+  ): Promise<{
+    agentName: string;
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    lastVisible: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    const logBase: OperatorLogInput = {
+      kind: 'rollback',
+      agent: agentName,
+      ...(opts.requester ? { requester: opts.requester } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+      params: { messageId: opts.messageId },
+    };
+    try {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+      if (agent.state.status !== 'idle') {
+        throw new OperatorActionError('agent-busy', `Cannot roll back while agent is ${agent.state.status}`);
+      }
+      const cm = agent.getContextManager();
+      const total = cm.getMessageCount();
+      const targetIndex = locateMessageIndex(cm, opts.messageId);
+      if (targetIndex < 0) {
+        throw new OperatorActionError('unknown-message', `Message ${opts.messageId} is not on the active branch`);
+      }
+      const messagesRemoved = total - targetIndex - 1;
+      if (messagesRemoved <= 0) {
+        throw new OperatorActionError('invalid', `Message ${opts.messageId} is already the tail of the active branch`);
+      }
+      const discarded = cm.getMessageWindow(targetIndex + 1, messagesRemoved, { resolveBlobs: false }).messages;
+      const removedRefs = extractDiscordAwarenessRefs(discarded);
+      const sourceBranch = this.store.currentBranch().name;
+      const targetBranch = opts.branchName ?? `rollback/${agentName}/${Date.now()}`;
+      if (targetBranch === sourceBranch) {
+        throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
+      }
+
+      // Prepare the external side effect before switching Chronicle. If the
+      // process dies after the switch but before activate(), startup promotes
+      // this batch by matching targetBranch to the active branch.
+      const markerBatch = this.discordAwarenessOutbox?.prepare({
+        agentName,
+        sourceBranch,
+        targetBranch,
+        refs: removedRefs,
+        emoji: this.discordAwarenessEmoji,
+      }) ?? null;
+
+      const branchName = cm.branchAt(opts.messageId as MessageId, targetBranch);
+      await cm.switchBranch(branchName);
+      if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+      await this.syncDiscordAwarenessMarkers();
+      this.materializeConfigMountAfterBranchSwitch();
+
+      console.error(
+        `[operator] rollback agent=${agentName} to=${opts.messageId} removed=${messagesRemoved} ` +
+          `branch=${branchName} by=${describeRequester(opts.requester)}`,
+      );
+      this.recordOperatorAction({
+        ...logBase,
+        result: { sourceBranch, targetBranch: branchName, messagesRemoved, discordRefs: removedRefs.length },
+      });
+      return {
+        agentName,
+        sourceBranch,
+        targetBranch: branchName,
+        messagesRemoved,
+        removedRefs,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    } catch (error) {
+      this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * Suppress specific messages from the live context without touching the
+   * source branch: fork at the current head (`suppress/<agent>/<ts>`), redact
+   * the messages on the fork, switch to it. Shards of a body group are always
+   * removed together. Discord originals get awareness markers via the outbox;
+   * the batch is `explicit`-activated only after every removal succeeded, and
+   * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   *
+   * Not retroactive over derived state: a message already folded into an
+   * autobiographical summary stays in that summary — roll back to before it
+   * entered if that matters.
+   */
+  async suppressMessages(
+    agentName: string,
+    opts: {
+      messageIds: string[];
+      requester?: OperatorRequester;
+      note?: string;
+      /** Branch name for the fork (default `suppress/<agent>/<ts>`). */
+      branchName?: string;
+    },
+  ): Promise<{
+    agentName: string;
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    removedIds: string[];
+    removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    lastVisible: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    const requestedIds = [...new Set(opts.messageIds.map(String))];
+    const logBase: OperatorLogInput = {
+      kind: 'suppress',
+      agent: agentName,
+      ...(opts.requester ? { requester: opts.requester } : {}),
+      ...(opts.note ? { note: opts.note } : {}),
+      params: { messageIds: requestedIds },
+    };
+    try {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
+      if (agent.state.status !== 'idle') {
+        throw new OperatorActionError('agent-busy', `Cannot suppress while agent is ${agent.state.status}`);
+      }
+      if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
+      const cm = agent.getContextManager();
+      const total = cm.getMessageCount();
+
+      const located = locateMessageIndices(cm, new Set(requestedIds));
+      const missing = requestedIds.filter((id) => !located.has(id));
+      if (missing.length > 0) {
+        throw new OperatorActionError(
+          'unknown-message',
+          `Not on the active branch: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`,
+        );
+      }
+
+      // Build removal intervals (index-ordered, newest first). A shard expands
+      // to its whole body group — chronicle refuses to bisect one.
+      const intervals = new Map<string, { from: number; to: number; fromId: string; toId: string }>();
+      for (const id of requestedIds) {
+        const hit = located.get(id)!;
+        const run = hit.bodyGroupId ? bodyGroupRun(cm, hit.index, hit.bodyGroupId) : { from: hit.index, to: hit.index };
+        const key = `${run.from}-${run.to}`;
+        if (intervals.has(key)) continue;
+        const win = cm.getMessageWindow(run.from, run.to - run.from + 1, { resolveBlobs: false }).messages;
+        intervals.set(key, { ...run, fromId: String(win[0].id), toId: String(win[win.length - 1].id) });
+      }
+      const ordered = [...intervals.values()].sort((a, b) => b.from - a.from);
+      const messagesRemoved = ordered.reduce((n, iv) => n + (iv.to - iv.from + 1), 0);
+      if (messagesRemoved >= total) {
+        throw new OperatorActionError('invalid', `Cannot suppress all ${total} message(s) — at least one must remain`);
+      }
+      const targeted = ordered.flatMap((iv) =>
+        cm.getMessageWindow(iv.from, iv.to - iv.from + 1, { resolveBlobs: false }).messages,
+      );
+      const removedIds = targeted.map((m) => String(m.id));
+      const removedRefs = extractDiscordAwarenessRefs(targeted);
+
+      const sourceBranch = this.store.currentBranch().name;
+      const targetBranch = opts.branchName ?? `suppress/${agentName}/${Date.now()}`;
+      if (targetBranch === sourceBranch) {
+        throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
+      }
+      const markerBatch = this.discordAwarenessOutbox?.prepare({
+        agentName,
+        sourceBranch,
+        targetBranch,
+        refs: removedRefs,
+        emoji: this.discordAwarenessEmoji,
+        // Seeing targetBranch active does not prove the removals finished;
+        // only this operation activates the batch, after the last redaction.
+        activationPolicy: 'explicit',
+        suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
+      }) ?? null;
+
+      const createdBranch = await cm.fork(targetBranch);
+      try {
+        for (const iv of ordered) {
+          if (iv.fromId === iv.toId) cm.removeMessage(iv.fromId as MessageId);
+          else cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
+        }
+        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+      } catch (error) {
+        // A partially suppressed branch is not safe to serve from. Keep it for
+        // diagnosis, but put the agent back on the untouched source branch.
+        if (this.store.currentBranch().name === createdBranch) {
+          await cm.switchBranch(sourceBranch);
+        }
+        throw new OperatorActionError(
+          'failed',
+          `Suppression failed on ${createdBranch}; active branch restored to ${sourceBranch}: ` +
+            (error instanceof Error ? error.message : String(error)),
+          { cause: error },
+        );
+      }
+      await this.syncDiscordAwarenessMarkers();
+      this.materializeConfigMountAfterBranchSwitch();
+
+      console.error(
+        `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
+          `by=${describeRequester(opts.requester)}`,
+      );
+      this.recordOperatorAction({
+        ...logBase,
+        result: { sourceBranch, targetBranch: createdBranch, messagesRemoved, removedIds, discordRefs: removedRefs.length },
+      });
+      return {
+        agentName,
+        sourceBranch,
+        targetBranch: createdBranch,
+        messagesRemoved,
+        removedIds,
+        removedRefs,
+        lastVisible: await this.lastVisiblePreview(agentName),
+      };
+    } catch (error) {
+      this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
+  }
+
+  /** Re-materialize config files from the (new) active branch — fire and
+   *  forget; the gate picks changes up via mtime. Mirrors undoLastTurn. */
+  private materializeConfigMountAfterBranchSwitch(): void {
+    const ws = this.moduleRegistry.getModule('workspace');
+    if (ws && 'materializeMount' in ws) {
+      (ws as { materializeMount: (m: string) => Promise<void> })
+        .materializeMount('_config')
+        .catch(() => {});
+    }
   }
 
   /**
