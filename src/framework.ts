@@ -8853,11 +8853,18 @@ export class AgentFramework {
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
 
+    // Both branches persist the JSON view, never the live object: a compiled
+    // request carries non-JSON members (the kv-unified `onCacheWireReceipt`
+    // hook is a function) and Chronicle's JSON bridge rejects those with
+    // "JS functions cannot be represented as a serde_json::Value" — which,
+    // thrown from the failure path, masked the failure being logged.
     if (entry.request && typeof entry.request === 'object') {
       const requestJson = JSON.stringify(entry.request);
       if (requestJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(requestJson), 'application/json');
         entryToStore.request = { blobId };
+      } else {
+        entryToStore.request = JSON.parse(requestJson);
       }
     }
 
@@ -8866,6 +8873,8 @@ export class AgentFramework {
       if (responseJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(responseJson), 'application/json');
         entryToStore.response = { blobId };
+      } else {
+        entryToStore.response = JSON.parse(responseJson);
       }
     }
 
