@@ -463,6 +463,8 @@ export interface RuntimeSettingsPreview {
     | 'no_adaptive_resolution'
     | string;
   path: 'immediate' | 'paced' | 'none';
+  /** The budget compiles currently plan at (baseline of the patch). */
+  liveBudgetTokens: number;
   /** Verdict at the effective compile budget (spread of the strategy's
    * PreviewResult: finalTokens, fits, headTokens, tailTokens, middleTokens,
    * deepestLevel, exhausted, …). */
@@ -1409,7 +1411,8 @@ export class AgentFramework {
           `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
           `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
-          `[host-mode] framework API.\n` +
+          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
+          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
           `[host-mode] ============================================================`,
         );
         framework.emitTrace({
@@ -2312,7 +2315,12 @@ export class AgentFramework {
       const preview = this.previewAgentRuntimeSettings(agentName, patch);
       if (preview.available && preview.effective) {
         const e = preview.effective;
-        if (preview.path === 'immediate' && !e.fits) {
+        // Block only a LOWERING that doesn't fit. A no-op rewrite or an
+        // increase on an already-over-floor agent never makes things worse —
+        // refusing those would throw on exactly the wedged population the
+        // guard exists to protect (and block stepwise remediation).
+        const lowering = patch.contextBudgetTokens! < preview.liveBudgetTokens;
+        if (preview.path === 'immediate' && !e.fits && lowering) {
           const msg =
             `[budget-preflight] contextBudgetTokens=${patch.contextBudgetTokens} would NOT fit ` +
             `${agentName}: the folded floor renders ${e.finalTokens} tokens against hard budget ` +
@@ -2323,6 +2331,12 @@ export class AgentFramework {
             `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
           if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
           console.warn(`${msg} — applying anyway (allowInfeasible).`);
+        } else if (preview.path === 'immediate' && !e.fits) {
+          console.warn(
+            `[budget-preflight] ${agentName} remains over the folded floor at ` +
+            `${patch.contextBudgetTokens} (floor renders ${e.finalTokens}); this patch does ` +
+            `not lower the budget, so applying — drain quarantine / advance merges to clear it.`,
+          );
         } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
           console.warn(
             `[budget-preflight] paced descent for ${agentName} targets ` +
@@ -2418,7 +2432,23 @@ export class AgentFramework {
     timeoutMs?: number;
     abandon?: boolean;
   }): Promise<HostModeStatus> {
-    if (this.quiesced) return this.getHostModeStatus();
+    if (this.quiesced) {
+      // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
+      // out undrained must be escalatable with a second quiesce({abandon})
+      // without resume()+re-quiesce (which would reopen data planes and
+      // release parked wakes mid-surgery).
+      if (opts?.abandon && this.activeTurnTokens.size > 0) {
+        await this.abandonActiveTurns();
+        this.emitTrace({
+          type: 'host:quiesce',
+          ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+          drained: this.activeTurnTokens.size === 0,
+          activeTurns: this.activeTurnTokens.size,
+          abandoned: true,
+        });
+      }
+      return this.getHostModeStatus();
+    }
     this.quiesced = true;
     this.quiesceReason = opts?.reason;
     this.quiescedAt = Date.now();
@@ -2436,7 +2466,13 @@ export class AgentFramework {
       connection.pauseDataPlane();
     }
 
-    const timeoutMs = Math.max(1_000, opts?.timeoutMs ?? 120_000);
+    // NaN-proof: timeoutMs arrives via Number()/blind casts on three
+    // ingresses, and Math.max(1_000, NaN) is NaN — which would silently
+    // collapse the drain window to zero (`Date.now() < NaN` is false).
+    const rawTimeout = opts?.timeoutMs;
+    const timeoutMs = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout)
+      ? Math.max(1_000, rawTimeout)
+      : 120_000;
     const deadline = Date.now() + timeoutMs;
     while (this.activeTurnTokens.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -2445,24 +2481,7 @@ export class AgentFramework {
     let abandoned = false;
     if (this.activeTurnTokens.size > 0 && opts?.abandon) {
       abandoned = true;
-      for (const agentName of [...this.activeTurnTokens.keys()]) {
-        const agent = this.agents.get(agentName);
-        const state = agent?.state;
-        const stream = state && 'stream' in state ? state.stream : undefined;
-        if (agent && stream) {
-          console.error(`[host-mode] abandoning in-flight turn for ${agentName}`);
-          this.frameworkCancelledStreams.set(
-            `${agent.name}:${agent.streamId}`,
-            'quiesce_abandoned',
-          );
-          stream.cancel();
-        }
-      }
-      // Bounded grace for the cancelled streams' teardown to settle.
-      const grace = Date.now() + 10_000;
-      while (this.activeTurnTokens.size > 0 && Date.now() < grace) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
+      await this.abandonActiveTurns();
     }
 
     const status = this.getHostModeStatus();
@@ -2480,6 +2499,30 @@ export class AgentFramework {
           `${status.activeTurns} turn(s) still alive`,
     );
     return status;
+  }
+
+  /** Cancel every turn-alive stream via the quiesce_abandoned kind and give
+   *  teardown a bounded grace to settle. Shared by the drain-timeout path and
+   *  the already-quiesced escalation path. */
+  private async abandonActiveTurns(): Promise<void> {
+    for (const agentName of [...this.activeTurnTokens.keys()]) {
+      const agent = this.agents.get(agentName);
+      const state = agent?.state;
+      const stream = state && 'stream' in state ? state.stream : undefined;
+      if (agent && stream) {
+        console.error(`[host-mode] abandoning in-flight turn for ${agentName}`);
+        this.frameworkCancelledStreams.set(
+          `${agent.name}:${agent.streamId}`,
+          'quiesce_abandoned',
+        );
+        stream.cancel();
+      }
+    }
+    // Bounded grace for the cancelled streams' teardown to settle.
+    const grace = Date.now() + 10_000;
+    while (this.activeTurnTokens.size > 0 && Date.now() < grace) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
   }
 
   /**
@@ -2533,6 +2576,21 @@ export class AgentFramework {
     this.persistHostMode(null);
     this.eventGate?.setQuiesced(false);
 
+    // Flush context writes deferred by the quiesce window (module events,
+    // api message.send) — with no turn alive there is no other flush point.
+    if (this.deferredMessages.length > 0 && this.activeTurnTokens.size === 0) {
+      const deferred = this.deferredMessages.splice(0);
+      for (const msg of deferred) {
+        this.addMessage(
+          msg.participant,
+          msg.content,
+          msg.metadata,
+          msg.forAgent ? { forAgent: msg.forAgent } : undefined,
+        );
+      }
+      console.error(`[host-mode] resume: flushed ${deferred.length} deferred context write(s)`);
+    }
+
     // Reopen MCPL data planes through the existing barrier funnel — NOT a
     // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
     // nested-install guard (a flushed tools-list-changed can install a newer
@@ -2557,6 +2615,9 @@ export class AgentFramework {
       ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
       releasedRequests,
     });
+    // NOTE: parked wakes and gate buffers are in-memory only — a restart
+    // mid-quiesce boots quiesced but with these queues empty (sources like
+    // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
     console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
     return this.getHostModeStatus();
   }
@@ -2569,6 +2630,12 @@ export class AgentFramework {
    * true in quiesce mode precisely so this machinery stays hot.
    */
   async maintenanceTick(): Promise<ContextMaintenanceSnapshot> {
+    if (!this.running) {
+      // startQueuedMaintenance no-ops on a stopped/never-started framework —
+      // returning a snapshot would silently masquerade as a completed pass.
+      console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
+      return this.getContextMaintenanceSnapshot();
+    }
     this.startQueuedMaintenance();
     await this.maintenancePass;
     return this.getContextMaintenanceSnapshot();
@@ -2746,6 +2813,7 @@ export class AgentFramework {
     const base: RuntimeSettingsPreview = {
       available: false,
       path: plan.path,
+      liveBudgetTokens: plan.liveBudgetTokens,
       transition: settings.transition,
       ...(settings.transitionReason ? { transitionReason: settings.transitionReason } : {}),
     };
@@ -6132,16 +6200,24 @@ export class AgentFramework {
       // allowed to finish. Parked requests are coalesced per reason (newest
       // kept): heartbeat/gate wakes arrive once per tick and nothing else
       // bounds a multi-day maintenance window's accumulation.
-      if (this.quiesced && !budgetRestart) {
+      if (this.quiesced) {
+        const parked = budgetRestart
+          ? requests.filter((r) => r.reason !== 'context_budget_restart')
+          : requests;
         const newestByReason = new Map<string, InferenceRequest>();
-        for (const request of requests) {
+        for (const request of parked) {
           const prev = newestByReason.get(request.reason);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByReason.set(request.reason, request);
           }
         }
         this.pendingRequests.push(...newestByReason.values());
-        continue;
+        if (!budgetRestart) continue;
+        // The restart continues its held turn; its parked siblings must NOT
+        // be consumed by that turn — they were re-parked above, so narrow
+        // the batch to the restart alone before the trigger selection below.
+        requests.length = 0;
+        requests.push(budgetRestart);
       }
 
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
@@ -8013,6 +8089,32 @@ export class AgentFramework {
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
 
+            // A quiesce-abandoned cancel may surface as `error` instead of
+            // `aborted` depending on how the stream implementation reports
+            // the cancellation. Same contract as the aborted branch: settle
+            // honestly, no errorPolicy retry (which would relaunch inference
+            // mid-maintenance-window), no inference:exhausted (which feeds
+            // the failure streak / hard-down / poison-history accounting).
+            {
+              const cancelKey = `${agent.name}:${myStreamId}`;
+              if (this.frameworkCancelledStreams.get(cancelKey) === 'quiesce_abandoned') {
+                this.frameworkCancelledStreams.delete(cancelKey);
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  error: 'Turn abandoned by operator quiesce',
+                });
+                this.emitTrace({
+                  type: 'inference:aborted',
+                  agentName: agent.name,
+                  durationMs,
+                  reason: 'quiesce_abandoned',
+                });
+                this.eventGate?.onInferenceEnded(agent.name);
+                break;
+              }
+            }
+
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -9794,6 +9896,10 @@ export class AgentFramework {
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting), or in
     // driveStream's finally when the turn ends.
+    // Quiesce (issue #122): the window exists to run compression/refold
+    // against a FROZEN context — module events and api message.send must not
+    // append mid-surgery. Deferred here, flushed by resume(). tool_result
+    // still lands (a draining turn's continuation depends on it).
     const hasToolResult = content.some(b => b.type === 'tool_result');
     // Explicitly-targeted deliveries scope the tool-cycle check to the
     // target (pendingAssistantBlocks is keyed by agent); the default path
@@ -9804,7 +9910,8 @@ export class AgentFramework {
       : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
-      (midToolCycle ||
+      (this.quiesced ||
+        midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {

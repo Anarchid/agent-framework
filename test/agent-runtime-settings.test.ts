@@ -501,3 +501,28 @@ it('preflight: boot restore is never preflighted — an infeasible persisted bud
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+it('preflight: no-op and increasing patches never throw on an already-over-floor agent', async () => {
+  await withPreflightFramework(async (framework) => {
+    stubPreview(framework, 'agent', infeasibleAt(600_000)); // floor above even 550k live
+    // No-op rewrite of the current budget: settings-plane writeback shape.
+    const rewrite = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 550_000,
+      immediate: true,
+    });
+    assert.equal(rewrite.contextBudgetTokens, 550_000);
+    // Strict improvement (increase) on a wedged agent must apply, not throw.
+    const raise = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 700_000,
+    });
+    assert.equal(raise.contextBudgetTokens, 700_000);
+    // A LOWERING that does not fit still throws.
+    assert.throws(
+      () => framework.updateAgentRuntimeSettings('agent', {
+        contextBudgetTokens: 500_000,
+        immediate: true,
+      }),
+      BudgetPreflightError,
+    );
+  });
+});

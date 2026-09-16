@@ -8,6 +8,7 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
 import { ResumeBlockedError } from '../framework.js';
@@ -56,6 +57,14 @@ const DEFAULT_CONFIG: Required<Omit<ApiServerConfig, 'adminToken'>> & Pick<ApiSe
 
 /** Polling interval for subscriptions (ms) */
 const SUBSCRIPTION_POLL_INTERVAL = 50;
+
+/** Constant-time token comparison (length leak is acceptable; content isn't). */
+function timingSafeTokenEqual(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 /**
  * API Server for the agent framework.
@@ -358,19 +367,34 @@ export class ApiServer {
       case 'events.subscribe':
         return this.cmdEventsSubscribe(params as unknown as EventsSubscribeParams);
 
-      // Host quiesce/maintenance mode (issue #122)
+      // Host quiesce/maintenance mode (issue #122). When an adminToken is
+      // configured, the mutating verbs require it here too — the WS surface
+      // must not be a token-free path to the same authority as the HTTP verbs.
       case 'host.quiesce':
+        this.requireAdminToken(params);
         return this.framework.quiesce(params as
           { reason?: string; timeoutMs?: number; abandon?: boolean } | undefined);
       case 'host.resume':
+        this.requireAdminToken(params);
         return this.framework.resume(params as { force?: boolean } | undefined);
       case 'host.status':
         return this.framework.getHostModeStatus();
       case 'host.maintenanceTick':
+        this.requireAdminToken(params);
         return this.framework.maintenanceTick();
 
       default:
         throw new Error(`Unknown command: ${command}`);
+    }
+  }
+
+  /** WS-side admin gate for the mutating host verbs: no-op unless an
+   *  adminToken is configured, then `params.adminToken` must match. */
+  private requireAdminToken(params?: Record<string, unknown>): void {
+    if (this.config.adminToken === undefined) return;
+    const presented = params?.adminToken;
+    if (typeof presented !== 'string' || !timingSafeTokenEqual(presented, this.config.adminToken)) {
+      throw new Error('adminToken required for host verbs on this server');
     }
   }
 
@@ -893,10 +917,23 @@ export class ApiServer {
     const hostVerb = req.method === 'POST'
       && ['/quiesce', '/resume', '/maintenance/tick'].includes(url.pathname);
     if (hostVerb) {
-      if (this.config.adminToken !== undefined
-        && req.headers['x-admin-token'] !== this.config.adminToken) {
+      // CSRF guard: the x-admin-token header is REQUIRED even when no token
+      // is configured (any value then). A custom header makes the request
+      // non-simple, forcing a CORS preflight — and the OPTIONS response only
+      // allows Content-Type, so browsers refuse to send it cross-origin.
+      // Without this, ACAO:* + query-string options made POST /quiesce a
+      // simple request any web page could fire at a localhost bind.
+      const presented = req.headers['x-admin-token'];
+      const authorized = typeof presented === 'string' && (
+        this.config.adminToken === undefined || timingSafeTokenEqual(presented, this.config.adminToken)
+      );
+      if (!authorized) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'x-admin-token required' }));
+        res.end(JSON.stringify({
+          error: this.config.adminToken !== undefined
+            ? 'x-admin-token required (configured token mismatch or missing header)'
+            : 'x-admin-token header required (any value; forces CORS preflight)',
+        }));
         return;
       }
       const respond = (code: number, body: unknown) => {

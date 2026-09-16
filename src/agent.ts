@@ -295,6 +295,10 @@ export class Agent {
    */
   planRuntimeSettings(patch?: AgentRuntimeSettingsPatch): {
     effectiveBudgetTokens: number;
+    /** The budget compiles currently plan at — the baseline the patch moves
+     *  from. Lets callers distinguish a lowering from a no-op or an increase
+     *  (an increase on an already-wedged agent never makes things worse). */
+    liveBudgetTokens: number;
     advisoryTargetTokens?: number;
     path: 'immediate' | 'paced' | 'none';
     overrides: Record<string, unknown>;
@@ -317,17 +321,19 @@ export class Agent {
     }
 
     if (patch?.contextBudgetTokens === undefined) {
-      return { effectiveBudgetTokens: live, path: 'none', overrides };
+      return { effectiveBudgetTokens: live, liveBudgetTokens: live, path: 'none', overrides };
     }
     if (patch.contextBudgetTokens >= live || patch.immediate) {
       return {
         effectiveBudgetTokens: patch.contextBudgetTokens,
+        liveBudgetTokens: live,
         path: 'immediate',
         overrides,
       };
     }
     return {
       effectiveBudgetTokens: live,
+      liveBudgetTokens: live,
       advisoryTargetTokens: patch.contextBudgetTokens,
       path: 'paced',
       overrides,

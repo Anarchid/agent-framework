@@ -22,7 +22,7 @@ import type { StreamEvent, YieldingStream, NormalizedRequest } from '@animalabs/
 
 import { AgentFramework, ResumeBlockedError } from '../src/index.js';
 import type { TraceEvent } from '../src/types/trace.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 async function waitFor(
   description: string,
@@ -409,4 +409,113 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Review-fix regressions (code review 08-21)
+// ---------------------------------------------------------------------------
+
+test('a non-finite timeoutMs falls back to the default drain window, never NaN-collapses', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    // NaN reached quiesce() via Number('12O000') on the HTTP ingress. With
+    // the old Math.max(1_000, NaN) the deadline was NaN and the drain window
+    // collapsed to zero. No turn is in flight here, so the observable is
+    // simply that quiesce completes sanely (drained) instead of misbehaving.
+    const status = await framework.quiesce({ timeoutMs: Number('12O000') });
+    assert.equal(status.quiesced, true);
+    assert.equal(status.drained, true);
+  });
+});
+
+test('abandon can escalate an already-quiesced, undrained host', async () => {
+  class HangingStream implements YieldingStream {
+    private pendingResolve: (() => void) | null = null;
+    private aborted = false;
+    cancel(): void { this.aborted = true; this.pendingResolve?.(); }
+    provideToolResults(): void {}
+    get isWaitingForTools() { return false; }
+    get pendingToolCallIds(): string[] { return []; }
+    get toolDepth() { return 0; }
+    async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      if (!this.aborted) {
+        await new Promise<void>((resolve) => { this.pendingResolve = resolve; });
+      }
+      yield { type: 'aborted', reason: 'user' } as StreamEvent;
+    }
+  }
+  class HangingMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new HangingStream();
+    }
+  }
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+
+    const first = await framework.quiesce({ timeoutMs: 1_000 });
+    assert.equal(first.drained, false, 'hung turn survives the first window');
+
+    // Old behavior: `if (this.quiesced) return status` made this a no-op and
+    // the only way out was resume()+re-quiesce, reopening planes mid-surgery.
+    const second = await framework.quiesce({ abandon: true });
+    assert.equal(second.drained, true, 'second quiesce escalates to abandon');
+  });
+});
+
+test('context writes are deferred while quiesced and flushed by resume', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce({ reason: 'refold' });
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const before = cm.getAllMessages().length;
+
+    // Module events / api message.send route through framework.addMessage
+    // (private — invoked here the way handleProcessEvent invokes it).
+    (framework as unknown as {
+      addMessage(participant: string, content: unknown[]): unknown;
+    }).addMessage('user', [{ type: 'text', text: 'mid-surgery message' }]);
+    assert.equal(
+      cm.getAllMessages().length, before,
+      'no context append while the window is open',
+    );
+
+    await framework.resume();
+    assert.equal(
+      cm.getAllMessages().length, before + 1,
+      'the deferred write lands at resume',
+    );
+  });
+});
+
+test('a batch carrying a budget restart re-parks its sibling wakes instead of consuming them', async () => {
+  const membrane = new MockMembrane();
+  // The restart's continuation round needs a response to complete on — an
+  // empty mock stream yields no `complete` and the agent never leaves
+  // `streaming`, which reads as a scheduler hang rather than a re-park bug.
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'restart round' }]));
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // A parked wake exists...
+    framework.nudgeAgent('agent', 'operator');
+    // ...and a budget restart lands in the same pendingRequests batch.
+    (framework as unknown as {
+      pendingRequests: Array<Record<string, unknown>>;
+    }).pendingRequests.push({
+      agentName: 'agent',
+      reason: 'context_budget_restart',
+      source: 'framework',
+      timestamp: Date.now(),
+    });
+    // Drive one scheduler pass: the restart may start a turn, but the nudge
+    // must survive as a parked request rather than being consumed by it.
+    await framework.runUntilIdle();
+    await waitFor(
+      'sibling wake re-parked',
+      () => framework.getHostModeStatus().gatedRequests >= 1,
+    );
+  });
 });

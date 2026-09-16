@@ -203,6 +203,11 @@ export class McplServerConnection extends EventEmitter {
    *  Held server→host requests are never dropped and may exceed this. */
   private static readonly MAX_BUFFERED_EVENTS = 1000;
   private droppedBufferedEvents = 0;
+  /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
+   *  re-buffering mid-flush were already admitted once — applying the cap to
+   *  them again would evict events that were legally held (the cap targets
+   *  NEW arrivals during a pause, not churn from control-plane flushes). */
+  private flushDepth = 0;
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
@@ -260,11 +265,16 @@ export class McplServerConnection extends EventEmitter {
         `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
       );
     }
-    for (const { event, args } of pending) {
-      // Re-enter the gate for every buffered item. A control handler (notably
-      // tools/list_changed) may install a newer data-plane barrier while this
-      // snapshot is being flushed; later data items must observe that pause.
-      this.emit(event, ...args);
+    this.flushDepth++;
+    try {
+      for (const { event, args } of pending) {
+        // Re-enter the gate for every buffered item. A control handler (notably
+        // tools/list_changed) may install a newer data-plane barrier while this
+        // snapshot is being flushed; later data items must observe that pause.
+        this.emit(event, ...args);
+      }
+    } finally {
+      this.flushDepth--;
     }
   }
 
@@ -278,13 +288,18 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    for (const item of pending) {
-      // Re-enter the ADMISSION gate (this.emit), never super.emit: control
-      // events include channels-register/changed, which are grant-gated —
-      // the old direct flush bypassed positive-grant enforcement entirely
-      // (PR #79 review blocker 3). Data-plane items re-buffer in order via
-      // the same call, since dataPlaneReady is still false.
-      this.emit(item.event, ...item.args);
+    this.flushDepth++;
+    try {
+      for (const item of pending) {
+        // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+        // events include channels-register/changed, which are grant-gated —
+        // the old direct flush bypassed positive-grant enforcement entirely
+        // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+        // the same call, since dataPlaneReady is still false.
+        this.emit(item.event, ...item.args);
+      }
+    } finally {
+      this.flushDepth--;
     }
   }
 
@@ -351,7 +366,7 @@ export class McplServerConnection extends EventEmitter {
     // holds a live responder the server is blocking on, and dropping it would
     // strand that call forever (the server timing out and reconnecting is the
     // accepted bound there, and reconnect re-runs the barrier funnel).
-    if (this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
+    if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
       const hasResponder = (item: { args: unknown[] }): boolean => {
         const responder = item.args[1] as { respond?: unknown } | undefined;
         return typeof responder?.respond === 'function';
