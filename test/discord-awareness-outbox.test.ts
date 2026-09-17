@@ -257,7 +257,12 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.mcplServerRegistry = null;
     framework.moduleRegistry = { getModule: () => null };
     framework.lastVisiblePreview = async () => null;
-    framework.activeTurnTokens = new Set();
+    // Live rollback reserves the store: it mints turn tokens for every agent
+    // and flushes deferred writers on release — give the stub those fields.
+    framework.activeTurnTokens = new Map();
+    framework.nextTurnToken = 1;
+    framework.deferredMessages = [];
+    framework.pendingAssistantBlocks = new Map();
     framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {

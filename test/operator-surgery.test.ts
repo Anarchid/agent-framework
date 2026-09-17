@@ -120,7 +120,114 @@ describe('live operator surgery', () => {
     assert.equal(cm().getMessageCount(), 5);
     const errors = readLog(framework.getOperatorLogPath()!).filter((e) => e.kind === 'rollback' && e.error);
     assert.equal(errors.length, 3);
-    assert.match(errors[2].error!, /Cannot roll back while agent is inferring/);
+    assert.match(errors[2].error!, /Cannot roll back while scout is inferring/);
+  });
+
+  // --- store-wide exclusion ---------------------------------------------------
+  // A branch switch moves the active branch for EVERY context manager on the
+  // store; the gate must cover every agent, and hold across the await.
+
+  it('refuses surgery on an idle agent while a different agent sharing the store has a turn alive', async () => {
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'shade', model: 'test-model', systemPrompt: 'You are shade.' },
+      ],
+      modules: [],
+    });
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+    const shadeBefore = framework.getAgent('shade')!.getContextManager().getMessageCount();
+    tokens.set('shade', 7);
+    try {
+      await assert.rejects(
+        framework.rollbackToMessage('scout', { messageId: ids[1] }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /shade is idle\+turn-alive/.test(e.message),
+      );
+      await assert.rejects(
+        framework.suppressMessages('scout', { messageIds: [ids[1]] }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /shade/.test(e.message),
+      );
+    } finally {
+      tokens.delete('shade');
+    }
+    assert.equal(cm().currentBranch().name, 'main', 'shared branch untouched');
+    assert.equal(framework.getAgent('shade')!.getContextManager().getMessageCount(), shadeBefore, "shade's history untouched");
+
+    // With shade idle the same call goes through — and the reservation is
+    // released afterwards (no token left behind on either agent).
+    const r = await framework.rollbackToMessage('scout', { messageId: ids[1] });
+    assert.equal(r.messagesRemoved, 3);
+    assert.equal(tokens.size, 0, 'store reservation released');
+  });
+
+  it('holds a turn token on every agent for the duration of the switch', async () => {
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const original = c.switchBranch;
+    let heldDuringSwitch: number | null = null;
+    c.switchBranch = async (name: string) => { heldDuringSwitch = tokens.size; return original.call(c, name); };
+    try {
+      await framework.rollbackToMessage('scout', { messageId: ids[2] });
+    } finally {
+      c.switchBranch = original;
+    }
+    assert.equal(heldDuringSwitch, 1, 'reservation held while the switch was awaited');
+    assert.equal(tokens.size, 0, 'and released after');
+  });
+
+  // --- strategy-initialization failure -----------------------------------------
+  // switchBranch()/fork() move the chronicle branch BEFORE awaiting strategy
+  // initialization, so a rejection there leaves the store on the new branch.
+
+  const failNextStrategyInit = (): (() => void) => {
+    const c = cm() as unknown as { initializeStrategy: (...a: unknown[]) => Promise<void> };
+    const original = c.initializeStrategy;
+    let armed = true;
+    c.initializeStrategy = async function (this: unknown, ...args: unknown[]) {
+      if (armed) { armed = false; throw new Error('injected strategy init failure'); }
+      return original.apply(this, args);
+    };
+    return () => { c.initializeStrategy = original; };
+  };
+
+  it('rollback restores the source branch when strategy initialization rejects after the switch', async () => {
+    const restore = failNextStrategyInit();
+    try {
+      await assert.rejects(
+        framework.rollbackToMessage('scout', { messageId: ids[1], branchName: 'failed-rollback' }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
+          && /active branch restored to main/.test(e.message) && /injected/.test(e.message),
+      );
+    } finally {
+      restore();
+    }
+    assert.equal(cm().currentBranch().name, 'main');
+    assert.equal(cm().isReady(), true, 'strategy re-initialized on the source branch');
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+    assert.ok(cm().listBranches().some((b) => b.name === 'failed-rollback'), 'failed branch kept for diagnosis');
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+    assert.equal(tokens.size, 0);
+  });
+
+  it('suppress restores the source branch when fork() rejects after the switch', async () => {
+    const restore = failNextStrategyInit();
+    try {
+      await assert.rejects(
+        framework.suppressMessages('scout', { messageIds: [ids[1]], branchName: 'failed-suppress' }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
+          && /active branch restored to main/.test(e.message),
+      );
+    } finally {
+      restore();
+    }
+    assert.equal(cm().currentBranch().name, 'main');
+    assert.equal(cm().isReady(), true);
+    assert.equal(cm().getMessageCount(), 5, 'nothing redacted anywhere visible');
+    const outbox = (framework as unknown as { discordAwarenessOutbox: { batches(): Array<{ status: string }> } }).discordAwarenessOutbox;
+    assert.equal(outbox.batches().filter((b) => b.status === 'prepared').length, 0);
   });
 
   it('suppressMessages forks at head, redacts only the chosen messages on the fork, logs', async () => {

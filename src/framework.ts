@@ -4313,18 +4313,90 @@ export class AgentFramework {
   }
 
   /**
-   * The surgery idle gate. `state.status === 'idle'` alone is not enough:
-   * status reads idle from dequeue until the stream registers, and again
-   * while a turn's teardown is pending — the scheduler's own busy test is
-   * status + turn-alive (`'idle+turn-alive'`), the same predicate
-   * `puppetToolCall` uses. Re-run after every `await` that precedes a
-   * mutation: these methods yield, and the scheduler can start a turn in
-   * between.
+   * The surgery gate — STORE-wide, not per agent. A branch switch moves the
+   * active chronicle branch for every context manager sharing this store,
+   * so an in-flight turn on *any* agent would have its next writes land on
+   * a history its request was never compiled against. Every agent must be
+   * idle with no turn alive (`state.status === 'idle'` alone is not enough:
+   * status reads idle from dequeue until the stream registers and again
+   * during teardown — the scheduler's own busy test is status + turn-alive,
+   * the predicate `puppetToolCall` uses).
+   *
+   * Passing the gate RESERVES the store for the caller: a turn token is
+   * held for every agent until the returned release runs, so no wake — via
+   * the scheduler or a parked provider admission, both of which re-test
+   * turn-alive — can start a turn while the switch is awaited. Release also
+   * flushes messages that deferred behind the reservation, as the puppet
+   * does. Always release in `finally`: a token nobody clears wedges the fleet.
    */
-  private requireIdleForSurgery(agentName: string, agent: Agent, verb: string): void {
-    if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
-      const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
-      throw new OperatorActionError('agent-busy', `Cannot ${verb} while agent is ${shown}`);
+  private reserveStoreForSurgery(verb: string): () => void {
+    const busy: string[] = [];
+    for (const [name, a] of this.agents) {
+      if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
+      else if (this.activeTurnTokens.has(name)) busy.push(`${name} is idle+turn-alive`);
+    }
+    for (const name of this.activeTurnTokens.keys()) {
+      if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
+    }
+    if (busy.length > 0) {
+      throw new OperatorActionError(
+        'agent-busy',
+        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+      );
+    }
+    const reserved = new Map<string, number>();
+    for (const name of this.agents.keys()) {
+      const token = this.nextTurnToken++;
+      this.activeTurnTokens.set(name, token);
+      reserved.set(name, token);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      for (const [name, token] of reserved) {
+        if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
+      }
+      // Writers that deferred behind the reservation land now, on the branch
+      // the operator chose (or the restored source) — the same end-of-turn
+      // flush driveStream/puppet perform, under the same guard.
+      if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const name of reserved.keys()) {
+          if (this.activeTurnTokens.has(name)) continue;
+          for (const msg of this.drainDeferredFor(name)) {
+            try {
+              this.addMessage(msg.participant, msg.content, msg.metadata,
+                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+            } catch (error) {
+              console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+      }
+    };
+  }
+
+  /**
+   * After a failed switch or redaction: put the store back on `sourceBranch`
+   * if it moved, and return a sentence saying what actually happened. Never
+   * throws — the caller reports the original failure with this appended.
+   */
+  private async restoreSourceBranch(
+    cm: ContextManager,
+    sourceBranch: string,
+    failedBranch: string,
+    agentName: string,
+  ): Promise<string> {
+    const current = this.store.currentBranch().name;
+    if (current !== failedBranch) return `active branch is ${current}`;
+    try {
+      await cm.switchBranch(sourceBranch);
+      return `active branch restored to ${sourceBranch}`;
+    } catch (restoreError) {
+      const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
+      const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
+      console.error(`[operator] agent=${agentName} ${status}`);
+      return status;
     }
   }
 
@@ -4369,7 +4441,6 @@ export class AgentFramework {
     try {
       const agent = this.agents.get(agentName);
       if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      this.requireIdleForSurgery(agentName, agent, 'roll back');
       const cm = agent.getContextManager();
       const total = cm.getMessageCount();
       const requestedIndex = locateMessageIndex(cm, opts.messageId);
@@ -4394,30 +4465,46 @@ export class AgentFramework {
         throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
       }
 
-      // Prepare the external side effect before switching Chronicle. If the
-      // process dies after the switch but before activate(), startup promotes
-      // this batch by matching targetBranch to the active branch. If the
-      // fork/switch itself throws, the batch is retired so it cannot arm a
-      // later branch that happens to reuse the name.
-      const markerBatch = this.discordAwarenessOutbox?.prepare({
-        agentName,
-        sourceBranch,
-        targetBranch,
-        refs: removedRefs,
-        emoji: this.discordAwarenessEmoji,
-      }) ?? null;
-
+      // Gate + reserve the whole store (see reserveStoreForSurgery); held
+      // until the switch has landed or been rolled back.
+      const release = this.reserveStoreForSurgery('roll back');
       let branchName: string;
       try {
-        branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
-        await cm.switchBranch(branchName);
-      } catch (error) {
-        if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
-        throw error;
+        // Prepare the external side effect before switching Chronicle. If the
+        // process dies after the switch but before activate(), startup
+        // promotes this batch by matching targetBranch to the active branch.
+        // If the fork/switch itself throws, the batch is retired so it cannot
+        // arm a later branch that happens to reuse the name.
+        const markerBatch = this.discordAwarenessOutbox?.prepare({
+          agentName,
+          sourceBranch,
+          targetBranch,
+          refs: removedRefs,
+          emoji: this.discordAwarenessEmoji,
+        }) ?? null;
+
+        try {
+          branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
+          await cm.switchBranch(branchName);
+        } catch (error) {
+          // switchBranch moves the chronicle branch BEFORE awaiting strategy
+          // initialization, so a rejection here can leave the store on the
+          // new branch with an uninitialized strategy. Retire the batch and
+          // go back to the source; keep the branch for diagnosis.
+          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Rollback failed; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
+        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+        await this.syncDiscordAwarenessMarkers();
+        this.materializeConfigMountAfterBranchSwitch();
+      } finally {
+        release();
       }
-      if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-      await this.syncDiscordAwarenessMarkers();
-      this.materializeConfigMountAfterBranchSwitch();
 
       console.error(
         `[operator] rollback agent=${agentName} to=${tailMessageId}` +
@@ -4490,7 +4577,6 @@ export class AgentFramework {
     try {
       const agent = this.agents.get(agentName);
       if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      this.requireIdleForSurgery(agentName, agent, 'suppress');
       if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
       const cm = agent.getContextManager();
       const total = cm.getMessageCount();
@@ -4529,69 +4615,68 @@ export class AgentFramework {
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
-      const markerBatch = this.discordAwarenessOutbox?.prepare({
-        agentName,
-        sourceBranch,
-        targetBranch,
-        refs: removedRefs,
-        emoji: this.discordAwarenessEmoji,
-        // Seeing targetBranch active does not prove the removals finished;
-        // only this operation activates the batch, after the last redaction.
-        activationPolicy: 'explicit',
-        suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
-      }) ?? null;
-      // Anything short of activation retires the batch: a prepared explicit
-      // batch re-arms through preparedSuppressionsForBranch the moment its
-      // target branch (or a descendant) becomes active — e.g. an operator
-      // opening the failed fork to look — and an un-completable resume there
-      // aborts framework start.
-      const retireBatch = (): void => {
-        if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
-      };
-
+      // Gate + reserve the whole store (see reserveStoreForSurgery); held
+      // until the fork is fully redacted or the source is restored.
+      const release = this.reserveStoreForSurgery('suppress');
       let createdBranch: string;
       try {
-        createdBranch = await cm.fork(targetBranch);
-      } catch (error) {
-        retireBatch();
-        throw error;
-      }
-      try {
-        // fork() yielded; a turn may have started meanwhile. Redacting under
-        // a live stream corrupts wire ordering — check again before mutating.
-        this.requireIdleForSurgery(agentName, agent, 'suppress');
-        for (const iv of ordered) {
-          if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
-          else cm.removeMessage(iv.fromId as MessageId);
+        const markerBatch = this.discordAwarenessOutbox?.prepare({
+          agentName,
+          sourceBranch,
+          targetBranch,
+          refs: removedRefs,
+          emoji: this.discordAwarenessEmoji,
+          // Seeing targetBranch active does not prove the removals finished;
+          // only this operation activates the batch, after the last redaction.
+          activationPolicy: 'explicit',
+          suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
+        }) ?? null;
+        // Anything short of activation retires the batch: a prepared explicit
+        // batch re-arms through preparedSuppressionsForBranch the moment its
+        // target branch (or a descendant) becomes active — e.g. an operator
+        // opening the failed fork to look — and an un-completable resume
+        // there aborts framework start.
+        const retireBatch = (): void => {
+          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+        };
+
+        try {
+          createdBranch = await cm.fork(targetBranch);
+        } catch (error) {
+          // fork() switches the chronicle branch before awaiting strategy
+          // initialization; a rejection can leave the store on the new
+          // branch. Retire the batch and go back to the source.
+          retireBatch();
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Suppression failed creating ${targetBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
         }
-        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-      } catch (error) {
-        // A partially suppressed branch is not safe to serve from. Keep it for
-        // diagnosis, but put the agent back on the untouched source branch —
-        // and say honestly whether that restore happened.
-        retireBatch();
-        const cause = error instanceof Error ? error.message : String(error);
-        let restored: string;
-        if (this.store.currentBranch().name !== createdBranch) {
-          restored = `active branch is ${this.store.currentBranch().name}`;
-        } else {
-          try {
-            await cm.switchBranch(sourceBranch);
-            restored = `active branch restored to ${sourceBranch}`;
-          } catch (restoreError) {
-            restored = `RESTORE TO ${sourceBranch} ALSO FAILED (${restoreError instanceof Error ? restoreError.message : String(restoreError)}); ` +
-              `agent is still on the partially suppressed ${createdBranch}`;
-            console.error(`[operator] suppress agent=${agentName} ${restored}`);
+        try {
+          for (const iv of ordered) {
+            if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
+            else cm.removeMessage(iv.fromId as MessageId);
           }
+          if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
+        } catch (error) {
+          // A partially suppressed branch is not safe to serve from. Keep it
+          // for diagnosis, put the agent back on the untouched source — and
+          // say honestly whether that restore happened.
+          retireBatch();
+          const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          throw new OperatorActionError(
+            'failed',
+            `Suppression failed on ${createdBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
         }
-        throw new OperatorActionError(
-          'failed',
-          `Suppression failed on ${createdBranch}; ${restored}: ${cause}`,
-          { cause: error },
-        );
+        await this.syncDiscordAwarenessMarkers();
+        this.materializeConfigMountAfterBranchSwitch();
+      } finally {
+        release();
       }
-      await this.syncDiscordAwarenessMarkers();
-      this.materializeConfigMountAfterBranchSwitch();
 
       console.error(
         `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
