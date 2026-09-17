@@ -99,6 +99,11 @@ export class Agent {
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
   private _streamId = 0;
+  /** kv-unified receipt flights opened by the CURRENT activation and not yet
+   * settled by a usage event. Held on the agent (not only in the stream's
+   * closure) so the next activation can close whatever its predecessor left
+   * open — see failOpenKvSubmissions. */
+  private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
   lastStreamInputTokens = 0;
   /** Real prefix size of the last usage event: fresh + cache creation +
    *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
@@ -730,6 +735,19 @@ export class Agent {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
+    // A new activation supersedes every receipt flight the previous one left
+    // open. Membrane fires the kv-unified wire receipt per provider attempt,
+    // BEFORE the adapter call; only that attempt's usage event settles it.
+    // When the attempt dies without usage (transport error, idle timeout,
+    // framework cancel for a budget restart or endTurn) the flight stays open
+    // until the old driveStream's `finally` runs — and every successor path
+    // (error-policy retry, budget restart, the next wake after an abort)
+    // starts the new stream BEFORE that `finally`. The successor's first
+    // receipt then met the ledger's single-flight guard and failed the
+    // recovery itself: "kv-unified submission devops:46:…:4 is still in
+    // flight" (devops agent, 2026-09-16 07:33Z, no provider error logged).
+    this.failOpenKvSubmissions();
+
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
@@ -753,6 +771,7 @@ export class Agent {
     const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
     let kvCall = 0;
     if (kvEnabled) {
+      this.kvOpenQueue = kvQueue;
       const layoutHash = stableHash(request.messages);
       const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
       kvRequest.onCacheWireReceipt = (receipt) => {
@@ -789,6 +808,28 @@ export class Agent {
           }
         : {}),
     };
+  }
+
+  /** Close every kv-unified receipt flight the previous activation left
+   * unsettled. Idempotent: the framework's driveStream `finally` drains the
+   * same per-stream queue, so whichever runs first empties it and the other
+   * finds nothing. Failing an already-settled id is a no-op in the ledger. */
+  private failOpenKvSubmissions(): void {
+    const open = this.kvOpenQueue?.splice(0) ?? [];
+    this.kvOpenQueue = null;
+    if (open.length === 0) return;
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as { reportKvUnifiedFailed?: (submissionId: string) => void } | undefined;
+    for (const { submissionId } of open) {
+      console.error(
+        `[kv-unified] ${this.name}: closing receipt flight ${submissionId} left open by the previous activation`,
+      );
+      try {
+        strategy?.reportKvUnifiedFailed?.(submissionId);
+      } catch (err) {
+        console.error(`[kv-unified] ${this.name}: could not close flight ${submissionId}:`, err);
+      }
+    }
   }
 
   /**
