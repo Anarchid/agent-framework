@@ -1,0 +1,314 @@
+/**
+ * Durable channel-label history (mcpl/channel-label-history append log).
+ *
+ * `resolveProseTarget()` resolves a label to a channel id only against the
+ * live `channels` map, which is empty for anything the bot has disconnected
+ * from or that hasn't re-registered since a restart. `appendLabelSighting()`
+ * durably records "this channelId had this label" on every descriptor
+ * observation, and `resolveProseTargetDurable()` falls back to that history
+ * when the live path misses — the case that matters for browsing message
+ * history on an old/quiet/disconnected channel.
+ */
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
+import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
+import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
+
+const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
+
+function makeRegistry(store?: unknown) {
+  const serverRegistry = {
+    getServer: (_id: string) => null,
+  } as unknown as McplServerRegistry;
+  return new ChannelRegistry(
+    serverRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    store ? { store: store as never } : undefined,
+  );
+}
+
+/** In-memory Chronicle-store stand-in, keyed by state id (unlike a single
+ *  flat array) so the lifecycle log and the label-history log don't bleed
+ *  into each other's getStateJson()/appendToStateJson() results. */
+function memoryStore() {
+  const registered = new Set<string>();
+  const events = new Map<string, unknown[]>();
+  const store = {
+    registerState: (opts: { id: string }) => {
+      if (registered.has(opts.id)) throw new Error('State already exists');
+      registered.add(opts.id);
+      if (!events.has(opts.id)) events.set(opts.id, []);
+    },
+    getStateJson: (id: string) => events.get(id) ?? null,
+    appendToStateJson: (id: string, event: unknown) => {
+      if (!events.has(id)) events.set(id, []);
+      events.get(id)!.push(event);
+    },
+  };
+  return { store, events };
+}
+
+function descriptor(id: string, label: string) {
+  return { id, type: 'discord', label, direction: 'bidirectional' as const };
+}
+
+test('a label sighting persists across a simulated restart', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'channel-label-history-'));
+  try {
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const first = makeRegistry(store);
+    await first.handleRegister('discord', {
+      channels: [descriptor('discord:g1:c1', "#general (Antra's Guild)")],
+    });
+
+    // Fresh registry over the SAME store, like a real restart — its live
+    // `channels` map starts empty (no handleRegister call this time), so
+    // resolveProseTarget() alone cannot see this channel at all.
+    const second = makeRegistry(store);
+    const liveMiss = second.resolveProseTarget("#general (Antra's Guild)");
+    assert.ok('error' in liveMiss, 'expected a live-path miss on a fresh registry');
+
+    // resolveProseTargetDurable() falls back to replayed history and finds it.
+    assert.deepEqual(
+      second.resolveProseTargetDurable("#general (Antra's Guild)"),
+      { channelId: 'discord:g1:c1', label: "#general (Antra's Guild)" },
+    );
+
+    // Name-segment match (bare name, parenthetical guild suffix omitted)
+    // mirrors resolveProseTarget()'s own byName normalization.
+    assert.deepEqual(
+      second.resolveProseTargetDurable('#general'),
+      { channelId: 'discord:g1:c1', label: "#general (Antra's Guild)" },
+    );
+
+    // Raw channelId also resolves, like resolveProseTarget()'s raw-id path.
+    assert.deepEqual(
+      second.resolveProseTargetDurable('discord:g1:c1'),
+      { channelId: 'discord:g1:c1', label: "#general (Antra's Guild)" },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('repeated identical label sightings do not bloat the log', async () => {
+  const { store, events } = memoryStore();
+  const registry = makeRegistry(store);
+
+  for (let i = 0; i < 3; i++) {
+    await registry.handleRegister('discord', {
+      channels: [descriptor('discord:g1:c1', '#general')],
+    });
+  }
+
+  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
+  assert.equal(log.length, 1, 'unchanged sightings must not append new records');
+});
+
+test('a genuinely new label sighting does append a new record', async () => {
+  const { store, events } = memoryStore();
+  const registry = makeRegistry(store);
+
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general')] });
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general-renamed')] });
+
+  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
+  assert.equal(log.length, 2);
+  // Later sighting wins on replay.
+  const second = makeRegistry(store);
+  assert.deepEqual(second.resolveProseTargetDurable('#general-renamed'), {
+    channelId: 'discord:g1:c1',
+    label: '#general-renamed',
+  });
+});
+
+test('resolveProseTargetDurable prefers the live path and only falls back to history on a live miss', async () => {
+  const { store, events } = memoryStore();
+  // Pre-seed history: a DIFFERENT (now-disconnected) channel historically
+  // held the same label text that a currently-live channel holds now.
+  events.set(CHANNEL_LABEL_HISTORY_LOG_ID, [
+    { channelId: 'discord:g1:ghost', label: 'shared-label', ts: 1 },
+  ]);
+
+  const registry = makeRegistry(store);
+  await registry.handleRegister('discord', {
+    channels: [descriptor('discord:g1:live', 'shared-label')],
+  });
+
+  // Live path resolves uniquely against the live channel — must win over
+  // the (stale) history entry for the ghost channel.
+  const live = registry.resolveProseTarget('shared-label');
+  assert.deepEqual(live, { channelId: 'discord:g1:live', label: 'shared-label' });
+  assert.deepEqual(registry.resolveProseTargetDurable('shared-label'), live);
+});
+
+test('a channel with no history at all still returns the original resolveProseTarget error/candidates unchanged', async () => {
+  const registry = makeRegistry(); // no chronicle store at all — appendLabelSighting must no-op safely
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#other')] });
+
+  const live = registry.resolveProseTarget('#nonexistent');
+  assert.ok('error' in live);
+
+  const durable = registry.resolveProseTargetDurable('#nonexistent');
+  assert.deepEqual(durable, live);
+
+  // Also true for an entirely empty registry (no channels ever seen).
+  const empty = makeRegistry();
+  const liveEmpty = empty.resolveProseTarget('#anything');
+  assert.deepEqual(empty.resolveProseTargetDurable('#anything'), liveEmpty);
+});
+
+test('ensureChannelRegistered and handleChanged updates also feed label history', async () => {
+  const { store, events } = memoryStore();
+  const registry = makeRegistry(store);
+
+  // ensureChannelRegistered: lazy registration with NO label at all (e.g. a
+  // DM push missing both channelName and an author name). This must NOT be
+  // durably recorded as if the bare channelId were a real label (finding
+  // #3) — only the in-memory descriptor gets the placeholder, for live
+  // routing purposes.
+  registry.ensureChannelRegistered('discord', 'discord:dm:1', undefined);
+  // ...then a later message reveals a real label — the backfill path.
+  registry.ensureChannelRegistered('discord', 'discord:dm:1', 'DM: Antra');
+
+  // handleChanged: an "added" channel, then an "updated" descriptor for it.
+  await registry.handleChanged('discord', {
+    added: [descriptor('discord:g1:c2', '#dev')],
+  });
+  await registry.handleChanged('discord', {
+    updated: [descriptor('discord:g1:c2', '#dev-renamed')],
+  });
+
+  const restarted = makeRegistry(store);
+  assert.deepEqual(restarted.resolveProseTargetDurable('DM: Antra'), {
+    channelId: 'discord:dm:1',
+    label: 'DM: Antra',
+  });
+  assert.deepEqual(restarted.resolveProseTargetDurable('#dev-renamed'), {
+    channelId: 'discord:g1:c2',
+    label: '#dev-renamed',
+  });
+
+  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
+  // discord:dm:1: the label-less lazy registration records NOTHING (fix
+  // #3), only the backfill ('DM: Antra') does = 1 record; discord:g1:c2
+  // added ('#dev') then updated ('#dev-renamed') = 2 records. Total 3, not
+  // the 4 a placeholder-recording implementation would produce.
+  assert.equal(log.length, 3);
+});
+
+test('a label-less lazy registration alone (no later backfill) records nothing durably (finding #3)', async () => {
+  const { store, events } = memoryStore();
+  const registry = makeRegistry(store);
+
+  registry.ensureChannelRegistered('discord', 'discord:dm:2', undefined);
+
+  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
+  assert.equal(log.length, 0, 'a placeholder label (bare channelId) must never be durably recorded');
+});
+
+test('a label-less lazy re-registration after restart does not clobber an already-durable real label (finding #3)', async () => {
+  const { store, events } = memoryStore();
+  const first = makeRegistry(store);
+  // Boot 1: a real label lands on file (e.g. a DM push that DID carry a
+  // display name).
+  first.ensureChannelRegistered('discord', 'discord:dm:3', 'DM: Antra');
+  assert.equal((events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? []).length, 1);
+
+  // Simulated restart: fresh registry, live `channels` map starts empty —
+  // this is exactly the state that makes the NEXT event take the
+  // fresh-registration branch of ensureChannelRegistered again, even
+  // though the channel already has a real label on file.
+  const second = makeRegistry(store);
+  assert.deepEqual(second.resolveProseTargetDurable('DM: Antra'), {
+    channelId: 'discord:dm:3',
+    label: 'DM: Antra',
+  });
+
+  // A label-less push arrives post-restart. This used to durably overwrite
+  // the real label with the bare-id placeholder, and the dedup guard would
+  // then append a SECOND record the moment a later event restored the real
+  // label — degrading the log forever on every boot that hit this path.
+  second.ensureChannelRegistered('discord', 'discord:dm:3', undefined);
+
+  assert.deepEqual(second.resolveProseTargetDurable('DM: Antra'), {
+    channelId: 'discord:dm:3',
+    label: 'DM: Antra',
+  });
+  assert.equal(
+    (events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? []).length,
+    1,
+    'a label-less event must not durably record a placeholder over an already-known real label',
+  );
+});
+
+test('a label-less descriptor from handleRegister does not crash and does not poison labelHistory (finding #2)', async () => {
+  const { store } = memoryStore();
+  const registry = makeRegistry(store);
+
+  // ChannelDescriptor.label: string is a compile-time-only assertion over
+  // untrusted wire data — handleRegister only runtime-validates `id`. Build
+  // a descriptor with a missing label the way a misbehaving MCPL server
+  // could actually send one.
+  const labelless = { id: 'discord:g1:broken', type: 'discord', direction: 'bidirectional' as const };
+  await registry.handleRegister('discord', { channels: [labelless as unknown as ReturnType<typeof descriptor>] });
+
+  // A subsequent, UNRELATED resolution call must still work — before the
+  // fix, an undefined label silently written into labelHistory threw a
+  // TypeError inside normalizeChannelLabel's `.replace()` on every future
+  // resolveProseTargetDurable call with a channelId, not just this one
+  // (this is what made it crash all four HistoryModule tools process-wide).
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c2', '#general')] });
+  assert.deepEqual(registry.resolveProseTargetDurable('#general'), {
+    channelId: 'discord:g1:c2',
+    label: '#general',
+  });
+  assert.doesNotThrow(() => registry.resolveProseTargetDurable('#anything-else'));
+});
+
+test('a channel renamed A -> B -> A is still resolvable by a name from BEFORE the most recent rename (finding #9)', async () => {
+  const { store } = memoryStore();
+  const registry = makeRegistry(store);
+
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#alpha')] });
+  await registry.handleChanged('discord', { updated: [descriptor('discord:g1:c1', '#beta')] });
+  await registry.handleChanged('discord', { updated: [descriptor('discord:g1:c1', '#alpha')] });
+
+  // Live-path check: '#alpha' is current again, so it resolves live.
+  assert.deepEqual(registry.resolveProseTarget('#alpha'), { channelId: 'discord:g1:c1', label: '#alpha' });
+
+  // The interesting case: '#beta' is a name from BEFORE the most recent
+  // rename (A -> B -> A), not the current OR immediately-previous label —
+  // labelHistory alone (latest-only) could never answer this; it needs
+  // allLabelsSeen's full per-channel history.
+  const restarted = makeRegistry(store);
+  assert.deepEqual(restarted.resolveProseTargetDurable('#beta'), {
+    channelId: 'discord:g1:c1',
+    label: '#alpha', // reported label is always the CURRENT/latest one
+  });
+});
+
+test('a genuine label collision across two different channels reports ambiguity, not a silent pick (finding #9)', async () => {
+  const { store } = memoryStore();
+  const registry = makeRegistry(store);
+
+  // Two DIFFERENT channels each historically held the label '#shared' —
+  // channel a's label has since moved on, channel b's has not.
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:a', '#shared')] });
+  await registry.handleChanged('discord', { updated: [descriptor('discord:g1:a', '#a-current')] });
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:b', '#shared')] });
+
+  // A fresh (post-restart) registry — live path can't shortcut this to a
+  // unique live match, so resolution goes through the historical-label
+  // scan that must detect the collision across the two distinct channelIds.
+  const restarted = makeRegistry(store);
+  const result = restarted.resolveProseTargetDurable('#shared');
+  assert.ok('error' in result, `expected an ambiguity error, got ${JSON.stringify(result)}`);
+});

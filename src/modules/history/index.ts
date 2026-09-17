@@ -9,13 +9,25 @@
  * this module can answer "what happened in #foo last Tuesday" against a
  * multi-million-message store without walking the whole log.
  *
- * Three tools:
- *  - `stats`   — per-channel message counts (all-time) + token totals
- *                (range-scoped), for orienting before pulling raw content.
- *  - `extract` — paginated raw messages for a time range and/or channel.
- *  - `search`  — substring/regex match over a narrowed candidate window,
- *                with an explicit truncation signal when the caller's
- *                filter was too broad for `maxScan`.
+ * Four tools:
+ *  - `stats`    — per-channel message counts (all-time) + token totals
+ *                 (range-scoped), for orienting before pulling raw content.
+ *  - `extract`  — paginated raw messages for a time range and/or channel.
+ *  - `search`   — substring/regex match over a narrowed candidate window,
+ *                 with an explicit truncation signal when the caller's
+ *                 filter was too broad for `maxScan`.
+ *  - `overview` — a compression-summary table of contents (zero new LLM
+ *                 calls) for a time range, gap-filled with raw message
+ *                 counts wherever nothing has been summarized yet. See
+ *                 `handleOverview` for the fold-reduction and gap-fill
+ *                 algorithm.
+ *
+ * All four accept `channelId` as either a channel label (e.g. `#general`)
+ * or a raw internal channel id — `resolveChannel()` resolves a label via
+ * the bound `ChannelRegistry`'s durable label history before it reaches any
+ * context-manager call. A host that hasn't wired up MCPL (no registry
+ * bound) sees unchanged behavior: `channelId` is treated as already the raw
+ * internal id.
  *
  * Kept deliberately read-only, same posture as HealthModule: no side
  * effects, no message mutation. `onProcess` is a no-op.
@@ -30,12 +42,13 @@
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import type { ContextManager, StoredMessage, ChannelCount, ChannelTokenStats } from '@animalabs/context-manager';
+import type { ContextManager, StoredMessage, ChannelCount, ChannelTokenStats, TimeRangeSummaryEntry } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Module, ModuleContext } from '../../types/module.js';
 import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../types/events.js';
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
+import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
 
 // ============================================================================
 // Tool input shapes
@@ -67,6 +80,13 @@ interface SearchInput {
   maxScan?: number;
 }
 
+interface OverviewInput {
+  from?: string;
+  to?: string;
+  channelId?: string;
+  level?: number;
+}
+
 // ============================================================================
 // Limits
 // ============================================================================
@@ -92,6 +112,15 @@ const SEARCH_DEFAULT_LIMIT = 20;
 const SEARCH_MAX_LIMIT = 100;
 const SEARCH_DEFAULT_MAX_SCAN = 5000;
 const SEARCH_MAX_MAX_SCAN = 50000;
+
+/**
+ * Minimum gap size `overview` will bother probing with a `getChannelTokenStats`
+ * call. Sub-second/empty seams between adjacent summaries (or between a
+ * range bound and the nearest summary) are compression-log bookkeeping
+ * noise, not a real unsummarized span — probing every one of them would add
+ * native calls without adding anything useful to the response.
+ */
+const OVERVIEW_MIN_GAP_MS = 5_000;
 
 /** Characters of surrounding context kept on each side of a search snippet. */
 const SNIPPET_CONTEXT_CHARS = 80;
@@ -119,16 +148,72 @@ export class HistoryModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private cm: ContextManager | null = null;
+  private channelRegistry: ChannelRegistry | null = null;
 
   /**
-   * Wire the context-manager instance. Host calls this after
-   * ContextManager.open() so the module can issue the native index-backed
-   * queries — ModuleContext itself exposes no store/context-manager
-   * reference, only the narrower message CRUD surface (addMessage/getMessage/
-   * queryMessages), which can't do range or channel queries.
+   * Wire the context-manager instance, and optionally the host's
+   * ChannelRegistry. Host calls this after ContextManager.open() so the
+   * module can issue the native index-backed queries — ModuleContext itself
+   * exposes no store/context-manager reference, only the narrower message
+   * CRUD surface (addMessage/getMessage/queryMessages), which can't do
+   * range or channel queries.
+   *
+   * `channelRegistry` is optional: a host without MCPL wired up has no
+   * registry to pass, and `resolveChannel()` falls back to treating
+   * `channelId` as already the raw internal id — today's behavior,
+   * unchanged.
    */
-  bind(contextManager: ContextManager): void {
+  bind(contextManager: ContextManager, channelRegistry?: ChannelRegistry): void {
     this.cm = contextManager;
+    this.channelRegistry = channelRegistry ?? null;
+  }
+
+  /**
+   * Resolve an agent-supplied channel spec — a label like `#general` or an
+   * already-raw internal channelId — to the internal id used by
+   * context-manager's channel-indexed queries, via the bound
+   * ChannelRegistry's durable label history (`resolveProseTargetDurable`,
+   * which survives the bot disconnecting from or restarting on a channel —
+   * exactly the case that matters for browsing OLD history).
+   *
+   * Falls through the input unchanged when no registry is bound (host
+   * without MCPL — today's behavior). On a registry MISS, the response
+   * depends on whether the spec actually looks like a label: `#general` or
+   * `@name` (the syntax `resolveProseTarget` itself treats as unambiguously
+   * label-shaped — see its own leading `#`/`@` handling) is very likely a
+   * typo, not a raw internal id, so a miss there throws the resolver's own
+   * error (with its `candidates` suggestions folded in) instead of quietly
+   * treating the typo as an empty/nonexistent channel. Anything else is
+   * passed through as an escape hatch — an agent can legitimately already
+   * hold a raw channelId (e.g. echoed back by a prior
+   * `stats`/`extract`/`search`/`overview` call), and erroring on that would
+   * break working addressing to "fix" a spec that was never a label at all.
+   */
+  private resolveChannel(input: string | undefined): string | undefined {
+    if (!input || !this.channelRegistry) return input;
+    const resolved = this.channelRegistry.resolveProseTargetDurable(input);
+    if (!('error' in resolved)) return resolved.channelId;
+    if (input.startsWith('#') || input.startsWith('@')) {
+      const suggestions = resolved.candidates?.length ? ` Did you mean: ${resolved.candidates.join(', ')}?` : '';
+      throw new Error(`Could not resolve channel "${input}": ${resolved.error}.${suggestions}`);
+    }
+    return input;
+  }
+
+  /**
+   * Earliest message timestamp anywhere in the store, constrained to
+   * `toMs` when given (never look past the caller's own upper bound while
+   * anchoring). Used by `handleOverview` to anchor its gap-walk cursor when
+   * `from` is omitted — see the cursor-anchoring comment there for why
+   * falling back to "now" instead is wrong. Cheap: a single native
+   * time-indexed query for one message (oldest-first is
+   * `queryMessagesByTime`'s default order). Returns undefined for a
+   * genuinely empty store (or empty up to `toMs`).
+   */
+  private earliestMessageMs(toMs: number | undefined): number | undefined {
+    const cm = this.cm as ContextManager;
+    const probe = cm.queryMessagesByTime({ toMs, limit: 1 });
+    return probe.messages[0]?.timestamp.getTime();
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -154,7 +239,7 @@ export class HistoryModule implements Module {
           properties: {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound for tokenStatsForRange. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound for tokenStatsForRange. Omit for open-ended.' },
-            channelId: { type: 'string', description: 'Restrict both parts of the response to one channel.' },
+            channelId: { type: 'string', description: 'Restrict both parts of the response to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
           },
         },
       },
@@ -170,7 +255,7 @@ export class HistoryModule implements Module {
           properties: {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
-            channelId: { type: 'string', description: 'Restrict to one channel.' },
+            channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
             limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
@@ -194,11 +279,46 @@ export class HistoryModule implements Module {
             caseSensitive: { type: 'boolean', description: 'Case-sensitive match (default false).' },
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
-            channelId: { type: 'string', description: 'Restrict to one channel.' },
+            channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
             limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
           },
           required: ['query'],
+        },
+      },
+      {
+        name: 'overview',
+        description:
+          'Browse a time range when you don\'t know exactly what you\'re looking for yet: returns existing ' +
+          'compression summaries as a table of contents, at zero new LLM cost (purely a read over summaries ' +
+          'already produced by compression). Spans not yet summarized fall back to raw message counts, ' +
+          'marked summarized:false. Omit `level` to let each span show its own coarsest available summary ' +
+          '(spans can end up at DIFFERENT levels — the response then reports maxLevelAvailable rather than ' +
+          'a single `level`, since no one number would describe a mixed result); pass an exact `level` for ' +
+          'flat, single-granularity results instead (finer detail = lower level), and the response then ' +
+          'echoes that `level` back. `channelId` (a label like "#general" or the raw internal id) narrows ' +
+          'WHICH spans are shown (only spans with at least one message from that channel) and scopes each ' +
+          'entry\'s messageCount/tokensEstimate to that channel\'s own numbers (spanMessageCount/' +
+          'spanTokensEstimate carry the whole-span totals alongside, for context) — but does NOT scope a ' +
+          'kept entry\'s summary TEXT to that channel: compression doesn\'t chunk per-channel, so a ' +
+          'summary may describe other channels\' traffic too. A wide or unbounded from/to can be expensive ' +
+          'on a cold cache — same cost class as `stats`\'s tokenStatsForRange — since gap-filling still ' +
+          'walks the underlying message range wherever nothing has been summarized yet.',
+        inputSchema: {
+          type: 'object' as const,
+          properties: {
+            from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
+            to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
+            channelId: { type: 'string', description: 'Only show spans with traffic from this channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
+            level: {
+              type: 'number',
+              description:
+                'Exact summary level to fetch, flat (no fold-reduction across levels). Omit to default to ' +
+                'each span\'s own coarsest currently-available summary (a mix of levels across the response ' +
+                'is expected and normal), reduced so a folded summary\'s now-superseded child does not also ' +
+                'appear alongside a coarser entry that already covers its span.',
+            },
+          },
         },
       },
     ];
@@ -216,6 +336,8 @@ export class HistoryModule implements Module {
           return this.handleExtract((call.input ?? {}) as ExtractInput);
         case 'search':
           return await this.handleSearch((call.input ?? {}) as SearchInput);
+        case 'overview':
+          return this.handleOverview((call.input ?? {}) as OverviewInput);
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
@@ -228,9 +350,9 @@ export class HistoryModule implements Module {
       // capability-absent error ("Chronicle history index unsupported...",
       // thrown by queryMessagesByTime/queryMessagesByChannel/
       // queryMessagesByTimeAndChannel/getChannelMessageCounts/
-      // getChannelTokenStats on a chronicle build that predates the native
-      // index-query capability) — all surfaced as a normal tool error
-      // rather than crashing the module.
+      // getChannelTokenStats/getSummariesInRange/getMaxSummaryLevel on a
+      // chronicle/strategy build that predates the relevant capability) —
+      // all surfaced as a normal tool error rather than crashing the module.
       return {
         success: false,
         isError: true,
@@ -248,6 +370,7 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private handleStats(input: StatsInput): ToolResult {
+    const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     const cm = this.cm as ContextManager;
@@ -255,8 +378,8 @@ export class HistoryModule implements Module {
     let messageCountsAllTime: ChannelCount[] = cm.getChannelMessageCounts();
     let tokenStatsForRange: ChannelTokenStats = cm.getChannelTokenStats({ fromMs, toMs });
 
-    if (input.channelId) {
-      messageCountsAllTime = messageCountsAllTime.filter((c) => c.channelId === input.channelId);
+    if (channelId) {
+      messageCountsAllTime = messageCountsAllTime.filter((c) => c.channelId === channelId);
       tokenStatsForRange = {
         // Totals stay whole-range (they're documented as store-wide-for-the-range,
         // not per-channel); only the byChannel breakdown is narrowed. Labeling the
@@ -265,7 +388,7 @@ export class HistoryModule implements Module {
         // misleadingly-merged single-channel total.
         totalMessages: tokenStatsForRange.totalMessages,
         totalTokensEstimate: tokenStatsForRange.totalTokensEstimate,
-        byChannel: tokenStatsForRange.byChannel.filter((c) => c.channelId === input.channelId),
+        byChannel: tokenStatsForRange.byChannel.filter((c) => c.channelId === channelId),
       };
     }
 
@@ -284,6 +407,7 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private handleExtract(input: ExtractInput): ToolResult {
+    const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
@@ -294,7 +418,7 @@ export class HistoryModule implements Module {
     const result = cm.queryMessagesByTimeAndChannel({
       fromMs,
       toMs,
-      channelId: input.channelId,
+      channelId,
       limit,
       offset,
     });
@@ -317,6 +441,7 @@ export class HistoryModule implements Module {
     if (!input.query) {
       throw new Error('search requires a non-empty "query".');
     }
+    const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit');
@@ -346,7 +471,7 @@ export class HistoryModule implements Module {
     const probe = cm.queryMessagesByTimeAndChannel({
       fromMs,
       toMs,
-      channelId: input.channelId,
+      channelId,
       limit: maxScan + 1,
       offset: 0,
     });
@@ -466,6 +591,191 @@ export class HistoryModule implements Module {
       // already-exited worker is a harmless no-op.
       if (worker) void worker.terminate().catch(() => {});
     }
+  }
+
+  // ==========================================================================
+  // overview
+  // ==========================================================================
+
+  private handleOverview(input: OverviewInput): ToolResult {
+    const channelId = this.resolveChannel(input.channelId);
+    const fromMs = parseIsoDate(input.from, 'from');
+    const toMs = parseIsoDate(input.to, 'to');
+    const cm = this.cm as ContextManager;
+
+    let entries: TimeRangeSummaryEntry[];
+    if (input.level !== undefined) {
+      // Caller asked for one exact level: flat, no fold-reduction — they
+      // want that granularity, not the coarsest-available mix below.
+      entries = cm.getSummariesInRange({ fromMs, toMs, level: input.level });
+    } else {
+      // No level given: fetch every level overlapping the range, then
+      // reduce to only "current" (non-superseded) entries. getSummariesInRange
+      // does NOT filter by fold status — a folded child and the coarser
+      // parent it was folded into can BOTH independently overlap the query
+      // range and BOTH come back in `all` (see TimeRangeSummaryEntry.parentId's
+      // doc comment in context-manager).
+      //
+      // Two complementary checks, because an ancestor CHAIN can be broken:
+      // `listSummariesInRange` silently skips an entry whose source range no
+      // longer resolves (a pruned/redacted source message, or a viewFilter
+      // exclusion — a real, named failure mode elsewhere in
+      // autobiographical.ts's contiguousMergeCandidates). If that skipped
+      // entry is an INTERMEDIATE level, its children's parentId points at an
+      // id that never made it into `all`, so the immediate-parent check
+      // alone can't see past the gap and a since-superseded child survives
+      // alongside the coarser grandparent that already covers its span.
+      //  1. Immediate-parent check (cheap, covers the intact-chain case).
+      //  2. Containment sweep (backstop, robust to a broken chain): drop an
+      //     entry if any OTHER fetched entry is STRICTLY coarser (higher
+      //     level) and its span fully contains this one — that entry
+      //     already covers the same messages regardless of whether the
+      //     parentId pointer chain between them survived intact.
+      // O(n^2) in the fetched set size, which is fine at summary-archive
+      // scale (bounded by how much has been compressed into this range, not
+      // by raw message count).
+      const all = cm.getSummariesInRange({ fromMs, toMs });
+      const idsInSet = new Set(all.map((e) => e.id));
+      entries = all.filter((e) => {
+        if (e.parentId && idsInSet.has(e.parentId)) return false;
+        return !all.some((f) => f.id !== e.id && f.level > e.level && f.startMs <= e.startMs && f.endMs >= e.endMs);
+      });
+    }
+    entries.sort((a, b) => a.startMs - b.startMs);
+
+    // Per-summary channel/token stats — same call `stats` uses, scoped to
+    // just this entry's own source span.
+    const summarized = entries.map((entry) => ({
+      startMs: entry.startMs,
+      endMs: entry.endMs,
+      summarized: true as const,
+      content: entry.content,
+      level: entry.level,
+      stats: cm.getChannelTokenStats({ fromMs: entry.startMs, toMs: entry.endMs }),
+    }));
+
+    // Gap-fill: walk the sorted summary spans and probe seams wide enough
+    // to be worth a getChannelTokenStats call. A gap with real traffic
+    // becomes a synthetic summarized:false entry; an empty gap (nothing
+    // happened there) is skipped rather than cluttering the response.
+    //
+    // Cursor anchoring when `from` is omitted: NOT "now" — with zero
+    // summaries minted yet (first-ever call, or a PassthroughStrategy host
+    // where getSummariesInRange always returns []) that would make the
+    // whole walk a zero-width no-op and silently report entries:[] even
+    // though the store is full of messages. And even WITH summaries
+    // present, starting at the first summary's startMs silently hides any
+    // older unsummarized traffic that predates every summary (e.g. history
+    // from before compression was enabled). Anchor instead at the earlier
+    // of "the first summary's start" and "the earliest real message in the
+    // store" — falling back to Date.now() only when NEITHER exists, i.e.
+    // the store is genuinely empty, where entries:[] is the correct answer.
+    const rangeEnd = toMs ?? Date.now();
+    const firstEntryStartMs = entries[0]?.startMs;
+    let cursor: number;
+    if (fromMs !== undefined) {
+      cursor = fromMs;
+    } else {
+      const earliestMessageMs = this.earliestMessageMs(toMs);
+      cursor =
+        earliestMessageMs !== undefined && firstEntryStartMs !== undefined
+          ? Math.min(earliestMessageMs, firstEntryStartMs)
+          : earliestMessageMs ?? firstEntryStartMs ?? Date.now();
+    }
+
+    const gaps: Array<{ startMs: number; endMs: number; summarized: false; stats: ChannelTokenStats }> = [];
+    // True once `cursor` has been advanced past at least one real summary
+    // entry's endMs — only THEN is `cursor` itself a value that a summary
+    // already claims (and so needs a +1 nudge below to probe half-open).
+    // The very first gap (before any entry) sits against `fromMs` or an
+    // earliest-message anchor, neither of which any summary has claimed,
+    // so it must NOT be nudged — nudging it would skip a real message
+    // sitting exactly at the anchor.
+    let cursorIsEntryBoundary = false;
+    for (const entry of entries) {
+      // getChannelTokenStats's range is BOTH-ENDS INCLUSIVE (chronicle's
+      // gte/lte), so probing the raw [cursor, entry.startMs] pair would
+      // re-count the neighboring summaries' own boundary messages (ts ===
+      // cursor from the entry before, ts === entry.startMs from this one)
+      // as if they were unsummarized — fabricating a phantom gap between
+      // EVERY pair of adjacent summaries, even when they cover 100% of
+      // traffic with zero real gap between them. Narrow to a half-open
+      // probe instead, and let the width check below run AFTER narrowing —
+      // a seam that looked wide pre-narrow can collapse to zero or go
+      // negative once both ends are pulled in by 1ms; the `>` comparison
+      // naturally skips both a trivial and a negative width, no separate
+      // guard needed.
+      const probeFrom = cursorIsEntryBoundary ? cursor + 1 : cursor;
+      const probeTo = entry.startMs - 1;
+      if (probeTo - probeFrom > OVERVIEW_MIN_GAP_MS) {
+        const stats = cm.getChannelTokenStats({ fromMs: probeFrom, toMs: probeTo });
+        if (stats.totalMessages > 0) gaps.push({ startMs: probeFrom, endMs: probeTo, summarized: false, stats });
+      }
+      cursor = Math.max(cursor, entry.endMs);
+      cursorIsEntryBoundary = true;
+    }
+    {
+      // Trailing gap: rangeEnd is either the caller's own inclusive `to`
+      // bound or Date.now() — never a summary boundary — so only the LOWER
+      // end gets the half-open nudge (same reasoning as inside the loop).
+      const probeFrom = cursorIsEntryBoundary ? cursor + 1 : cursor;
+      const probeTo = rangeEnd;
+      if (probeTo - probeFrom > OVERVIEW_MIN_GAP_MS) {
+        const stats = cm.getChannelTokenStats({ fromMs: probeFrom, toMs: probeTo });
+        if (stats.totalMessages > 0) gaps.push({ startMs: probeFrom, endMs: probeTo, summarized: false, stats });
+      }
+    }
+
+    // Merge summary-backed + gap-filled spans, apply the channel filter
+    // (drop any span with zero messages from the requested channel — but
+    // keep a kept summary's `content` unfiltered: compression doesn't chunk
+    // per-channel, so the text may legitimately describe other channels
+    // too), sort, and project to the response shape.
+    const merged = [...summarized, ...gaps].sort((a, b) => a.startMs - b.startMs);
+    const filtered = channelId
+      ? merged.filter((e) => e.stats.byChannel.some((c) => c.channelId === channelId))
+      : merged;
+
+    return {
+      success: true,
+      data: {
+        range: { from: input.from ?? null, to: input.to ?? null },
+        // Only meaningful as a single number when `level` was pinned: the
+        // default (fold-reduced) result mixes spans at whatever level each
+        // one's own coarsest-available summary happens to be, so reporting
+        // a single `level` there would be actively misleading (an agent
+        // could see level:3 while looking at an L1 entry). Each summarized
+        // entry already carries its own accurate `level`; the top-level
+        // field instead reports the ceiling as `maxLevelAvailable` in that
+        // case, distinctly named so it can't be mistaken for a uniform
+        // per-entry level.
+        ...(input.level !== undefined ? { level: input.level } : { maxLevelAvailable: cm.getMaxSummaryLevel() }),
+        entries: filtered.map((e) => {
+          // When channelId narrows the response, the numbers an agent will
+          // actually reason over (messageCount/tokensEstimate) are scoped
+          // to THAT channel — not the whole span, which can otherwise
+          // include far more traffic from other channels sharing the same
+          // summarized/gap span. This is a deliberate departure from
+          // `stats`, which keeps its top-level totals whole-range and only
+          // narrows the byChannel breakdown (documented in handleStats) —
+          // here, an agent that asked to narrow by channel is reasoning
+          // about that channel specifically, so the whole-span totals stay
+          // available under distinctly-named spanMessageCount/
+          // spanTokensEstimate instead of silently double-serving as both.
+          const channelStats = channelId ? e.stats.byChannel.find((c) => c.channelId === channelId) : undefined;
+          return {
+            from: new Date(e.startMs).toISOString(),
+            to: new Date(e.endMs).toISOString(),
+            summarized: e.summarized,
+            ...(e.summarized ? { content: e.content, level: e.level } : {}),
+            messageCount: channelStats ? channelStats.messages : e.stats.totalMessages,
+            tokensEstimate: channelStats ? channelStats.tokensEstimate : e.stats.totalTokensEstimate,
+            ...(channelId ? { spanMessageCount: e.stats.totalMessages, spanTokensEstimate: e.stats.totalTokensEstimate } : {}),
+            byChannel: e.stats.byChannel,
+          };
+        }),
+      },
+    };
   }
 }
 

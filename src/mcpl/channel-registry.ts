@@ -45,6 +45,18 @@ import { CapabilityGrant } from './capability-grant.js';
 const TYPING_INTERVAL_MS = 7_000;
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
+/**
+ * Durable "which label did this channelId have, each time we saw it" log.
+ * `resolveProseTarget()` resolves a label to an id only for channels
+ * currently in the live `channels` map — fine for normal addressing, but
+ * useless for browsing history on a channel the bot has since disconnected
+ * from (or that didn't survive a restart). This log lets that lookup survive
+ * a disconnect/restart by replaying the most recent label sighting per
+ * channelId. See `labelHistory`, `appendLabelSighting`, and
+ * `resolveProseTargetDurable`.
+ */
+const CHANNEL_LABEL_HISTORY_LOG_ID = 'mcpl/channel-label-history';
+
 type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
 
 /**
@@ -95,6 +107,35 @@ interface ChannelLifecycleEvent {
   source?: string;
   messageId?: string;
   acknowledgment?: string;
+}
+
+/** One append-log record in `CHANNEL_LABEL_HISTORY_LOG_ID`: "at `ts`, this
+ *  channelId's label was observed to be `label`". See `labelHistory`. */
+interface ChannelLabelSightingEvent {
+  channelId: string;
+  label: string;
+  ts: number;
+}
+
+/**
+ * Case-insensitive channel-label comparison key: strips a leading '#' and
+ * lowercases. Mirrors the normalization `resolveProseTarget()` applies to
+ * its live-channel label matches (see the local `norm` there) — factored out
+ * so `resolveLabelFromHistory()` recognizes the same spellings without
+ * duplicating (and risking drift from) the live matching rules.
+ */
+function normalizeChannelLabel(s: string): string {
+  return s.replace(/^#/, '').toLowerCase();
+}
+
+/**
+ * Same as `normalizeChannelLabel`, but also strips a trailing parenthetical
+ * guild/server suffix (e.g. "#fable (antra's server)" -> "fable") so a bare
+ * channel name matches the disambiguated label agents often omit. Mirrors
+ * `resolveProseTarget()`'s local `nameOf` helper.
+ */
+function normalizeChannelLabelName(label: string): string {
+  return normalizeChannelLabel(label.replace(/\s*\([^)]*\)\s*$/, ''));
 }
 
 function shallowEqualRecord(
@@ -460,6 +501,28 @@ export class ChannelRegistry {
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
 
+  /**
+   * Most-recently-known label per channelId, replayed from
+   * `CHANNEL_LABEL_HISTORY_LOG_ID` (last sighting wins) and kept current by
+   * `appendLabelSighting()`. Unlike `channels`, this survives disconnect and
+   * restart — it's what lets `resolveProseTargetDurable()` resolve a label
+   * for a channel that's no longer live. Keyed by bare channelId, not
+   * `{serverId}:{channelId}` — the label history exists to answer "what id
+   * did this label refer to", independent of which server it came through.
+   */
+  private labelHistory = new Map<string, string>();
+
+  /**
+   * EVERY distinct label a channelId has ever been durably seen with (not
+   * just the latest) — additive alongside `labelHistory`, populated by the
+   * same replay-at-boot loop and the same `appendLabelSighting()` call.
+   * `labelHistory` alone can only resolve a channel's CURRENT/latest name;
+   * this is what lets `resolveLabelFromHistory()` find a channel by a label
+   * it used to have before a rename — the exact case this whole durable log
+   * exists for (finding an old/renamed channel while browsing history).
+   */
+  private allLabelsSeen = new Map<string, Set<string>>();
+
   /** Most recent incoming channel ID — used for speech routing / default publish. */
   private defaultPublishChannel: string | null = null;
 
@@ -517,6 +580,7 @@ export class ChannelRegistry {
     this.activeChannelResolver = options?.activeChannelResolver;
     this.store = options?.store;
     this.initializeLifecycleStore();
+    this.initializeLabelHistoryStore();
   }
 
   /**
@@ -562,6 +626,7 @@ export class ChannelRegistry {
         descriptor: channel,
         open: false,
       });
+      this.appendLabelSighting(channel.id, channel.label);
       registeredIds.push(channel.id);
       results.push({ id: channel.id, accepted: true });
     }
@@ -631,6 +696,7 @@ export class ChannelRegistry {
           continue;
         }
         existing.descriptor = channel;
+        this.appendLabelSighting(channel.id, channel.label);
         addedResults.push({ id: channel.id, accepted: true });
       }
     }
@@ -650,6 +716,7 @@ export class ChannelRegistry {
           descriptor: channel,
           open: false,
         });
+        this.appendLabelSighting(channel.id, channel.label);
         addedResults.push({ id: channel.id, accepted: true });
         accepted.push(channel);
       }
@@ -836,6 +903,8 @@ export class ChannelRegistry {
         if (extraMetadata) {
           existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
         }
+        // The channel now has a real label, not just the bare id — durable.
+        this.appendLabelSighting(existing.descriptor.id, existing.descriptor.label);
       }
       return;
     }
@@ -852,6 +921,19 @@ export class ChannelRegistry {
       },
       open: false,
     });
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor above still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record.
+    if (label) this.appendLabelSighting(channelId, label);
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1226,6 +1308,183 @@ export class ChannelRegistry {
 
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
+  }
+
+  // ==========================================================================
+  // Private: Durable channel-label history (disconnected-channel resolution)
+  // ==========================================================================
+
+  /**
+   * Replay `CHANNEL_LABEL_HISTORY_LOG_ID` into `labelHistory`. Same
+   * construction-time timing as `initializeLifecycleStore()`, and the same
+   * register-if-missing / swallow-"already exists" pattern. The log is
+   * chronological, so folding forward and letting each record overwrite the
+   * map entry for its channelId naturally keeps only the latest sighting.
+   */
+  private initializeLabelHistoryStore(): void {
+    if (!this.store) return;
+
+    try {
+      this.store.registerState({ id: CHANNEL_LABEL_HISTORY_LOG_ID, strategy: 'append_log' });
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('State already exists')) {
+        throw error;
+      }
+    }
+
+    const raw = this.store.getStateJson(CHANNEL_LABEL_HISTORY_LOG_ID);
+    if (!Array.isArray(raw)) return;
+
+    for (const item of raw) {
+      if (!item || typeof item !== 'object') continue;
+      const event = item as Partial<ChannelLabelSightingEvent>;
+      if (typeof event.channelId !== 'string' || typeof event.label !== 'string' || !event.label) continue;
+      this.labelHistory.set(event.channelId, event.label);
+      let seen = this.allLabelsSeen.get(event.channelId);
+      if (!seen) {
+        seen = new Set();
+        this.allLabelsSeen.set(event.channelId, seen);
+      }
+      seen.add(event.label);
+    }
+  }
+
+  /**
+   * Record that `channelId` was most recently seen with `label`. Called from
+   * every place a `ChannelDescriptor` is set into the live `channels` map
+   * (`handleRegister`, `handleChanged`'s update/add branches,
+   * `ensureChannelRegistered`) so the label survives disconnect and restart
+   * for `resolveLabelFromHistory()` / `resolveProseTargetDurable()`.
+   *
+   * Guarded like `setDesiredState()`: a reconnect or re-registration that
+   * reports the same label as last time is a no-op, so the append log
+   * doesn't grow without bound on every boot/resubscribe.
+   *
+   * `label` is `string | undefined` (not just `string`) even though
+   * `ChannelDescriptor.label` is typed `string`: that typing is a
+   * compile-time-only assertion over untrusted wire data from an MCPL
+   * server, and only `channel.id` is runtime-validated on the way in
+   * (`handleRegister`/`handleChanged`). A missing/undefined label is
+   * dropped rather than recorded — durable garbage here would later throw
+   * inside `resolveLabelFromHistory()`'s normalization, which every
+   * `HistoryModule` tool call passes through unguarded via
+   * `resolveProseTargetDurable()`.
+   */
+  private appendLabelSighting(channelId: string, label: string | undefined): void {
+    if (typeof label !== 'string' || !label) return;
+    // Never let a bare-id placeholder (ensureChannelRegistered's fallback
+    // `label ?? channelId` when no real label was ever supplied — e.g. a
+    // Discord DM push missing both channelName and an author name) durably
+    // overwrite a real label already on file. This is exactly the restart
+    // scenario the durable log exists to survive: the live `channels` map
+    // is empty after a restart, so the next label-less event would
+    // otherwise take the "first sighting" path and clobber a good label
+    // the replay above just restored. (Belt-and-braces alongside
+    // ensureChannelRegistered's own guard, which should stop this before
+    // it ever gets here — see there for the primary fix.)
+    if (label === channelId && this.labelHistory.has(channelId)) return;
+    if (this.labelHistory.get(channelId) === label) return;
+    this.labelHistory.set(channelId, label);
+    let seen = this.allLabelsSeen.get(channelId);
+    if (!seen) {
+      seen = new Set();
+      this.allLabelsSeen.set(channelId, seen);
+    }
+    seen.add(label);
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+    } satisfies ChannelLabelSightingEvent);
+  }
+
+  /**
+   * Look up a label spec against label *history* rather than the live
+   * `channels` map — the fallback path for a channel the bot isn't
+   * currently connected to. Applies the same normalization
+   * `resolveProseTarget()` uses for its live label/name matches
+   * (`normalizeChannelLabel` / `normalizeChannelLabelName`), plus a raw-id
+   * fast path (mirroring `resolveProseTarget()`'s own raw-id acceptance).
+   *
+   * Matches against `allLabelsSeen` — EVERY label a channel has ever had —
+   * not just its current/latest one in `labelHistory`, so a channel renamed
+   * A -> B -> A is still resolvable by a name from BEFORE the most recent
+   * rename (the point of a history-browsing tool is finding things by what
+   * they used to be called). Ambiguity is genuine here: if the same
+   * normalized spec matches historical labels belonging to two DIFFERENT
+   * channelIds (an actual rename collision, not just the same channel seen
+   * twice), that's a real ambiguity, not a false positive from re-scanning
+   * one channel's own label list — `byLabel`/`byName` tracking below
+   * already only flags ambiguous when the matched channelId itself differs.
+   *
+   * Returns undefined — rather than raising an ambiguity error — when a
+   * normalized spec matches more than one distinct channelId in history;
+   * callers fall back to `resolveProseTarget()`'s original error in that
+   * case via `resolveProseTargetDurable()`.
+   */
+  private resolveLabelFromHistory(spec: string): string | undefined {
+    const trimmed = spec.trim();
+    if (!trimmed) return undefined;
+
+    // Fast path: spec is already a channelId we have label history for.
+    if (this.labelHistory.has(trimmed)) return trimmed;
+
+    const normSpec = normalizeChannelLabel(trimmed);
+    let byLabel: string | undefined;
+    let byLabelAmbiguous = false;
+    let byName: string | undefined;
+    let byNameAmbiguous = false;
+
+    for (const [channelId, labels] of this.allLabelsSeen) {
+      for (const label of labels) {
+        // `?? ''` is belt-and-braces: appendLabelSighting/replay already
+        // refuse to store a falsy label, so this should never see one, but
+        // normalizeChannelLabel has no internal guard of its own (unlike
+        // resolveProseTarget's `e.descriptor.label ?? ''`), and this is
+        // exactly the kind of one-bad-record-poisons-every-future-call path
+        // that caused finding #2.
+        const normLabel = normalizeChannelLabel(label ?? '');
+        const normName = normalizeChannelLabelName(label ?? '');
+        if (normLabel === normSpec) {
+          if (byLabel !== undefined && byLabel !== channelId) byLabelAmbiguous = true;
+          byLabel = channelId;
+        }
+        if (normName === normSpec) {
+          if (byName !== undefined && byName !== channelId) byNameAmbiguous = true;
+          byName = channelId;
+        }
+      }
+    }
+
+    if (byLabel !== undefined && !byLabelAmbiguous) return byLabel;
+    if (byName !== undefined && !byNameAmbiguous) return byName;
+    return undefined;
+  }
+
+  /**
+   * Durable-history-aware counterpart to `resolveProseTarget()`. Resolves a
+   * label or channelId to a canonical channel id even for a channel the bot
+   * is not currently connected to (browsing message history is exactly the
+   * case where you want to look at an old/quiet/disconnected channel, so the
+   * live-only `resolveProseTarget()` isn't enough).
+   *
+   * Tries the live path first — unchanged, so ordinary addressing keeps its
+   * exact current behavior — and only consults `labelHistory` on a live
+   * miss. If history has no answer either, the original error/candidates
+   * from `resolveProseTarget()` are returned unchanged, so callers keep the
+   * same debuggability they'd get from the live-only path.
+   */
+  resolveProseTargetDurable(
+    spec: string,
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+    const live = this.resolveProseTarget(spec);
+    if (!('error' in live)) return live;
+
+    const channelId = this.resolveLabelFromHistory(spec);
+    if (channelId !== undefined) {
+      return { channelId, label: this.labelHistory.get(channelId) };
+    }
+    return live;
   }
 
   private setDesiredState(
@@ -1755,7 +2014,7 @@ export class ChannelRegistry {
       };
     }
 
-    const norm = (s: string) => s.replace(/^#/, '').toLowerCase();
+    const norm = normalizeChannelLabel;
 
     // DM addressing is PEOPLE-first: usernames and mention tokens, never
     // ids-only (2026-07-24, antra + Fable's live-canary bug report). A DM
@@ -1831,7 +2090,7 @@ export class ChannelRegistry {
     // must resolve. Strip a trailing parenthetical from the stored label and
     // compare the bare channel name. Same name in several guilds is a real
     // ambiguity: error with full labels so the agent can use the exact id.
-    const nameOf = (label: string) => norm(label.replace(/\s*\([^)]*\)\s*$/, ''));
+    const nameOf = normalizeChannelLabelName;
     const byName = entries.filter((e) => nameOf(e.descriptor.label ?? '') === norm(trimmed));
     if (byName.length === 1) {
       return { channelId: byName[0]!.descriptor.id, label: byName[0]!.descriptor.label };
