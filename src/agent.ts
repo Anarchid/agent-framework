@@ -99,6 +99,11 @@ export class Agent {
   private _state: AgentState = { status: 'idle' };
   private _inferenceStartedAt = 0;
   private _streamId = 0;
+  /** kv-unified receipt flights opened by the CURRENT activation and not yet
+   * settled by a usage event. Held on the agent (not only in the stream's
+   * closure) so the next activation can close whatever its predecessor left
+   * open — see failOpenKvSubmissions. */
+  private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
   lastStreamInputTokens = 0;
   /** Real prefix size of the last usage event: fresh + cache creation +
    *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
@@ -269,6 +274,75 @@ export class Agent {
 
   getRuntimeSettingsOverrides(): AgentRuntimeSettingsOverrides {
     return { ...this.runtimeSettingsOverrides };
+  }
+
+  /**
+   * Read-only mirror of `updateRuntimeSettings`' budget semantics: derive what
+   * the next compile would actually plan at if `patch` were applied, WITHOUT
+   * mutating anything. This is the settings→config mapping a feasibility
+   * preview must share with the live path — previewing `patch.contextBudgetTokens`
+   * directly models the wrong compile for a paced descent (a non-immediate
+   * decrease never changes the compile budget; it only arms a prepared-window
+   * transition — see the else-branch in updateRuntimeSettings).
+   *
+   * - `path: 'immediate'` — the patch changes the compile budget (increase, or
+   *   decrease with `immediate: true`); `effectiveBudgetTokens` = patch value.
+   * - `path: 'paced'` — non-immediate decrease; `effectiveBudgetTokens` stays
+   *   at the live budget and `advisoryTargetTokens` carries the descent target.
+   * - `path: 'none'` — patch absent or budget untouched.
+   *
+   * `overrides` uses strategy-config names (`recentWindowTokens`,
+   * `kvStableReachTokens`) suitable for `previewContext`. `preparedWindowTokens`
+   * is deliberately never mapped: it is strategy instance state, not config,
+   * and cannot be simulated by a preview. A `kvStableReachTokens` override is
+   * omitted while a prepared window is in flight — the live runtime pace
+   * shadows the config value there, so the override would not be observed.
+   */
+  planRuntimeSettings(patch?: AgentRuntimeSettingsPatch): {
+    effectiveBudgetTokens: number;
+    /** The budget compiles currently plan at — the baseline the patch moves
+     *  from. Lets callers distinguish a lowering from a no-op or an increase
+     *  (an increase on an already-wedged agent never makes things worse). */
+    liveBudgetTokens: number;
+    advisoryTargetTokens?: number;
+    path: 'immediate' | 'paced' | 'none';
+    overrides: Record<string, unknown>;
+  } {
+    if (patch && Object.keys(patch).length > 0) {
+      this.validateRuntimeSettingsPatch(patch);
+    }
+    const hot = this.getHotContextSettings();
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+
+    const overrides: Record<string, unknown> = {};
+    if (patch?.tailTokens !== undefined) {
+      overrides.recentWindowTokens = patch.tailTokens;
+    }
+    if (
+      patch?.transitionPaceTokens !== undefined &&
+      hot?.preparedWindowTokens === undefined
+    ) {
+      overrides.kvStableReachTokens = patch.transitionPaceTokens;
+    }
+
+    if (patch?.contextBudgetTokens === undefined) {
+      return { effectiveBudgetTokens: live, liveBudgetTokens: live, path: 'none', overrides };
+    }
+    if (patch.contextBudgetTokens >= live || patch.immediate) {
+      return {
+        effectiveBudgetTokens: patch.contextBudgetTokens,
+        liveBudgetTokens: live,
+        path: 'immediate',
+        overrides,
+      };
+    }
+    return {
+      effectiveBudgetTokens: live,
+      liveBudgetTokens: live,
+      advisoryTargetTokens: patch.contextBudgetTokens,
+      path: 'paced',
+      overrides,
+    };
   }
 
   getEffectiveSameRoundThinkTextPolicy(): SameRoundThinkTextPolicy {
@@ -730,6 +804,19 @@ export class Agent {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
 
+    // A new activation supersedes every receipt flight the previous one left
+    // open. Membrane fires the kv-unified wire receipt per provider attempt,
+    // BEFORE the adapter call; only that attempt's usage event settles it.
+    // When the attempt dies without usage (transport error, idle timeout,
+    // framework cancel for a budget restart or endTurn) the flight stays open
+    // until the old driveStream's `finally` runs — and every successor path
+    // (error-policy retry, budget restart, the next wake after an abort)
+    // starts the new stream BEFORE that `finally`. The successor's first
+    // receipt then met the ledger's single-flight guard and failed the
+    // recovery itself: "kv-unified submission devops:46:…:4 is still in
+    // flight" (devops agent, 2026-09-16 07:33Z, no provider error logged).
+    this.failOpenKvSubmissions();
+
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
@@ -753,6 +840,7 @@ export class Agent {
     const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
     let kvCall = 0;
     if (kvEnabled) {
+      this.kvOpenQueue = kvQueue;
       const layoutHash = stableHash(request.messages);
       const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
       kvRequest.onCacheWireReceipt = (receipt) => {
@@ -789,6 +877,28 @@ export class Agent {
           }
         : {}),
     };
+  }
+
+  /** Close every kv-unified receipt flight the previous activation left
+   * unsettled. Idempotent: the framework's driveStream `finally` drains the
+   * same per-stream queue, so whichever runs first empties it and the other
+   * finds nothing. Failing an already-settled id is a no-op in the ledger. */
+  private failOpenKvSubmissions(): void {
+    const open = this.kvOpenQueue?.splice(0) ?? [];
+    this.kvOpenQueue = null;
+    if (open.length === 0) return;
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as { reportKvUnifiedFailed?: (submissionId: string) => void } | undefined;
+    for (const { submissionId } of open) {
+      console.error(
+        `[kv-unified] ${this.name}: closing receipt flight ${submissionId} left open by the previous activation`,
+      );
+      try {
+        strategy?.reportKvUnifiedFailed?.(submissionId);
+      } catch (err) {
+        console.error(`[kv-unified] ${this.name}: could not close flight ${submissionId}:`, err);
+      }
+    }
   }
 
   /**

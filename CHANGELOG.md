@@ -12,6 +12,40 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.15.0 — 2026-09-17
+
+### Added
+
+- `HistoryModule` adds `stats`/`extract`/`search` tools for querying an
+  agent's full uncompressed message history by time range and/or channel
+  (#151), backed by context-manager's native chronicle secondary-index
+  queries — O(log n + k) against multi-million-message stores, not a full
+  scan. Read-only, `bind(contextManager)` after `AgentFramework.create()`.
+
+### Fixed
+
+- `puppetToolCall` reserves the agent against turn start for its whole
+  duration (#145). The idle check was a point in time before two awaits
+  (tool execution, result build); a wake arriving in either gap started a
+  real turn, and the synthetic `tool_use`/`tool_result` pair then wrote
+  straight into the window under that turn — the wire-order corruption the
+  puppet exists to avoid. The puppet now holds the turn-alive marker the
+  scheduler and the `addMessage` deferral guard already respect, and refuses
+  when a turn is alive even if status reads idle. The one path that could
+  still start a turn over the reservation — a wake parked on provider
+  admission resuming after an auxiliary call — now re-tests turn-alive, gives
+  admission back and requeues the wake for the scheduler instead.
+
+- kv-unified: a new activation now closes any receipt flight its predecessor left unsettled before it submits its own. A provider attempt that died without a usage event (transport error, idle timeout, budget-restart or endTurn cancel) used to keep its flight open until the old stream's teardown, and every successor path started first — so the retry itself failed with `kv-unified submission … is still in flight` (devops agent, 2026-09-16).
+- Inference-log records below the blob threshold are persisted through their JSON view; the kv-unified receipt hook on a compiled request (a function) made Chronicle reject the record with `JS functions cannot be represented as a serde_json::Value`, throwing from the failure path it was logging.
+
+- Oversized tool-result spill files can now be read in bounded character
+  ranges with `workspace--read` (`offsetChars`/`limitChars`). Spill notices
+  include a read command sized for the inline cap and explain how to continue.
+  This makes single-line JSON, large string values, and non-JSON long lines
+  recoverable without rewriting the stored result or expanding it past the
+  workspace file-size limit. Existing line-based reads keep their behavior.
+
 ## 0.14.0 — 2026-09-09
 
 ### Added

@@ -1,7 +1,7 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -405,6 +405,39 @@ import {
 } from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+/** Snapshot slot mirroring context writes deferred while quiesced (#122). */
+const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** Above this serialized size the deferred-write mirror is skipped (kept in
+ *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
+const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
+
+/** Requests that CONTINUE a turn whose token is already held — a context-
+ *  budget restart, or the non-streaming path's tool-results round. The
+ *  quiesce wake gate lets these through: the drain is exactly the phase
+ *  where such a turn must be allowed to finish, and parking them would hold
+ *  the token until the drain timed out (and `abandon` could not clear a turn
+ *  with no stream). */
+/** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
+interface DeferredWrite {
+  id: string;
+  seq: number;
+  participant: string;
+  content: ContentBlock[];
+  metadata?: MessageMetadata;
+  forAgent?: string;
+}
+const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
+/** Stamp a deferred write's durable id into the metadata it is stored with
+ *  (boot recovery dedups replays by it). Idempotent for an already-stamped
+ *  message. */
+function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
+  return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
+function isTurnContinuation(reason: string): boolean {
+  return reason === 'context_budget_restart' || reason === 'tool_results_ready';
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -450,6 +483,106 @@ class DiscordAwarenessAccountingError extends Error {
     const detail = cause instanceof Error ? cause.message : String(cause);
     super(`Discord awareness accounting failed during ${operation}: ${detail}`, { cause });
     this.name = 'DiscordAwarenessAccountingError';
+  }
+}
+
+/**
+ * Feasibility verdict for a runtime-settings patch, derived through the SAME
+ * settings→config mapping the live apply path uses (`Agent.planRuntimeSettings`
+ * → `previewContextSettings`). The `effective` verdict is for the budget the
+ * next compile actually plans at — for a paced descent that is the UNCHANGED
+ * live budget, with the descent target reported separately as `advisory`.
+ */
+export interface RuntimeSettingsPreview {
+  /** False when no verdict could be computed (no strategy support, preview
+   * overlap, stale branch generation, …) — see `reason`. Never silently
+   * swallowed: an unavailable preview is an answer, not an error. */
+  available: boolean;
+  reason?:
+    | 'no_preview_support'
+    | 'preview_in_flight'
+    | 'branch_generation_changed'
+    | 'no_adaptive_resolution'
+    | string;
+  path: 'immediate' | 'paced' | 'none';
+  /** The budget compiles currently plan at (baseline of the patch). */
+  liveBudgetTokens: number;
+  /** Verdict at the effective compile budget (spread of the strategy's
+   * PreviewResult: finalTokens, fits, headTokens, tailTokens, middleTokens,
+   * deepestLevel, exhausted, …). */
+  effective?: { budgetTokens: number; fits: boolean; finalTokens: number } & Record<string, unknown>;
+  /** Best-effort verdict at a paced-descent target. Advisory only — a target
+   * below the folded floor does not block the patch; the descent simply
+   * converges as far as the floor allows. */
+  advisory?: { targetTokens: number; fits: boolean } & Record<string, unknown>;
+  transition: 'stable' | 'converging' | 'blocked';
+  transitionReason?: string;
+}
+
+/**
+ * Thrown by `updateAgentRuntimeSettings` when an immediate budget change would
+ * put the agent in an un-compilable layout: the folded floor renders more
+ * tokens than the hard budget admits, so every subsequent compile would
+ * OverBudget-wedge the agent (2026-08-21: mythos, 550k→260k set live against a
+ * ~450k floor — hours of hard-down). Overridable with `{ allowInfeasible: true }`.
+ * Paced descents never throw this: a non-immediate decrease leaves the compile
+ * budget untouched and converges only as far as the floor allows.
+ */
+export class BudgetPreflightError extends Error {
+  constructor(
+    message: string,
+    readonly preview: RuntimeSettingsPreview,
+  ) {
+    super(message);
+    this.name = 'BudgetPreflightError';
+  }
+}
+
+/** Operator-facing snapshot of the host's quiesce state (issue #122). */
+export interface HostModeStatus {
+  quiesced: boolean;
+  reason?: string;
+  since?: number;
+  /** True when no turn is alive (activeTurnTokens empty — the token spans
+   * dequeue → settled teardown, strictly wider than activeStreams). */
+  drained: boolean;
+  activeTurns: number;
+  /** Wakes that own provider admission while waiting for an in-flight
+   * auxiliary call — no turn token yet, but a turn is one settle away. The
+   * admission continuation rechecks quiesce and requeues them; `drained`
+   * is false until it has. */
+  parkedAdmissions: number;
+  /** Inference requests parked by the quiesce wake gate (while quiesced), or
+   * simply queued (while serving — non-zero right after a resume until the
+   * scheduler's next pass consumes them). Continuations of a held turn
+   * (budget restart, tool results) are never counted. */
+  gatedRequests: number;
+  /** Background code-execution scripts still running. Quiesce does NOT stop
+   * them — they hold no turn token, so drain doesn't wait for them. Reported
+   * so the operator sees what is still acting during the window. */
+  backgroundScripts: number;
+  /** Context writes (module events, api message.send) withheld because the
+   * host is quiesced. Persisted while quiesced and flushed by resume(). */
+  deferredWrites: number;
+  /** Agents whose turn `abandon` could NOT cancel: the turn token is held but
+   * no stream exists yet (still in hooks/compile) or ever will (puppet tool
+   * turns). Present only after an abandon that left such turns behind. */
+  unabandonable?: string[];
+}
+
+/**
+ * Thrown by `resume()` when the current runtime settings do not compile for
+ * one or more agents — returning to service would OverBudget-wedge them on
+ * the first wake. Drain quarantine / advance merges to lower the floor, or
+ * pass `{ force: true }` after deciding the verdicts are acceptable.
+ */
+export class ResumeBlockedError extends Error {
+  constructor(
+    message: string,
+    readonly verdicts: Array<{ agentName: string; preview: RuntimeSettingsPreview }>,
+  ) {
+    super(message);
+    this.name = 'ResumeBlockedError';
   }
 }
 
@@ -702,6 +835,14 @@ interface HostCommandParams {
   maxRewinds?: number;
   /** For the `unstick` command: raw channel id to post the outcome report to. */
   channelId?: string;
+  /** For the `quiesce` command: operator-facing reason recorded in the mode. */
+  reason?: string;
+  /** For the `quiesce` command: drain window in ms (clamped to [1s, 10m]). */
+  timeoutMs?: number;
+  /** For the `quiesce` command: cancel undrained turns after the window. */
+  abandon?: boolean;
+  /** For the `resume` command: override a failing feasibility verdict. */
+  force?: boolean;
   requesterId?: string;
   requesterName?: string;
 }
@@ -781,6 +922,17 @@ export class AgentFramework {
   private activeTriggerChannels: Map<string, string> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
+  /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
+   * `running`, which is overloaded as the runLoop condition, the maintenance
+   * admission guard, AND the per-tick loop condition — expressing "paused" by
+   * clearing `running` would kill the very maintenance machinery quiesce
+   * exists to keep hot, plus store sync and tool-result processing. While
+   * quiesced: runLoop, syncTimer, maintenanceTimer, and the watchdog all keep
+   * running; only new turns (wake gate in processInferenceRequests) and MCPL
+   * data planes are held. */
+  private quiesced = false;
+  private quiesceReason?: string;
+  private quiescedAt?: number;
   private traceListeners: TraceEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
@@ -885,7 +1037,7 @@ export class AgentFramework {
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
@@ -960,7 +1112,42 @@ export class AgentFramework {
   /** Tune-out coordinator (issue #77); non-null iff subconscious + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
 
+  /** Agents an abandon could not cancel (token held, no stream) — surfaced
+   *  in HostModeStatus until the next quiesce/resume. */
+  private lastUnabandonable: string[] = [];
+  /** True while the deferred-write queue has a persisted mirror (quiesced). */
+  private deferredWritesPersisted = false;
+  private deferredWritesCapWarned = false;
+  /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
+   *  deferredWritesPath). Undefined → branch-local slot fallback. */
+  private hostModePath: string | undefined;
+  private deferredWritesPath: string | undefined;
+  private recoveryFallbackWarned = false;
+  /**
+   * Deferred writes that have been handed to a context manager but whose
+   * chronicle state is NOT yet durably synced. They stay in the durable
+   * recovery queue until `ackDeferredWrites()` syncs the store — chronicle
+   * persists the slot-chain head only on sync(), so acknowledging on append
+   * alone would let a hard exit forget an accepted message.
+   */
+  private unackedDeferredWrites: DeferredWrite[] = [];
+  /** Monotonic order stamp for deferred writes: the durable queue is always
+   *  written, restored, drained and flushed in `seq` order, whatever the
+   *  pending/un-acked split — a re-deferred entry keeps its place. */
+  private deferredSeq = 0;
+  /**
+   * Per target agent: the store's message count when the OLDEST currently
+   * un-acked entry for it was handed off. Persisted with the queue so a boot
+   * after an interrupted flush knows exactly which slot range the batch
+   * could occupy and dedups against all of it — never a fixed tail.
+   */
+  private deferredScanFrom = new Map<string, number>();
   private deferredMessages: Array<{
+    /** Durable identity for per-message flush acknowledgement: a flush
+     *  interrupted by a crash replays only the messages not yet acked. */
+    id: string;
+    /** Order stamp (see deferredSeq). */
+    seq: number;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -1188,6 +1375,11 @@ export class AgentFramework {
     } catch {
       // Already registered
     }
+    try {
+      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
+    } catch {
+      // Already registered
+    }
 
     try {
       store.registerState({
@@ -1400,6 +1592,61 @@ export class AgentFramework {
       framework.toolResultInlineMaxCharsOverride.set(agentName, cap);
     }
 
+    // Restore persisted quiesce mode (issue #122) BEFORE initializeMcpl: the
+    // flag must be set before any data-plane barrier completion can run, or
+    // the startup funnel would open the data planes on a host that shut down
+    // mid-maintenance. Staged connections boot with both planes closed, so a
+    // quiesced boot needs no re-pause — completeMcplDataPlaneGate consults
+    // the flag and holds data planes (control planes come up normally). The
+    // gate already exists at this point, so the suppression is wired here too.
+    //
+    // Both records live OUTSIDE branch history (recovery/ files next to the
+    // store): a historical rollback must not be able to erase the marker of
+    // the very surgery it belongs to, nor orphan the writes deferred by it.
+    framework.hostModePath = config.hostModePath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
+    framework.deferredWritesPath = config.deferredWritesPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
+    {
+      const hostMode = framework.readHostMode();
+      // Deferred writes are recovered REGARDLESS of the mode flag: a crash
+      // between a resume's flag clear and the end of its flush must not
+      // strand accepted messages. Per-message acks mean only the remainder
+      // replays. Serving boot with a remainder → flush it right now (no turn
+      // is alive yet, so this is a safe boundary).
+      const restoredWrites = framework.restorePersistedDeferredWrites();
+      if (!hostMode?.quiesced && restoredWrites > 0) {
+        console.error(
+          `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
+          `(an earlier resume did not finish its flush) — landing them now`,
+        );
+        await framework.flushDeferredWrites('boot-recovery');
+      }
+      if (hostMode?.quiesced) {
+        framework.quiesced = true;
+        framework.quiesceReason = hostMode.reason;
+        framework.quiescedAt = hostMode.since;
+        framework.eventGate?.setQuiesced(true);
+        console.error(
+          `[host-mode] ============================================================\n` +
+          `[host-mode] BOOTING QUIESCED (persisted${hostMode.reason ? `: ${hostMode.reason}` : ''}, ` +
+          `since ${hostMode.since ? new Date(hostMode.since).toISOString() : 'unknown'}).\n` +
+          `[host-mode] No wakes will start turns and MCPL data planes stay paused\n` +
+          `[host-mode] until resume() — via host/command, the API server, or the\n` +
+          `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
+          `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
+          `[host-mode] they land at resume().\n` +
+          `[host-mode] ============================================================`,
+        );
+        framework.emitTrace({
+          type: 'host:quiesced_boot',
+          ...(hostMode.reason ? { reason: hostMode.reason } : {}),
+          ...(hostMode.since !== undefined ? { since: hostMode.since } : {}),
+        });
+      }
+    }
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
@@ -1525,6 +1772,9 @@ export class AgentFramework {
    */
   async stop(): Promise<void> {
     this.running = false;
+    // Flushed-but-unsynced deferred writes: sync and ack now, while the
+    // store is still open, rather than leaving them to a reboot replay.
+    this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
@@ -2279,10 +2529,56 @@ export class AgentFramework {
   updateAgentRuntimeSettings(
     agentName: string,
     patch: AgentRuntimeSettingsPatch,
-    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
+    opts?: { persist?: boolean; allowInfeasible?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    // Feasibility preflight — only a budget-bearing patch can wedge, and only
+    // on the immediate path (a paced descent leaves the compile budget alone
+    // and converges only as far as the folded floor allows). Boot restore
+    // deliberately bypasses this wrapper (createAgent → restoreRuntimeSettings),
+    // so a persisted-but-now-infeasible budget can never brick startup.
+    if (patch.contextBudgetTokens !== undefined) {
+      const preview = this.previewAgentRuntimeSettings(agentName, patch);
+      if (preview.available && preview.effective) {
+        const e = preview.effective;
+        // Block only a LOWERING that doesn't fit. A no-op rewrite or an
+        // increase on an already-over-floor agent never makes things worse —
+        // refusing those would throw on exactly the wedged population the
+        // guard exists to protect (and block stepwise remediation).
+        const lowering = patch.contextBudgetTokens! < preview.liveBudgetTokens;
+        if (preview.path === 'immediate' && !e.fits && lowering) {
+          const msg =
+            `[budget-preflight] contextBudgetTokens=${patch.contextBudgetTokens} would NOT fit ` +
+            `${agentName}: the folded floor renders ${e.finalTokens} tokens against hard budget ` +
+            `${e.budgetTokens} (head=${e.headTokens ?? '?'} tail=${e.tailTokens ?? '?'} ` +
+            `middle=${e.middleTokens ?? '?'}, deepest L${e.deepestLevel ?? '?'}` +
+            `${e.exhausted ? ', picker exhausted' : ''}). Every compile at this budget would ` +
+            `OverBudget-wedge the agent. Lower the floor first (drain compression quarantine / ` +
+            `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
+          if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
+          console.warn(`${msg} — applying anyway (allowInfeasible).`);
+        } else if (preview.path === 'immediate' && !e.fits) {
+          console.warn(
+            `[budget-preflight] ${agentName} remains over the folded floor at ` +
+            `${patch.contextBudgetTokens} (floor renders ${e.finalTokens}); this patch does ` +
+            `not lower the budget, so applying — drain quarantine / advance merges to clear it.`,
+          );
+        } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
+          console.warn(
+            `[budget-preflight] paced descent for ${agentName} targets ` +
+            `${preview.advisory.targetTokens} tokens, below the current folded floor — the ` +
+            `transition will converge only as far as the floor allows (drain quarantine / ` +
+            `advance merges to go lower). Applying; the live compile budget is unchanged.`,
+          );
+        }
+      } else if (preview.reason) {
+        console.warn(
+          `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
+          `applying without preflight`,
+        );
+      }
+    }
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
@@ -2332,6 +2628,632 @@ export class AgentFramework {
       ...(opts?.requester ? { requester: opts.requester } : {}),
     });
     return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Host quiesce / maintenance mode (issue #122)
+  //
+  // Pause the inference thread and MCPL data planes while keeping the
+  // framework + context managers + membrane loaded and hot, so maintenance
+  // (compression ticks, refold, quarantine drains, budget descents) runs
+  // through the exact machinery the agent uses live — with live config, live
+  // tool definitions, and full llm-calls logging — instead of offline rigs
+  // that re-derive all of it and drift.
+  //
+  // While quiesced: runLoop, store sync, the maintenance timer, and the
+  // liveness watchdog all keep running. Wakes park in pendingRequests
+  // (coalesced per reason) and fire at resume; MCPL events buffer on the
+  // paused data planes; gate debounces buffer in the gate. Background
+  // code-execution scripts are NOT stopped (they hold no turn token) — they
+  // are reported in the status so the operator sees what still acts.
+  //
+  // NOTE: do not call quiesce() from inside a queue event handler — the drain
+  // wait depends on the event loop continuing to run.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Wakes that passed the scheduler and now own provider admission while
+   * waiting for an in-flight auxiliary call to settle — no turn token yet,
+   * so `activeTurnTokens` alone would call the host drained while a turn is
+   * one promise-resolution away from starting. The admission continuation
+   * rechecks quiesce and requeues, but until it runs the wake is live.
+   */
+  private parkedAdmissionCount(): number {
+    let n = 0;
+    for (const [agentName, gate] of this.providerGates) {
+      if (gate.primaryDepth > 0 && !this.activeTurnTokens.has(agentName)) n++;
+    }
+    return n;
+  }
+
+  getHostModeStatus(): HostModeStatus {
+    const parkedAdmissions = this.parkedAdmissionCount();
+    return {
+      quiesced: this.quiesced,
+      ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+      ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
+      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
+      activeTurns: this.activeTurnTokens.size,
+      parkedAdmissions,
+      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
+      backgroundScripts: [...this.backgroundScripts.values()]
+        .filter((record) => record.status === 'running').length,
+      deferredWrites: this.deferredMessages.length,
+      ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
+    };
+  }
+
+  /** Drain window bounds shared by every ingress (framework API, WS, HTTP,
+   *  host/command). Below the floor a drain is meaningless; above the ceiling
+   *  an awaited call would poll for days. */
+  static readonly QUIESCE_TIMEOUT_MIN_MS = 1_000;
+  static readonly QUIESCE_TIMEOUT_MAX_MS = 600_000;
+  static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
+
+  /**
+   * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
+   * MCPL data planes, and wait for in-flight turns to settle (turn-alive is
+   * `activeTurnTokens`, which spans dequeue → settled teardown). Idempotent.
+   *
+   * On drain timeout the host STAYS quiesced (`drained: false` in the
+   * result); with `abandon: true` the undrained streams are cancelled via a
+   * dedicated cancel kind that settles the turn without feeding the
+   * inference-failure accounting.
+   */
+  async quiesce(opts?: {
+    reason?: string;
+    timeoutMs?: number;
+    abandon?: boolean;
+  }): Promise<HostModeStatus> {
+    if (this.quiesced) {
+      // Idempotent — EXCEPT abandon escalation: a first quiesce that timed
+      // out undrained must be escalatable with a second quiesce({abandon})
+      // without resume()+re-quiesce (which would reopen data planes and
+      // release parked wakes mid-surgery).
+      if (opts?.abandon && this.activeTurnTokens.size > 0) {
+        const unabandonable = await this.abandonActiveTurns();
+        this.emitTrace({
+          type: 'host:quiesce',
+          ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+          drained: this.activeTurnTokens.size === 0,
+          activeTurns: this.activeTurnTokens.size,
+          abandoned: true,
+          ...(unabandonable.length > 0 ? { unabandonable } : {}),
+        });
+      }
+      return this.getHostModeStatus();
+    }
+    this.quiesced = true;
+    this.quiesceReason = opts?.reason;
+    this.quiescedAt = Date.now();
+    this.lastUnabandonable = [];
+    this.persistHostMode({
+      quiesced: true,
+      ...(opts?.reason ? { reason: opts.reason } : {}),
+      since: this.quiescedAt,
+    });
+    console.error(
+      `[host-mode] quiescing${opts?.reason ? ` (${opts.reason})` : ''}: parking wakes, ` +
+      `pausing MCPL data planes, draining ${this.activeTurnTokens.size} in-flight turn(s)`,
+    );
+    this.eventGate?.setQuiesced(true);
+    for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
+      connection.pauseDataPlane();
+    }
+
+    // Clamp HERE, for every ingress. NaN-proof too: timeoutMs arrives via
+    // Number()/blind casts, and Math.max(1_000, NaN) is NaN — which would
+    // silently collapse the drain window to zero (`Date.now() < NaN` is
+    // false). The ceiling matters because this call is awaited: an
+    // unbounded value polls the event loop for as long as it says.
+    const rawTimeout = opts?.timeoutMs;
+    const timeoutMs = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout)
+      ? Math.max(
+          AgentFramework.QUIESCE_TIMEOUT_MIN_MS,
+          Math.min(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, Math.floor(rawTimeout)),
+        )
+      : AgentFramework.QUIESCE_TIMEOUT_DEFAULT_MS;
+    const deadline = Date.now() + timeoutMs;
+    // Drain = no turn token AND no wake parked on provider admission (the
+    // latter becomes a turn the moment its auxiliary settles unless the
+    // continuation's quiesce recheck requeues it — wait for that to happen).
+    while (
+      this.quiesced &&
+      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    // A concurrent resume() ended this window while we waited. Nothing here
+    // may act any more — an abandon now would cancel a turn that started
+    // legitimately AFTER the resume, and the trace/log would describe a mode
+    // the host is no longer in.
+    if (!this.quiesced) {
+      console.error('[host-mode] quiesce superseded by a concurrent resume during drain');
+      return this.getHostModeStatus();
+    }
+
+    let abandoned = false;
+    let unabandonable: string[] = [];
+    if (this.activeTurnTokens.size > 0 && opts?.abandon) {
+      abandoned = true;
+      unabandonable = await this.abandonActiveTurns();
+      if (!this.quiesced) return this.getHostModeStatus();
+    }
+
+    const status = this.getHostModeStatus();
+    this.emitTrace({
+      type: 'host:quiesce',
+      ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
+      drained: status.drained,
+      activeTurns: status.activeTurns,
+      ...(status.parkedAdmissions > 0 ? { parkedAdmissions: status.parkedAdmissions } : {}),
+      ...(abandoned ? { abandoned: true } : {}),
+      ...(unabandonable.length > 0 ? { unabandonable } : {}),
+    });
+    console.error(
+      status.drained
+        ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) parked`
+        : `[host-mode] quiesced but drain ${abandoned ? 'needed abandon and' : 'timed out —'} ` +
+          `${status.activeTurns} turn(s) still alive` +
+          (status.parkedAdmissions > 0
+            ? `, ${status.parkedAdmissions} wake(s) parked on provider admission`
+            : ''),
+    );
+    return status;
+  }
+
+  /** Cancel every turn-alive stream via the quiesce_abandoned kind and give
+   *  teardown a bounded grace to settle. Shared by the drain-timeout path and
+   *  the already-quiesced escalation path. */
+  private async abandonActiveTurns(): Promise<string[]> {
+    const unabandonable: string[] = [];
+    for (const agentName of [...this.activeTurnTokens.keys()]) {
+      const agent = this.agents.get(agentName);
+      const state = agent?.state;
+      const stream = state && 'stream' in state ? state.stream : undefined;
+      if (agent && stream) {
+        console.error(`[host-mode] abandoning in-flight turn for ${agentName}`);
+        this.frameworkCancelledStreams.set(
+          `${agent.name}:${agent.streamId}`,
+          'quiesce_abandoned',
+        );
+        stream.cancel();
+      } else {
+        // Token held, no stream to cancel: the turn is between dequeue and
+        // stream registration (hooks/compile), or it is a puppet tool turn,
+        // which never has one. Say so — silence here reads as "abandon acted
+        // and teardown is slow", which is a different operator decision.
+        unabandonable.push(agentName);
+        console.error(
+          `[host-mode] cannot abandon turn for ${agentName}: turn token held with no stream ` +
+          `(status=${state?.status ?? 'unknown'}) — it must settle on its own`,
+        );
+      }
+    }
+    // Bounded grace for the cancelled streams' teardown to settle.
+    const grace = Date.now() + 10_000;
+    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < grace) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    // Only turns still alive after the grace are worth reporting.
+    this.lastUnabandonable = unabandonable.filter((name) => this.activeTurnTokens.has(name));
+    return this.lastUnabandonable;
+  }
+
+  /**
+   * Leave quiesce mode. Gates on a FRESH feasibility preview of every agent's
+   * CURRENT settings — maintenance may have moved the folded floor and the
+   * branch generation, so verdicts are computed at resume time, never reused.
+   * Throws ResumeBlockedError (with all failing verdicts) unless `force`.
+   * Unavailable previews warn and pass — refusing to resume because the
+   * strategy cannot preview would hold hosts hostage to a diagnostic.
+   */
+  async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
+    if (!this.quiesced) return this.getHostModeStatus();
+
+    // The canonical operator flow is `maintain; resume`, and a timer-driven
+    // pass may still be mid-flight: previewContext refuses to overlap one
+    // ("already running"), which used to degrade the gate to "no opinion".
+    // Wait for the pass first, then retry a few times for the case where a
+    // fresh pass started in between.
+    if (this.maintenancePass) {
+      await this.maintenancePass.catch(() => {});
+    }
+    const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
+    for (const agentName of this.agents.keys()) {
+      let preview = this.previewAgentRuntimeSettings(agentName);
+      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+        preview = this.previewAgentRuntimeSettings(agentName);
+      }
+      if (preview.available && preview.effective && !preview.effective.fits) {
+        failing.push({ agentName, preview });
+      } else if (!preview.available && preview.reason !== 'no_preview_support') {
+        console.warn(
+          `[host-mode] resume: feasibility preview unavailable for ${agentName} ` +
+          `(${preview.reason}) — proceeding without a verdict`,
+        );
+      }
+    }
+    if (failing.length > 0 && !opts?.force) {
+      const detail = failing.map(({ agentName, preview }) =>
+        `${agentName}: folded floor ${preview.effective!.finalTokens} > hard budget ` +
+        `${preview.effective!.budgetTokens}` +
+        (preview.transition === 'blocked'
+          ? ` (transition blocked: ${preview.transitionReason ?? 'unknown'})`
+          : ''),
+      ).join('; ');
+      throw new ResumeBlockedError(
+        `resume refused: returning to service would OverBudget-wedge — ${detail}. ` +
+        `Drain compression quarantine / advance the merge ladder to lower the floor ` +
+        `(maintenanceTick()), or resume({ force: true }).`,
+        failing,
+      );
+    }
+    if (failing.length > 0) {
+      console.warn(
+        `[host-mode] resume FORCED past ${failing.length} failing feasibility verdict(s)`,
+      );
+    }
+
+    const releasedRequests = this.pendingRequests.length;
+    // In-memory first: addMessage must stop deferring so the flush below can
+    // land. The DURABLE flag is cleared only after the flush completes — a
+    // crash in between then boots quiesced with the un-acked remainder
+    // restored (and a serving boot recovers any remainder anyway).
+    this.quiesced = false;
+    this.quiesceReason = undefined;
+    this.quiescedAt = undefined;
+    this.lastUnabandonable = [];
+    this.eventGate?.setQuiesced(false);
+
+    try {
+      // Flush context writes deferred by the quiesce window (module events,
+      // api message.send) — with no turn alive there is no other flush
+      // point. Per-message try/catch and per-message durable ack (see
+      // flushDeferredWrites); nothing here may reach the plane reopen below.
+      await this.flushDeferredWrites('resume');
+      this.persistHostMode(null);
+    } finally {
+      // Reopen MCPL data planes through the existing barrier funnel — NOT a
+      // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
+      // nested-install guard (a flushed tools-list-changed can install a
+      // newer barrier mid-flush), drains any awareness work accumulated
+      // during the window before opening, and replaces a stale failed
+      // barrier by identity. In `finally` so that nothing above can leave
+      // the host un-quiesced with every data plane still paused.
+      if (this.mcplServerRegistry) {
+        const barrier = this.installMcplDataPlaneGate();
+        this.releaseMcplDataPlaneGate(barrier);
+        try {
+          await barrier.promise;
+          this.completeMcplDataPlaneGate(barrier);
+        } catch (error) {
+          // The host IS resumed — don't rethrow. failMcplDataPlaneGate
+          // recycles the connections, and their reconnect flows re-run the
+          // funnel with quiesced=false, self-healing the data planes.
+          await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
+        }
+      }
+
+      this.emitTrace({
+        type: 'host:resume',
+        ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
+        releasedRequests,
+      });
+      // NOTE: parked wakes and gate buffers are in-memory only — a restart
+      // mid-quiesce boots quiesced but with these queues empty (sources like
+      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
+      // Deferred context WRITES are persisted while quiesced and survive.
+      console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+    }
+    return this.getHostModeStatus();
+  }
+
+  /**
+   * Land every deferred write whose target has no turn alive, one at a time,
+   * acknowledging each durably as it lands (the persisted queue is rewritten
+   * after every message). A crash mid-flush therefore replays exactly the
+   * un-acked remainder at the next boot — no loss, no duplicates. A write
+   * the store REJECTS is logged and acked too: replaying a poison message
+   * forever would wedge every later boot on it.
+   *
+   * Per-target: an agent whose turn is still alive keeps ITS messages
+   * deferred for its own turn boundary; everyone else's flush now.
+   */
+  private async flushDeferredWrites(label: string): Promise<void> {
+    if (this.deferredMessages.length === 0) {
+      this.persistDeferredWrites();
+      return;
+    }
+    const keep: typeof this.deferredMessages = [];
+    const flush: typeof this.deferredMessages = [];
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
+    }
+    // Hand-off: the batch leaves the pending queue and enters the un-acked
+    // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
+    // crash anywhere below replays the whole batch, and the deferredWriteId
+    // stamped on each stored message lets boot skip the ones that did land.
+    flush.sort(bySeq);
+    this.deferredMessages = keep;
+    this.handOffDeferredWrites(flush);
+    let stored = 0;
+    for (const msg of flush) {
+      try {
+        this.addMessage(msg.participant, msg.content, msg.metadata, {
+          deferredWriteId: msg.id,
+          ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+        });
+        stored++;
+      } catch (err) {
+        console.error(
+          `[host-mode] ${label}: failed to store a deferred context write ` +
+          `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
+          err,
+        );
+      }
+    }
+    // Ack = sync the chronicle FIRST, then rewrite the durable queue without
+    // the batch. Never the other way round.
+    this.ackDeferredWrites();
+    console.error(
+      `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
+      (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
+    );
+  }
+
+  /**
+   * Acknowledge every deferred write that has been handed to a context
+   * manager: sync the chronicle so the appended slots are durable, and only
+   * then drop them from the recovery queue. If the sync fails they stay in
+   * the durable queue (the next ack, or stop(), retries); a reboot in that
+   * state replays them, deduplicated by `deferredWriteId` for any that did
+   * reach disk. Idempotent and cheap when nothing is un-acked.
+   */
+  private ackDeferredWrites(): void {
+    if (this.unackedDeferredWrites.length === 0) return;
+    // Nothing durable to reconcile against unless the queue was persisted.
+    if (!this.deferredWritesPersisted && !this.quiesced) {
+      this.unackedDeferredWrites = [];
+      return;
+    }
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error(
+        `[host-mode] chronicle sync failed — ${this.unackedDeferredWrites.length} flushed deferred ` +
+        `write(s) stay in the recovery queue until a sync succeeds:`,
+        err,
+      );
+      return;
+    }
+    this.unackedDeferredWrites = [];
+    this.deferredScanFrom.clear();
+    this.persistDeferredWrites();
+  }
+
+  /**
+   * Move drained entries into the un-acked set and record, per target
+   * agent, the store position they will be appended after — then persist
+   * that receipt BEFORE any of them is written. Boot recovery scans from the
+   * recorded position to the tail, so every member of an interrupted batch
+   * is visible to the dedup, however large the batch.
+   */
+  private handOffDeferredWrites(entries: DeferredWrite[]): void {
+    if (entries.length === 0) return;
+    const durable = this.deferredWritesPersisted || this.quiesced;
+    if (!durable) return; // memory-only deferrals: nothing to reconcile at boot
+    for (const entry of entries) {
+      const target = entry.forAgent ?? this.primaryAgentName;
+      const agent = target ? this.agents.get(target) : undefined;
+      if (!agent) continue;
+      let count = 0;
+      try {
+        const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
+        count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+      } catch { count = 0; }
+      const prev = this.deferredScanFrom.get(target!);
+      this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
+    }
+    this.unackedDeferredWrites.push(...entries);
+    this.persistDeferredWrites();
+  }
+
+  /**
+   * Which of `ids` already exist in some agent's store as a landed deferred
+   * write (`metadata.deferredWriteId`). Scans each context manager's recent
+   * tail blob-free — an interrupted flush is always within the last few
+   * hundred slots — and tolerates facades without windowed reads.
+   */
+  private landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string> {
+    const landed = new Set<string>();
+    if (ids.size === 0) return landed;
+    const WINDOW = 500;
+    for (const agent of this.agents.values()) {
+      try {
+        const cm = agent.getContextManager() as unknown as {
+          getMessageCount?: () => number;
+          getMessageWindow?: (o: number, l: number, opts?: { resolveBlobs?: boolean }) =>
+            { messages: Array<{ metadata?: Record<string, unknown> }> };
+          getAllMessages: () => Array<{ metadata?: Record<string, unknown> }>;
+        };
+        const consider = (m: { metadata?: Record<string, unknown> }): void => {
+          const id = m.metadata?.deferredWriteId;
+          if (typeof id === 'string' && ids.has(id)) landed.add(id);
+        };
+        if (typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function') {
+          const total = cm.getMessageCount();
+          // From the receipt position (0 = whole store when unknown) to the
+          // tail, in blob-free windows — the batch can only be after it.
+          const from = Math.min(scanFrom.get(agent.name) ?? 0, total);
+          for (let start = from; start < total; start += WINDOW) {
+            const win = cm.getMessageWindow(start, Math.min(WINDOW, total - start), { resolveBlobs: false });
+            for (const m of win.messages) consider(m);
+          }
+        } else {
+          for (const m of cm.getAllMessages()) consider(m);
+        }
+      } catch (err) {
+        console.error(`[host-mode] could not scan ${agent.name} for landed deferred writes:`, err);
+      }
+    }
+    return landed;
+  }
+
+  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
+   *  same idiom as the Discord awareness outbox. */
+  private writeRecoveryFile(path: string, document: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+  }
+
+  private readRecoveryFile(path: string): unknown {
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(readFileSync(path, 'utf8'));
+  }
+
+  private warnRecoveryFallbackOnce(): void {
+    if (this.recoveryFallbackWarned) return;
+    this.recoveryFallbackWarned = true;
+    console.error(
+      '[host-mode] no storePath / hostModePath / deferredWritesPath: quiesce state and deferred ' +
+      'writes persist in the branch-local framework/state slot — a historical rollback while ' +
+      'quiesced can erase them; configure the recovery paths',
+    );
+  }
+
+  /**
+   * Mirror the deferred-write queue durably while quiesced (and until an
+   * already-persisted queue drains). The quiesce flag itself is persisted
+   * because a crash mid-surgery is an expected event; the messages withheld
+   * BECAUSE of that surgery would otherwise die with the process — and the
+   * window is operator-length, not turn-length. Lives in the
+   * branch-independent recovery file so a rollback cannot orphan it.
+   * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
+   * still memory-only: they flush within the turn, as before.
+   */
+  private persistDeferredWrites(): void {
+    try {
+      // The durable queue is everything not yet acked: writes still pending
+      // AND writes handed to a context manager whose sync has not happened.
+      // Always in original deferral order, whatever the pending/un-acked
+      // split: a re-deferred entry must not jump the queue.
+      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+      const scanFrom = Object.fromEntries(this.deferredScanFrom);
+      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+        const payload = JSON.stringify(durable);
+        if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
+          if (!this.deferredWritesCapWarned) {
+            this.deferredWritesCapWarned = true;
+            console.error(
+              `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
+              `serialized (${durable.length} message(s)) — kept in memory only; ` +
+              `a crash before resume loses them`,
+            );
+          }
+          return;
+        }
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
+        } else {
+          this.warnRecoveryFallbackOnce();
+          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
+        }
+        this.deferredWritesPersisted = true;
+      } else if (this.deferredWritesPersisted) {
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
+        } else {
+          this.store.setStateJson(DEFERRED_WRITES_ID, []);
+        }
+        this.deferredWritesPersisted = false;
+      }
+    } catch (err) {
+      console.error('[host-mode] failed to persist deferred context writes:', err);
+    }
+  }
+
+  private restorePersistedDeferredWrites(): number {
+    try {
+      let raw: unknown;
+      if (this.deferredWritesPath && existsSync(this.deferredWritesPath)) {
+        raw = this.readRecoveryFile(this.deferredWritesPath);
+      } else {
+        // Stores that predate the recovery file (or store-only configs).
+        raw = this.store.getStateJson(DEFERRED_WRITES_ID);
+      }
+      // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
+      // `{ pending, scanFrom? }`.
+      const doc = Array.isArray(raw) ? { pending: raw } : (raw as { pending?: unknown; scanFrom?: unknown } | undefined);
+      const data = doc?.pending;
+      if (!Array.isArray(data) || data.length === 0) return 0;
+      const scanFrom = new Map<string, number>();
+      if (doc?.scanFrom && typeof doc.scanFrom === 'object') {
+        for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
+          if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
+        }
+      }
+      const candidates = data
+        .filter((m): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
+          !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
+            && Array.isArray((m as { content?: unknown }).content))
+        .map((m, i) => ({
+          ...m,
+          id: typeof m.id === 'string' ? m.id : randomUUID(),
+          // Files that predate `seq` are in write order already.
+          seq: typeof m.seq === 'number' ? m.seq : i + 1,
+        }))
+        .sort(bySeq);
+      this.deferredSeq = Math.max(this.deferredSeq, ...candidates.map((m) => m.seq));
+      // Exactly-once: a message that landed before its ack was written is
+      // already in the store under its deferredWriteId — do not replay it.
+      // The scan covers every slot the interrupted batch could occupy (from
+      // the receipt's per-agent position), or the whole store when the
+      // receipt predates the position field.
+      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
+      const restored = candidates.filter((m) => !landed.has(m.id));
+      if (landed.size > 0) {
+        console.error(
+          `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
+          `(interrupted flush) — skipped, not replayed`,
+        );
+      }
+      this.deferredMessages.push(...restored);
+      this.deferredWritesPersisted = true;
+      // Rewrite the durable queue without the already-landed entries so a
+      // second interrupted boot does not re-scan them.
+      if (landed.size > 0) this.persistDeferredWrites();
+      return restored.length;
+    } catch (err) {
+      console.error('[host-mode] failed to restore persisted deferred context writes:', err);
+      return 0;
+    }
+  }
+
+  /**
+   * Operator-driven maintenance: run (or join) one bounded compression pass —
+   * the same runQueuedMaintenance the timer drives, so tool definitions are
+   * refreshed and ticks are bounded/serialized identically — and return the
+   * maintenance snapshot. Works while quiesced by design: `running` stays
+   * true in quiesce mode precisely so this machinery stays hot.
+   */
+  async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
+    if (!this.running) {
+      // startQueuedMaintenance no-ops on a stopped/never-started framework —
+      // a bare snapshot would masquerade as a completed pass, so say so.
+      console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
+      return { ...this.getContextMaintenanceSnapshot(), ran: false };
+    }
+    this.startQueuedMaintenance();
+    await this.maintenancePass;
+    return { ...this.getContextMaintenanceSnapshot(), ran: true };
   }
 
   /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
@@ -2475,6 +3397,101 @@ export class AgentFramework {
       overrides,
       opts,
     );
+  }
+
+  /**
+   * Feasibility preview for a runtime-settings patch — or, with no patch, for
+   * the agent's CURRENT settings (the resume-gate case: quiesce maintenance
+   * may have moved the folded floor and the branch generation, so the verdict
+   * must be computed fresh at resume time).
+   *
+   * Models the patch through the same immediate-vs-paced semantics as the
+   * apply path (`Agent.planRuntimeSettings`): a non-immediate budget decrease
+   * is previewed at the UNCHANGED live compile budget, with a best-effort
+   * advisory verdict at the descent target. This is what the superseded
+   * `feat/budget-preflight-guard` got wrong — it previewed the patch value as
+   * the compile budget and rejected safe-by-construction paced descents.
+   *
+   * Never throws for preview-layer reasons: strategy without previewContext,
+   * preview overlap, stale branch generation, and the hierarchical (non-
+   * adaptive) path all come back as `{available: false, reason}`. Unknown
+   * agent still throws, matching the sibling accessors.
+   */
+  previewAgentRuntimeSettings(
+    agentName: string,
+    patch?: AgentRuntimeSettingsPatch,
+  ): RuntimeSettingsPreview {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const plan = agent.planRuntimeSettings(patch);
+    const settings = agent.getRuntimeSettings();
+    const base: RuntimeSettingsPreview = {
+      available: false,
+      path: plan.path,
+      liveBudgetTokens: plan.liveBudgetTokens,
+      transition: settings.transition,
+      ...(settings.transitionReason ? { transitionReason: settings.transitionReason } : {}),
+    };
+
+    const runPreview = (budgetTokens: number): {
+      result?: Record<string, unknown>;
+      reason?: string;
+    } => {
+      try {
+        const result = this.previewContextSettings(
+          agentName,
+          budgetTokens,
+          Object.keys(plan.overrides).length > 0 ? plan.overrides : undefined,
+        );
+        if (result === null || typeof result !== 'object') {
+          return { reason: 'no_preview_support' };
+        }
+        return { result: result as Record<string, unknown> };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        // Structured mapping of the strategy's known throw paths. Message
+        // matching is fragile by nature, so unknown messages surface verbatim
+        // as the reason rather than being swallowed or rethrown.
+        if (message.includes('requires reinitialization for the current branch generation')) {
+          return { reason: 'branch_generation_changed' };
+        }
+        if (message.includes('already running; previews must not overlap')) {
+          return { reason: 'preview_in_flight' };
+        }
+        if (message.includes('requires adaptiveResolution')) {
+          return { reason: 'no_adaptive_resolution' };
+        }
+        return { reason: message };
+      }
+    };
+
+    const effective = runPreview(plan.effectiveBudgetTokens);
+    if (!effective.result) {
+      return { ...base, reason: effective.reason };
+    }
+    const preview: RuntimeSettingsPreview = {
+      ...base,
+      available: true,
+      effective: {
+        ...effective.result,
+        budgetTokens: plan.effectiveBudgetTokens,
+        fits: effective.result.fits === true,
+        finalTokens: Number(effective.result.finalTokens ?? 0),
+      },
+    };
+    if (plan.advisoryTargetTokens !== undefined) {
+      // Best-effort: an advisory failure never flips `available` — the
+      // effective verdict above is the one that gates anything.
+      const advisory = runPreview(plan.advisoryTargetTokens);
+      if (advisory.result) {
+        preview.advisory = {
+          ...advisory.result,
+          targetTokens: plan.advisoryTargetTokens,
+          fits: advisory.result.fits === true,
+        };
+      }
+    }
+    return preview;
   }
 
   /**
@@ -2660,6 +3677,75 @@ export class AgentFramework {
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
+  /** Persist (or clear, with null) the host quiesce mode. First process-global
+   * key in the framework/state slot: quiesce survives a restart BY DESIGN — a
+   * crash mid-surgery must come back up NOT serving against a half-repaired
+   * store. Resume is always reachable (public method, WS/HTTP, control-plane
+   * host/command), and every quiesced boot logs a loud banner. */
+  private persistHostMode(mode: { quiesced: true; reason?: string; since: number } | null): void {
+    if (this.hostModePath) {
+      // Branch-independent: the recovery file is the record. (`quiesced:
+      // false` is written explicitly rather than deleting the file so that
+      // its presence, not its content, decides precedence over the legacy
+      // branch-local slot below.)
+      this.writeRecoveryFile(
+        this.hostModePath,
+        mode === null ? { version: 1, quiesced: false, clearedAt: Date.now() } : { version: 1, ...mode },
+      );
+      if (mode === null) {
+        // Also drop any legacy slot marker so a downgrade cannot resurrect it.
+        try {
+          const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+          if (data && typeof data === 'object' && 'hostMode' in (data as Record<string, unknown>)) {
+            const state = { ...(data as Record<string, unknown>) };
+            delete state.hostMode;
+            this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+          }
+        } catch { /* best effort */ }
+      }
+    } else {
+      this.warnRecoveryFallbackOnce();
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      if (mode === null) delete state.hostMode;
+      else state.hostMode = { ...mode };
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    }
+    // The whole feature rests on the flag surviving a crash — close the
+    // window between the write and the next periodic sync.
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error('[host-mode] store sync after host-mode change failed:', err);
+    }
+  }
+
+  /** The recovery file wins whenever it exists; the branch-local slot is
+   *  read only for stores that predate it (or store-only configs). */
+  private readHostMode(): { quiesced: boolean; reason?: string; since?: number } | null {
+    try {
+      let record: Record<string, unknown> | null = null;
+      if (this.hostModePath && existsSync(this.hostModePath)) {
+        const doc = this.readRecoveryFile(this.hostModePath);
+        if (doc && typeof doc === 'object') record = doc as Record<string, unknown>;
+      } else {
+        const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+        if (!data || typeof data !== 'object') return null;
+        const mode = (data as Record<string, unknown>).hostMode;
+        if (!mode || typeof mode !== 'object') return null;
+        record = mode as Record<string, unknown>;
+      }
+      if (!record) return null;
+      return {
+        quiesced: record.quiesced === true,
+        ...(typeof record.reason === 'string' ? { reason: record.reason } : {}),
+        ...(typeof record.since === 'number' ? { since: record.since } : {}),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Create an ephemeral agent that is NOT registered in the main event loop.
    *
@@ -2785,6 +3871,18 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
+    // Refused at admission while quiesced rather than requeued: the caller
+    // awaits the settle promise under an idle-stall watchdog, so a gate-parked
+    // ephemeral would ride out its timeout and reject with a misleading
+    // "stalled" error hours later. A clear refusal now beats that. Checked
+    // before the generation ticket is consumed so the same (agent, cm) pair
+    // can be retried after resume().
+    if (this.quiesced) {
+      throw new Error(
+        `framework is quiesced${this.quiesceReason ? ` (${this.quiesceReason})` : ''}: ` +
+        `refusing new ephemeral run for ${agent.name} — resume() first`,
+      );
+    }
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
     // cleanup is name-keyed and could cancel/deregister the legitimate owner.
@@ -2806,6 +3904,7 @@ export class AgentFramework {
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }
+    // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
@@ -3550,6 +4649,8 @@ export class AgentFramework {
     /** Agent state at queue time — 'idle' means the turn starts on the next
      *  scheduler pass; anything else means it runs after the current turn. */
     agentStatus?: string;
+    /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
+    quiesced?: boolean;
   } {
     const name = agentName ?? [...this.agents.keys()][0];
     const agent = name ? this.agents.get(name) : undefined;
@@ -3565,14 +4666,17 @@ export class AgentFramework {
       source: 'admin',
       timestamp: Date.now(),
     });
-    console.error(`[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}`);
+    console.error(
+      `[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}` +
+      (this.quiesced ? ' (host quiesced — parked until resume)' : ''),
+    );
     this.recordOperatorAction({
       kind: 'nudge',
       agent: name,
       requester: { via: 'nudge', ...(requestedBy ? { name: requestedBy } : {}) },
-      result: { agentStatus },
+      result: { agentStatus, ...(this.quiesced ? { quiesced: true } : {}) },
     });
-    return { ok: true, agentName: name, agentStatus };
+    return { ok: true, agentName: name, agentStatus, ...(this.quiesced ? { quiesced: true } : {}) };
   }
 
   /**
@@ -3586,6 +4690,20 @@ export class AgentFramework {
    *
    *   nudge — run inference on the current context with NO new events
    *   (see `nudgeAgent`).
+   *
+   *   quiesce — enter host maintenance mode (issue #122): park wakes, pause
+   *   MCPL data planes, drain in-flight turns (optionally `abandon` on
+   *   timeout). Host-scoped, no agentName.
+   *
+   *   resume — leave maintenance mode behind a fresh feasibility preview of
+   *   every agent's current settings (`force` overrides a failing verdict).
+   *
+   *   maintain — run (or join) one bounded compression/maintenance pass and
+   *   return the snapshot; the operator lever for draining quarantine or
+   *   advancing merges during a quiesce window.
+   *
+   *   host-status — report the quiesce state (drained / parked wakes /
+   *   running background scripts).
    */
   private async handleHostCommand(
     serverId: string,
@@ -3597,6 +4715,10 @@ export class AgentFramework {
     code?: string;
     undone?: number;
     requested?: number;
+    /** For quiesce/resume/maintain/host-status: the host mode snapshot. */
+    hostMode?: HostModeStatus;
+    /** For `maintain`: the context-maintenance snapshot after the pass. */
+    maintenance?: ContextMaintenanceSnapshot;
     messagesRemoved?: number;
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
@@ -3610,6 +4732,9 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
+     *  until resume rather than running. */
+    quiesced?: boolean;
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
@@ -3618,9 +4743,46 @@ export class AgentFramework {
       params.command !== 'undo' &&
       params.command !== 'hide' &&
       params.command !== 'unstick' &&
-      params.command !== 'nudge'
+      params.command !== 'nudge' &&
+      params.command !== 'quiesce' &&
+      params.command !== 'resume' &&
+      params.command !== 'maintain' &&
+      params.command !== 'host-status'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
+    }
+
+    // Host-scoped verbs (issue #122) — no agent resolution.
+    const requester = params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`;
+    if (params.command === 'quiesce') {
+      // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
+      console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
+      const hostMode = await this.quiesce({
+        reason: params.reason ?? `host/command by ${requester}`,
+        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
+        ...(params.abandon ? { abandon: true } : {}),
+      });
+      return { ok: true, hostMode };
+    }
+    if (params.command === 'resume') {
+      console.error(`[host-command] resume by=${requester} (server=${serverId})`);
+      try {
+        const hostMode = await this.resume(params.force ? { force: true } : undefined);
+        return { ok: true, hostMode };
+      } catch (error) {
+        if (error instanceof ResumeBlockedError) {
+          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
+        }
+        throw error;
+      }
+    }
+    if (params.command === 'maintain') {
+      console.error(`[host-command] maintain by=${requester} (server=${serverId})`);
+      const maintenance = await this.maintenanceTick();
+      return { ok: true, maintenance, hostMode: this.getHostModeStatus() };
+    }
+    if (params.command === 'host-status') {
+      return { ok: true, hostMode: this.getHostModeStatus() };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
@@ -3635,7 +4797,7 @@ export class AgentFramework {
         agentName,
         params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`,
       );
-      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus };
+      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus, ...(r.quiesced ? { quiesced: true } : {}) };
     }
 
     // unstick: force the refusal-rewind loop on demand (even if the agent's
@@ -3672,9 +4834,9 @@ export class AgentFramework {
         agent: agentName,
         requester: hostCommandRequester(serverId, params),
         params: { cap },
-        result: { started: true },
+        result: { started: true, ...(this.quiesced ? { quiesced: true } : {}) },
       });
-      return { ok: true, started: true, cap };
+      return { ok: true, started: true, cap, ...(this.quiesced ? { quiesced: true } : {}) };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -4890,7 +6052,12 @@ export class AgentFramework {
       !this.queue.isEmpty ||
       // Direct inference requests (e.g. runEphemeralToCompletion) bypass the
       // event queue — without this the loop can exit before they're drained.
-      this.pendingRequests.length > 0 ||
+      // While quiesced, gate-parked requests are NOT progress and must not
+      // block idle (only a budget restart can still run); identity-equivalent
+      // to `.length > 0` when not quiesced.
+      this.pendingRequests.some(
+        (r) => !this.quiesced || isTurnContinuation(r.reason),
+      ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
@@ -5144,7 +6311,7 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
               for (const msg of deferred) {
-                agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -5163,6 +6330,10 @@ export class AgentFramework {
               }
             }
           }
+
+          // Deferred writes handed to the store above: sync, then drop them
+          // from the durable recovery queue (no-op unless one is persisted).
+          this.ackDeferredWrites();
 
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
@@ -6187,6 +7358,42 @@ export class AgentFramework {
       // This mirrors how the restart has always overwritten activeStreams
       // rather than waiting for the old stream's teardown.
       const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
+
+      // Host quiesce (issue #122): park wakes instead of starting turns —
+      // the requeue mirrors the busy path below, so requests survive and
+      // fire at resume. A context-budget restart passes through: it
+      // CONTINUES a turn whose token is held (see the deadlock note below),
+      // and quiesce's drain is exactly the phase where such a turn must be
+      // allowed to finish. Parked requests are coalesced per reason (newest
+      // kept): heartbeat/gate wakes arrive once per tick and nothing else
+      // bounds a multi-day maintenance window's accumulation.
+      if (this.quiesced) {
+        // Continuations of a held turn (budget restart, non-streaming tool
+        // results) pass; everything else parks.
+        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
+        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // Coalesce per (reason, addressed): every channel wake shares one
+        // reason, so keying on reason alone would let an ambient message
+        // parked later evict a DM/mention parked earlier — and the
+        // addressed-outranks-ambient trigger selection below would then
+        // route the resumed turn into the wrong channel.
+        const newestByKey = new Map<string, InferenceRequest>();
+        for (const request of parked) {
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}`;
+          const prev = newestByKey.get(key);
+          if (!prev || request.timestamp >= prev.timestamp) {
+            newestByKey.set(key, request);
+          }
+        }
+        this.pendingRequests.push(...newestByKey.values());
+        if (passThrough.length === 0) continue;
+        // The continuation continues its held turn; its parked siblings must
+        // NOT be consumed by that turn — they were re-parked above, so narrow
+        // the batch to the continuation(s) alone before the trigger selection.
+        requests.length = 0;
+        requests.push(...passThrough);
+      }
+
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
       const providerGate = this.providerGates?.get(agentName);
       // A primary can own provider admission while yielding to an already in-flight
@@ -6200,9 +7407,12 @@ export class AgentFramework {
       // added later) leave the slot undefined, which must read as "not held".
       const surgeryHeld = !!this.surgeryHold;
       if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
-        // Re-queue requests, but warn if they've been pending too long
+        // Re-queue requests, but warn if they've been pending too long.
+        // Suppressed while quiesced: a drain-phase busy requeue is expected,
+        // not a wedge tell.
         const oldest = Math.min(...requests.map(r => r.timestamp));
         if (
+          !this.quiesced &&
           now - oldest > STALE_REQUEST_MS &&
           (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
         ) {
@@ -6795,6 +8005,20 @@ export class AgentFramework {
             console.error(`[provider-admission] ${agent.name}: turn-alive while parked — wake requeued, not started`);
             return;
           }
+          // Same gap, second hazard (#122): the host may have QUIESCED while
+          // this wake was parked. The scheduler's quiesce gate ran before the
+          // park; starting here would bypass it and run a turn against a
+          // context the operator believes frozen. Give admission back and
+          // requeue — the scheduler re-parks it (coalesced) until resume.
+          // Continuations of a held turn pass, as they do at the gate.
+          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -6876,7 +8100,9 @@ export class AgentFramework {
           // poison message — or a transient store-write failure — must not
           // abort the turn or drop the messages behind it in the queue.
           try {
-            const id = agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+            const id = agent.getContextManager().addMessage(
+              msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
+            );
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -6886,6 +8112,7 @@ export class AgentFramework {
             );
           }
         }
+        this.ackDeferredWrites();
       }
     }
 
@@ -8061,6 +9288,41 @@ export class AgentFramework {
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
 
+            // A quiesce-abandoned cancel may surface as `error` instead of
+            // `aborted` depending on how the stream implementation reports
+            // the cancellation. Same contract as the aborted branch: settle
+            // honestly, no errorPolicy retry (which would relaunch inference
+            // mid-maintenance-window), no inference:exhausted (which feeds
+            // the failure streak / hard-down / poison-history accounting).
+            {
+              const cancelKey = `${agent.name}:${myStreamId}`;
+              if (this.frameworkCancelledStreams.get(cancelKey) === 'quiesce_abandoned') {
+                this.frameworkCancelledStreams.delete(cancelKey);
+                // Same terminal as the `aborted` twin: §10.5 lifecycle reads
+                // 'aborted' (not 'completed'), and the gate is released only
+                // for THIS agent instance — a name re-registered meanwhile
+                // (ephemeral disposal, conversation replacement) owns its own
+                // gate liveness. The inference-log terminal was already
+                // written at the top of this case (`Stream error`).
+                lifecyclePhase = 'aborted';
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  error: 'Turn abandoned by operator quiesce',
+                });
+                this.emitTrace({
+                  type: 'inference:aborted',
+                  agentName: agent.name,
+                  durationMs,
+                  reason: 'quiesce_abandoned',
+                });
+                if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+                  this.eventGate?.onInferenceEnded(agent.name);
+                }
+                break;
+              }
+            }
+
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
@@ -8115,6 +9377,30 @@ export class AgentFramework {
                   preserveEventGateForSuccessor = true;
                 } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
                   this.eventGate?.onInferenceEnded(agent.name);
+                }
+                if (cancelKind === 'quiesce_abandoned') {
+                  // Operator-initiated cancel during a quiesce drain. Settle
+                  // the turn honestly — deliberately NO inference:exhausted:
+                  // that trace centrally drives the consecutive-failure
+                  // streak, hard-down ops alerts, and the poison-history
+                  // breaker, none of which an operator cancel represents.
+                  // inference:aborted carries the observability instead.
+                  if (agent.streamId === myStreamId) {
+                    this.abortAgentScript(agent.name, 'turn abandoned by quiesce');
+                    agent.reset();
+                    this.settleAgent(agent.name, {
+                      stopReason: 'exhausted',
+                      speech: '',
+                      error: 'Turn abandoned by operator quiesce',
+                    });
+                  }
+                  this.emitTrace({
+                    type: 'inference:aborted',
+                    agentName: agent.name,
+                    durationMs: Date.now() - startTime,
+                    reason: 'quiesce_abandoned',
+                  });
+                  return;
                 }
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
@@ -8407,9 +9693,12 @@ export class AgentFramework {
       if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -8560,8 +9849,8 @@ export class AgentFramework {
         cm.addMessage('user', blocks);
       } else {
         this.deferredMessages.push(
-          { participant: agentName, content: toolUse, forAgent: agentName },
-          { participant: 'user', content: blocks, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName },
         );
       }
 
@@ -8591,9 +9880,12 @@ export class AgentFramework {
       if (!this.activeTurnTokens.has(agentName)
         && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         for (const msg of this.drainDeferredFor(agentName)) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -9504,11 +10796,18 @@ export class AgentFramework {
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
 
+    // Both branches persist the JSON view, never the live object: a compiled
+    // request carries non-JSON members (the kv-unified `onCacheWireReceipt`
+    // hook is a function) and Chronicle's JSON bridge rejects those with
+    // "JS functions cannot be represented as a serde_json::Value" — which,
+    // thrown from the failure path, masked the failure being logged.
     if (entry.request && typeof entry.request === 'object') {
       const requestJson = JSON.stringify(entry.request);
       if (requestJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(requestJson), 'application/json');
         entryToStore.request = { blobId };
+      } else {
+        entryToStore.request = JSON.parse(requestJson);
       }
     }
 
@@ -9517,6 +10816,8 @@ export class AgentFramework {
       if (responseJson.length > BLOB_THRESHOLD) {
         const blobId = this.store.storeBlob(Buffer.from(responseJson), 'application/json');
         entryToStore.response = { blobId };
+      } else {
+        entryToStore.response = JSON.parse(responseJson);
       }
     }
 
@@ -9788,6 +11089,14 @@ export class AgentFramework {
        * this is reachable from timer callbacks that may outlive an agent).
        */
       forAgent?: string;
+      /**
+       * Set when the message is being flushed FROM the durable deferred
+       * queue: it is the entry's one durable identity. A write stamps it
+       * into `metadata.deferredWriteId` (boot dedup); a re-deferral moves
+       * the same logical entry back to pending under the same id instead of
+       * minting a second, independently replayable one.
+       */
+      deferredWriteId?: string;
     }
   ): MessageId {
     // Route to the named agent, else the primary (not ephemeral subagents).
@@ -9823,6 +11132,10 @@ export class AgentFramework {
     // their own wake), at the agent's next tool boundary (where they are
     // ALSO injected into the live stream — hear-while-acting), or in
     // driveStream's finally when the turn ends.
+    // Quiesce (issue #122): the window exists to run compression/refold
+    // against a FROZEN context — module events and api message.send must not
+    // append mid-surgery. Deferred here, flushed by resume(). tool_result
+    // still lands (a draining turn's continuation depends on it).
     const hasToolResult = content.some(b => b.type === 'tool_result');
     // Explicitly-targeted deliveries scope the tool-cycle check to the
     // target (pendingAssistantBlocks is keyed by agent); the default path
@@ -9833,15 +11146,30 @@ export class AgentFramework {
       : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
-      (midToolCycle ||
+      (this.quiesced ||
+        midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      this.deferredMessages.push({ participant, content, metadata, forAgent: opts?.forAgent });
+      // A re-deferral of a drained entry keeps its id and leaves the un-acked
+      // set: one logical message, one durable identity — never two entries.
+      const id = opts?.deferredWriteId ?? randomUUID();
+      let seq: number | undefined;
+      if (opts?.deferredWriteId) {
+        const prior = this.unackedDeferredWrites.find((m) => m.id === id);
+        seq = prior?.seq;
+        this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
+      }
+      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
-    return agent.getContextManager().addMessage(participant, content, metadata);
+    return agent.getContextManager().addMessage(
+      participant,
+      content,
+      opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
+    );
   }
 
   /**
@@ -9850,6 +11178,9 @@ export class AgentFramework {
    * targets' messages queued for their own boundaries.
    */
   private drainDeferredFor(agentName: string): Array<{
+    /** Durable identity — every write of this entry must carry it
+     *  (`withDeferredWriteId` / `opts.deferredWriteId`). */
+    id: string;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -9863,6 +11194,12 @@ export class AgentFramework {
       (target === agentName ? mine : rest).push(msg);
     }
     this.deferredMessages = rest;
+    mine.sort(bySeq);
+    // The drained messages are about to be written by the caller; they stay
+    // in the DURABLE queue (as un-acked) until the caller's
+    // ackDeferredWrites() has synced the chronicle. Removing them here would
+    // acknowledge before the write is durable.
+    this.handOffDeferredWrites(mine);
     return mine;
   }
 
@@ -10854,8 +12191,21 @@ export class AgentFramework {
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
       // ready() can synchronously flush a nested list-change notification that
       // installs a newer global generation. Never let this older completion
-      // release any remaining server behind that newer gate.
+      // release any remaining server behind that newer gate. (The quiesce
+      // check sits AFTER this guard: readyControlPlane can also synchronously
+      // flush a control event that installs a newer barrier.)
       if (this.discordAwarenessBarrier !== null) return false;
+      // Host quiesce (issue #122): this is the single point every barrier
+      // completion and reconnect flow funnels through, so holding here keeps
+      // data planes paused across awareness drains and reconnects for the
+      // whole window. Control planes come up normally (host/command rides the
+      // control plane, so resume stays deliverable); resume() performs the
+      // real ready() flush through this same funnel once its feasibility gate
+      // passes and the flag is cleared.
+      if (this.quiesced) {
+        connection.readyControlPlane();
+        continue;
+      }
       connection.ready();
     }
     return this.discordAwarenessBarrier === null;

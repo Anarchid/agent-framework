@@ -266,9 +266,30 @@ const server = new ApiServer(framework, { port: 8765 });
 await server.start();
 ```
 
-**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`
+**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`
 
 Also available as an MCP server via the `agent-framework-mcp` binary.
+
+### Host quiesce / maintenance mode
+
+Pause the inference thread and MCPL data planes while keeping the framework,
+context managers, and membrane hot — so compression/refold/quarantine work runs
+through the live machinery instead of offline scripts (issue #122). Quiesce
+persists across restarts; `resume` gates on a fresh per-agent feasibility
+preview of the current runtime settings (`force` overrides).
+
+```typescript
+await framework.quiesce({ reason: 'refold', timeoutMs: 120_000, abandon: false });
+await framework.maintenanceTick();   // drain quarantine / advance merges
+await framework.resume();            // throws ResumeBlockedError if the layout won't compile
+```
+
+Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
+`POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
+`host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
+servers granted `allowHostCommands`. The HTTP host verbs accept an optional
+shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
+deployments that front the port with a proxy.
 
 ## Observability
 
