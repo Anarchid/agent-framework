@@ -48,7 +48,9 @@ import type {
 
 export * from './types.js';
 
-const DEFAULT_CONFIG: Required<Omit<ApiServerConfig, 'adminToken'>> & Pick<ApiServerConfig, 'adminToken'> = {
+type ResolvedApiServerConfig = Required<Omit<ApiServerConfig, 'adminToken' | 'allowedOrigins'>> & Pick<ApiServerConfig, 'adminToken' | 'allowedOrigins'>;
+
+const DEFAULT_CONFIG: ResolvedApiServerConfig = {
   port: 8765,
   host: 'localhost',
   path: '/ws',
@@ -70,7 +72,7 @@ function timingSafeTokenEqual(presented: string, expected: string): boolean {
  * API Server for the agent framework.
  */
 export class ApiServer {
-  private config: Required<Omit<ApiServerConfig, 'adminToken'>> & Pick<ApiServerConfig, 'adminToken'>;
+  private config: ResolvedApiServerConfig;
   private framework: AgentFramework;
   private wss: WebSocketServer | null = null;
   private httpServer: ReturnType<typeof createServer> | null = null;
@@ -84,7 +86,35 @@ export class ApiServer {
 
   constructor(framework: AgentFramework, config: ApiServerConfig = {}) {
     this.framework = framework;
+    // An empty token would look configured while matching an empty header:
+    // the gate would pass for anyone. Refuse it at construction.
+    if (config.adminToken !== undefined && config.adminToken.length === 0) {
+      throw new Error('ApiServerConfig.adminToken must be non-empty when set (omit it to disable the gate)');
+    }
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * WebSocket upgrade origin policy (see ApiServerConfig.allowedOrigins).
+   * Non-browser clients send no Origin and pass; a browser Origin must match
+   * this server's own host or the configured allow-list.
+   */
+  private originAllowed(origin: string | undefined, hostHeader: string | undefined): boolean {
+    if (origin === undefined || origin === '' || origin === 'null') return origin !== 'null';
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      return false;
+    }
+    if (hostHeader && originHost.toLowerCase() === hostHeader.toLowerCase()) return true;
+    return (this.config.allowedOrigins ?? []).some((allowed) => {
+      try {
+        return new URL(allowed).host.toLowerCase() === originHost.toLowerCase();
+      } catch {
+        return allowed.toLowerCase() === originHost.toLowerCase();
+      }
+    });
   }
 
   /**
@@ -105,6 +135,14 @@ export class ApiServer {
     this.wss = new WebSocketServer({
       server: this.httpServer,
       path: this.config.path,
+      // Browsers skip CORS for WS handshakes, so the Origin check is the
+      // only thing standing between a visited web page and this command
+      // surface on a localhost bind (host.quiesce, undo, branch.delete…).
+      verifyClient: (info: { origin: string; req: IncomingMessage }, done: (ok: boolean, code?: number, msg?: string) => void) => {
+        const ok = this.originAllowed(info.origin, info.req.headers.host);
+        if (!ok) console.warn(`[api] rejected WebSocket upgrade from origin ${info.origin}`);
+        done(ok, 403, 'origin not allowed');
+      },
     });
 
     this.wss.on('connection', (ws) => {
@@ -910,6 +948,16 @@ export class ApiServer {
     // so no ambient remoteAddress check is attempted (it breaks behind
     // proxies both ways and adds nothing on a local bind).
     if (url.pathname === '/hostmode') {
+      // Carries the operator's free-text reason; when a token is configured,
+      // reads require it too (ACAO:* makes this cross-origin readable).
+      if (this.config.adminToken !== undefined) {
+        const presented = req.headers['x-admin-token'];
+        if (typeof presented !== 'string' || !timingSafeTokenEqual(presented, this.config.adminToken)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'x-admin-token required' }));
+          return;
+        }
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(this.framework.getHostModeStatus()));
       return;
@@ -968,7 +1016,10 @@ export class ApiServer {
             respond(500, { error: error instanceof Error ? error.message : String(error) });
           }
         }
-      })();
+      })().catch(() => {
+        // The client went away mid-drain: respond() threw, and the fallback
+        // respond(500) threw again. Nothing left to tell anyone.
+      });
       return;
     }
 
