@@ -910,9 +910,20 @@ test('a failed chronicle sync keeps flushed deferred writes in the durable queue
 
 const CRASH_CHILD = fileURLToPath(new URL('./helpers/quiesce-crash-child.js', import.meta.url));
 
-for (const mode of ['after-ack', 'before-sync'] as const) {
-  test(`a REAL process exit ${mode === 'after-ack' ? 'right after the first ack' : 'before the chronicle sync'} of the resume flush loses no deferred write and duplicates none`, async () => {
-    const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${mode}-`));
+const CRASH_SCENARIOS = [
+  { mode: 'after-ack', label: 'right after the first ack of the resume flush',
+    expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
+  { mode: 'before-sync', label: 'before the chronicle sync of the resume flush',
+    expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
+  { mode: 'turn-start-ack', label: "after an ORDINARY turn-start flush's sync but before its queue rewrite",
+    expect: ['ONCE-ONLY'], bootQuiesced: false },
+  { mode: 'redefer', label: "at the recovery-file write of a re-deferral (abandoned turn's teardown while quiesced)",
+    expect: ['REDEFER-ONCE'], bootQuiesced: true },
+] as const;
+
+for (const scenario of CRASH_SCENARIOS) {
+  test(`a REAL process exit ${scenario.label} loses no deferred write and duplicates none`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${scenario.mode}-`));
     const storePath = join(dir, 'store');
     const config = () => ({
       storePath,
@@ -922,27 +933,29 @@ for (const mode of ['after-ack', 'before-sync'] as const) {
     });
     let framework: AgentFramework | null = null;
     try {
-      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, mode], {
+      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, scenario.mode], {
         encoding: 'utf8',
         timeout: 60_000,
       });
       assert.equal(child.status, 0, `child staged the crash (stderr: ${child.stderr.slice(-800)})`);
 
+      const wanted = new Set<string>(scenario.expect);
+      const texts = () => framework!.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text: string }).text)
+        .filter((t) => wanted.has(t));
+
       framework = await AgentFramework.create(config());
       const booted = framework.getHostModeStatus();
-      assert.equal(booted.quiesced, true, 'the durable flag is cleared only after the flush completes');
-
-      await framework.resume();
-      const texts = framework.getAgent('agent')!.getContextManager().getAllMessages()
-        .map((m) => (m.content[0] as { text: string }).text)
-        .filter((t) => t === 'ACKED-BUT-NOT-SYNCED' || t === 'STILL-PENDING');
-      assert.deepEqual(texts, ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], 'both present, exactly once, in order');
+      assert.equal(booted.quiesced, scenario.bootQuiesced);
+      if (booted.quiesced) await framework.resume();
+      assert.deepEqual(texts(), [...scenario.expect], 'present exactly once, in order');
       assert.equal(framework.getHostModeStatus().deferredWrites, 0);
       await framework.stop();
 
       framework = await AgentFramework.create(config());
       assert.equal(framework.getHostModeStatus().quiesced, false);
       assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+      assert.deepEqual(texts(), [...scenario.expect], 'still exactly once after a second reopen');
     } finally {
       await framework?.stop();
       rmSync(dir, { recursive: true, force: true });

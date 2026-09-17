@@ -408,6 +408,13 @@ const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
  *  where such a turn must be allowed to finish, and parking them would hold
  *  the token until the drain timed out (and `abandon` could not clear a turn
  *  with no stream). */
+/** Stamp a deferred write's durable id into the metadata it is stored with
+ *  (boot recovery dedups replays by it). Idempotent for an already-stamped
+ *  message. */
+function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
+  return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready';
 }
@@ -2818,12 +2825,10 @@ export class AgentFramework {
     let stored = 0;
     for (const msg of flush) {
       try {
-        this.addMessage(
-          msg.participant,
-          msg.content,
-          { ...(msg.metadata ?? {}), deferredWriteId: msg.id } as MessageMetadata,
-          msg.forAgent ? { forAgent: msg.forAgent } : undefined,
-        );
+        this.addMessage(msg.participant, msg.content, msg.metadata, {
+          deferredWriteId: msg.id,
+          ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+        });
         stored++;
       } catch (err) {
         console.error(
@@ -5589,7 +5594,7 @@ export class AgentFramework {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
               for (const msg of deferred) {
-                agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -7370,7 +7375,9 @@ export class AgentFramework {
           // poison message — or a transient store-write failure — must not
           // abort the turn or drop the messages behind it in the queue.
           try {
-            const id = agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+            const id = agent.getContextManager().addMessage(
+              msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
+            );
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -8961,8 +8968,10 @@ export class AgentFramework {
       if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
         this.ackDeferredWrites();
       }
@@ -9141,8 +9150,10 @@ export class AgentFramework {
       if (!this.activeTurnTokens.has(agentName)
         && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         for (const msg of this.drainDeferredFor(agentName)) {
-          this.addMessage(msg.participant, msg.content, msg.metadata,
-            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
         }
         this.ackDeferredWrites();
       }
@@ -10339,6 +10350,14 @@ export class AgentFramework {
        * this is reachable from timer callbacks that may outlive an agent).
        */
       forAgent?: string;
+      /**
+       * Set when the message is being flushed FROM the durable deferred
+       * queue: it is the entry's one durable identity. A write stamps it
+       * into `metadata.deferredWriteId` (boot dedup); a re-deferral moves
+       * the same logical entry back to pending under the same id instead of
+       * minting a second, independently replayable one.
+       */
+      deferredWriteId?: string;
     }
   ): MessageId {
     // Route to the named agent, else the primary (not ephemeral subagents).
@@ -10393,12 +10412,22 @@ export class AgentFramework {
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      this.deferredMessages.push({ id: randomUUID(), participant, content, metadata, forAgent: opts?.forAgent });
+      // A re-deferral of a drained entry keeps its id and leaves the un-acked
+      // set: one logical message, one durable identity — never two entries.
+      const id = opts?.deferredWriteId ?? randomUUID();
+      if (opts?.deferredWriteId) {
+        this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
+      }
+      this.deferredMessages.push({ id, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
-    return agent.getContextManager().addMessage(participant, content, metadata);
+    return agent.getContextManager().addMessage(
+      participant,
+      content,
+      opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
+    );
   }
 
   /**
@@ -10407,6 +10436,9 @@ export class AgentFramework {
    * targets' messages queued for their own boundaries.
    */
   private drainDeferredFor(agentName: string): Array<{
+    /** Durable identity — every write of this entry must carry it
+     *  (`withDeferredWriteId` / `opts.deferredWriteId`). */
+    id: string;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;

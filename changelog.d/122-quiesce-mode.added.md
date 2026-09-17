@@ -63,3 +63,12 @@
   Regression coverage uses a real child process that `process.exit`s
   mid-resume, both right after the first acknowledgement and before the
   sync: the reopened host replays exactly the un-landed remainder.
+- Review round 4: one durable id per logical deferred write across every
+  hand-off. Every write that originates from the durable queue — the
+  ordinary turn-start, mid-turn-injection, turn-end and puppet-end flushes,
+  not only the resume flush — stamps `metadata.deferredWriteId`, and a
+  re-deferral (target still busy or host still quiesced when a drained entry
+  is written) moves the same entry back to pending under the same id
+  instead of minting a second replayable one. Two more real child-process
+  crash regressions: exit between an ordinary turn-start flush's sync and
+  its queue rewrite, and exit at a re-deferral's recovery-file write.
