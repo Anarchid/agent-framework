@@ -8,6 +8,7 @@ import {
   extractDiscordAwarenessRefs,
 } from '../src/recovery/discord-awareness-outbox.js';
 import { AgentFramework } from '../src/framework.js';
+import { OperatorLog } from '../src/operator-log.js';
 
 test('extractDiscordAwarenessRefs keeps only direct Discord addressing metadata', () => {
   const refs = extractDiscordAwarenessRefs([
@@ -256,6 +257,8 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.mcplServerRegistry = null;
     framework.moduleRegistry = { getModule: () => null };
     framework.lastVisiblePreview = async () => null;
+    framework.activeTurnTokens = new Set();
+    framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {
       command: 'undo', agentName: 'cairn', messages: 2,

@@ -9,7 +9,16 @@
   agent is not idle (`OperatorActionError`, code `agent-busy`). The
   message-granular `host/command undo` now rides on `rollbackToMessage`
   (reads windowed, blob-free — no longer re-inflates every attachment on the
-  branch).
+  branch). Its stderr line is now `[operator] rollback …` rather than
+  `[host-command] undo-messages …`, and the reply carries the refusal `code`.
+  Body groups are never bisected: a rollback target inside a sharded message
+  snaps to the group's last shard (`tailMessageId` in the result), and a
+  suppression removes the whole group as a range. The idle gate is the
+  scheduler's own (`idle+turn-alive` counts as busy).
+- `DiscordAwarenessOutbox.discard(batchId)` retires a prepared-but-never-
+  activated batch. Live suppression uses it on every failure path so an
+  orphaned explicit batch can no longer re-arm at boot and abort
+  `AgentFramework.create()`.
 - Durable operator log: `<storePath>/operator-actions.jsonl` (config
   `operatorLogPath`, `false` to disable) records who asked, from where, and
   why for every operator mutation — rollback, suppress, hide, undo/redo turn,

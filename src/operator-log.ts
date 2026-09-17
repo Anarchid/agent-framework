@@ -10,12 +10,16 @@
  * The chronicle record log is the authoritative history of *what* changed;
  * this file records *who asked for it, from where, and why* — the part the
  * store cannot know. Writes are best-effort (a logging failure never fails
- * the action) but synchronous, so an entry is on disk before the action
- * returns to its caller.
+ * the action) and synchronous (`write(2)`, not `fsync`): an entry survives a
+ * process crash once the call returns, not a power loss. Mutations record
+ * after they complete, so a crash between the chronicle switch and the
+ * append loses the who/why for that one action — the branch itself remains
+ * the evidence. The file is created 0600: it carries requester identity and
+ * free-text operator notes.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /** Who asked. `via` names the surface ('webui', 'host-command', 'api',
  *  'cli', …); `name`/`id` are whatever identity that surface has. */
@@ -61,7 +65,7 @@ export class OperatorLog {
     try {
       const dir = dirname(this.path);
       if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      appendFileSync(this.path, JSON.stringify(entry) + '\n');
+      appendFileSync(this.path, JSON.stringify(entry) + '\n', { mode: 0o600 });
     } catch (error) {
       if (!this.warned) {
         this.warned = true;
@@ -102,7 +106,16 @@ export class OperatorLog {
 }
 
 export function defaultOperatorLogPath(storePath: string): string {
-  return `${storePath.replace(/\/+$/, '')}/operator-actions.jsonl`;
+  return join(storePath, 'operator-actions.jsonl');
+}
+
+/** Ids lists in log records are capped so one wide `hide`/`suppress` cannot
+ *  write a multi-KB line; the full count is always recorded alongside. */
+export const OPERATOR_LOG_ID_CAP = 50;
+export function capIds(ids: string[]): { ids: string[]; count: number; truncated?: true } {
+  return ids.length > OPERATOR_LOG_ID_CAP
+    ? { ids: ids.slice(0, OPERATOR_LOG_ID_CAP), count: ids.length, truncated: true }
+    : { ids, count: ids.length };
 }
 
 /** Thrown by live surgery methods when a request cannot be honored. `code`

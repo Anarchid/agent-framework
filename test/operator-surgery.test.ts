@@ -178,6 +178,115 @@ describe('live operator surgery', () => {
     assert.equal(entry.requester?.name, 'antra');
   });
 
+  // --- body groups -----------------------------------------------------------
+  // Shards of one large message are stored as a contiguous run sharing a
+  // bodyGroupId. Chronicle refuses to bisect a run on removal; the surgeries
+  // must never create a partial run either.
+
+  type ShardStore = { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: string } } };
+  const appendShards = (group: string, texts: string[]): string[] =>
+    texts.map((text, shardIndex) =>
+      (cm() as unknown as ShardStore).messageStore
+        .append('user', [{ type: 'text', text }], {}, undefined, { bodyGroupId: group, shardIndex }).id,
+    );
+
+  it('suppress removes a whole body group from any shard id, and a single-shard group as a range', async () => {
+    // m1..m5 exist; add a 3-shard group then a plain message, then a 1-shard group.
+    const [g0, g1, g2] = appendShards('g3', ['s0', 's1', 's2']);
+    cm().addMessage('user', [{ type: 'text', text: 'after' }]);
+    const [lone] = appendShards('g1', ['lone']);
+    const before = cm().getMessageCount();
+
+    const r = await framework.suppressMessages('scout', { messageIds: [g1, lone] });
+    assert.equal(r.messagesRemoved, 4, 'middle shard expands to its 3-shard group; lone shard removed as a range');
+    assert.deepEqual(new Set(r.removedIds), new Set([g0, g1, g2, lone]));
+    assert.equal(cm().getMessageCount(), before - 4);
+    assert.deepEqual(remainingTexts().slice(-2), ['m5', 'after'], 'no partial run survives');
+  });
+
+  it('rollback never bisects a body group: a mid-group target snaps to the group tail', async () => {
+    const [s0, s1, s2] = appendShards('g3', ['s0', 's1', 's2']);
+    cm().addMessage('user', [{ type: 'text', text: 'after' }]);
+
+    const r = await framework.rollbackToMessage('scout', { messageId: s1 });
+    assert.equal(r.tailMessageId, s2, 'fork lands on the last shard');
+    assert.equal(r.messagesRemoved, 1, 'only the message after the group leaves');
+    assert.deepEqual(remainingTexts().slice(-3), ['s0', 's1', 's2']);
+    void s0;
+  });
+
+  // --- failure path ----------------------------------------------------------
+
+  it('a failed suppression restores the source branch, retires its outbox batch, and leaves the store bootable', async () => {
+    const c = cm() as unknown as { removeMessages: (a: string, b: string) => void };
+    const original = c.removeMessages;
+    c.removeMessages = () => { throw new Error('injected redaction failure'); };
+    try {
+      // A 2-shard group forces the range path (the injected failure).
+      const [s0] = appendShards('g2', ['x0', 'x1']);
+      await assert.rejects(
+        framework.suppressMessages('scout', { messageIds: [s0] }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'failed'
+          && /active branch restored to main/.test(e.message) && /injected/.test(e.message),
+      );
+    } finally {
+      c.removeMessages = original;
+    }
+    assert.equal(cm().currentBranch().name, 'main');
+    const fork = cm().listBranches().find((b) => b.name.startsWith('suppress/'));
+    assert.ok(fork, 'the fork is kept for diagnosis');
+
+    const outbox = (framework as unknown as { discordAwarenessOutbox: { batches(): Array<{ status: string }> } }).discordAwarenessOutbox;
+    assert.equal(outbox.batches().filter((b) => b.status === 'prepared').length, 0, 'no armed batch left behind');
+
+    // The reproduction from review: open the failed fork, restart the host.
+    // Before the fix, the orphaned prepared batch re-ran the failed removal
+    // at boot and AgentFramework.create() threw.
+    await cm().switchBranch(fork!.name);
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    assert.equal(cm().currentBranch().name, fork!.name, 'host boots on the diagnostic branch');
+  });
+
+  it('the suppression outbox batch activates only after the last redaction', async () => {
+    const outbox = (framework as unknown as { discordAwarenessOutbox: { batches(): Array<{ status: string }> } }).discordAwarenessOutbox;
+    const c = cm() as unknown as { removeMessage: (id: string) => void };
+    const original = c.removeMessage;
+    const seen: string[][] = [];
+    c.removeMessage = (id: string) => { seen.push(outbox.batches().map((b) => b.status)); original.call(c, id); };
+    try {
+      await framework.suppressMessages('scout', { messageIds: [ids[1], ids[3]] });
+    } finally {
+      c.removeMessage = original;
+    }
+    assert.equal(seen.length, 2);
+    for (const statuses of seen) assert.deepEqual(statuses, ['prepared'], 'still prepared while removals run');
+    assert.deepEqual(outbox.batches().map((b) => b.status), ['active']);
+  });
+
+  it("the idle gate also refuses 'idle+turn-alive' (turn token held, status idle)", async () => {
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+    tokens.set('scout', 1);
+    try {
+      await assert.rejects(
+        framework.rollbackToMessage('scout', { messageId: ids[1] }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy' && /idle\+turn-alive/.test(e.message),
+      );
+      await assert.rejects(
+        framework.suppressMessages('scout', { messageIds: [ids[1]] }),
+        (e: unknown) => e instanceof OperatorActionError && e.code === 'agent-busy',
+      );
+    } finally {
+      tokens.delete('scout');
+    }
+    assert.equal(cm().listBranches().length, 1);
+  });
+
   it('nudge and settings changes are recorded; getOperatorLog reads newest-last', async () => {
     framework.nudgeAgent('scout', 'host-console');
     framework.updateAgentRuntimeSettings('scout', { contextBudgetTokens: 150_000 }, {

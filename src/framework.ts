@@ -397,6 +397,7 @@ import {
 import {
   OperatorActionError,
   OperatorLog,
+  capIds,
   defaultOperatorLogPath,
   type OperatorLogEntry,
   type OperatorLogInput,
@@ -480,7 +481,7 @@ interface SurgeryReadableCm {
   getMessageWindow(
     offset: number,
     limit: number,
-    opts?: { resolveBlobs?: boolean },
+    opts?: { resolveBlobs?: boolean; alignToBodyGroups?: boolean },
   ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
 }
 
@@ -519,16 +520,25 @@ function locateMessageIndices(
   return found;
 }
 
-/** Inclusive slot range of the contiguous body-group run containing `index`. */
-function bodyGroupRun(cm: SurgeryReadableCm, index: number, groupId: string): { from: number; to: number } {
-  const total = cm.getMessageCount();
-  const at = (i: number): string | undefined =>
-    cm.getMessageWindow(i, 1, { resolveBlobs: false }).messages[0]?.bodyGroupId;
-  let from = index;
-  while (from > 0 && at(from - 1) === groupId) from--;
-  let to = index;
-  while (to + 1 < total && at(to + 1) === groupId) to++;
-  return { from, to };
+/**
+ * Inclusive slot range of the body-group run containing `index` (the slot
+ * itself when it is not sharded). Delegates to the store's own
+ * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
+ */
+function bodyGroupRun(
+  cm: SurgeryReadableCm,
+  index: number,
+): { from: number; to: number; fromId: string; toId: string; group: boolean } {
+  const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
+  const from = win.startIndex;
+  const to = win.startIndex + win.messages.length - 1;
+  return {
+    from,
+    to,
+    fromId: String(win.messages[0].id),
+    toId: String(win.messages[win.messages.length - 1].id),
+    group: win.messages[0].bodyGroupId !== undefined,
+  };
 }
 
 function describeRequester(r: OperatorRequester | undefined): string {
@@ -1218,6 +1228,13 @@ export class AgentFramework {
       ? undefined
       : config.operatorLogPath
         ?? (config.storePath ? defaultOperatorLogPath(config.storePath) : undefined);
+    if (operatorLogPath === undefined && config.operatorLogPath !== false) {
+      // An audit log that is silently off is worse than none: say so once.
+      console.error(
+        '[operator-log] disabled: no storePath and no operatorLogPath configured — ' +
+          'operator actions will only be visible as operator:action traces',
+      );
+    }
 
     const framework = new AgentFramework(
       store,
@@ -3559,6 +3576,8 @@ export class AgentFramework {
   ): Promise<{
     ok: boolean;
     error?: string;
+    /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable. */
+    code?: string;
     undone?: number;
     requested?: number;
     messagesRemoved?: number;
@@ -3694,12 +3713,18 @@ export class AgentFramework {
             `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
           );
+          const loggedRange = capIds(rangeIds);
           this.recordOperatorAction({
             kind: 'hide',
             agent: agentName,
             requester: hostCommandRequester(serverId, params),
             params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
-            result: { branch: this.store.currentBranch().name, hidden: hi - lo + 1, removedIds: rangeIds },
+            result: {
+              branch: this.store.currentBranch().name,
+              hidden: hi - lo + 1,
+              removedIds: loggedRange.ids,
+              ...(loggedRange.truncated ? { removedIdsTruncated: true } : {}),
+            },
           });
           return {
             ok: true,
@@ -3765,7 +3790,11 @@ export class AgentFramework {
           lastVisible: r.lastVisible,
         };
       } catch (error) {
-        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof OperatorActionError ? { code: error.code } : {}),
+        };
       }
     }
 
@@ -4253,11 +4282,9 @@ export class AgentFramework {
    * framework does not own (e.g. a WebUI toggling quiesce). Never throws.
    */
   recordOperatorAction(input: OperatorLogInput): OperatorLogEntry {
-    // Observability never fails the action: tolerate a missing log (partially
-    // constructed framework in tests) and any trace-listener misbehavior.
-    const entry: OperatorLogEntry = this.operatorLog
-      ? this.operatorLog.append(input)
-      : { ...input, at: input.at ?? new Date().toISOString() };
+    // Observability never fails the action: OperatorLog.append never throws,
+    // and a misbehaving trace listener is contained here.
+    const entry = this.operatorLog.append(input);
     try {
       this.emitTrace({
         type: 'operator:action',
@@ -4286,6 +4313,22 @@ export class AgentFramework {
   }
 
   /**
+   * The surgery idle gate. `state.status === 'idle'` alone is not enough:
+   * status reads idle from dequeue until the stream registers, and again
+   * while a turn's teardown is pending — the scheduler's own busy test is
+   * status + turn-alive (`'idle+turn-alive'`), the same predicate
+   * `puppetToolCall` uses. Re-run after every `await` that precedes a
+   * mutation: these methods yield, and the scheduler can start a turn in
+   * between.
+   */
+  private requireIdleForSurgery(agentName: string, agent: Agent, verb: string): void {
+    if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
+      const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
+      throw new OperatorActionError('agent-busy', `Cannot ${verb} while agent is ${shown}`);
+    }
+  }
+
+  /**
    * Roll the active branch back so `messageId` becomes its tail: fork the
    * chronicle at that message (origin-sequence time-travel branch) and switch
    * to the fork. Everything after the message stays on the source branch.
@@ -4309,6 +4352,10 @@ export class AgentFramework {
     sourceBranch: string;
     targetBranch: string;
     messagesRemoved: number;
+    /** The message that actually became the tail. Differs from the requested
+     *  id only when that id was a shard of a body group: the fork lands on
+     *  the group's last shard so the sharded message stays whole. */
+    tailMessageId: string;
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
@@ -4322,15 +4369,19 @@ export class AgentFramework {
     try {
       const agent = this.agents.get(agentName);
       if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      if (agent.state.status !== 'idle') {
-        throw new OperatorActionError('agent-busy', `Cannot roll back while agent is ${agent.state.status}`);
-      }
+      this.requireIdleForSurgery(agentName, agent, 'roll back');
       const cm = agent.getContextManager();
       const total = cm.getMessageCount();
-      const targetIndex = locateMessageIndex(cm, opts.messageId);
-      if (targetIndex < 0) {
+      const requestedIndex = locateMessageIndex(cm, opts.messageId);
+      if (requestedIndex < 0) {
         throw new OperatorActionError('unknown-message', `Message ${opts.messageId} is not on the active branch`);
       }
+      // Never bisect a body group: chronicle refuses that for removals
+      // (byte-faithful reassembly needs the whole run) and branchAt has no
+      // such guard of its own. Snap to the run's last shard.
+      const run = bodyGroupRun(cm, requestedIndex);
+      const targetIndex = run.to;
+      const tailMessageId = run.toId;
       const messagesRemoved = total - targetIndex - 1;
       if (messagesRemoved <= 0) {
         throw new OperatorActionError('invalid', `Message ${opts.messageId} is already the tail of the active branch`);
@@ -4345,7 +4396,9 @@ export class AgentFramework {
 
       // Prepare the external side effect before switching Chronicle. If the
       // process dies after the switch but before activate(), startup promotes
-      // this batch by matching targetBranch to the active branch.
+      // this batch by matching targetBranch to the active branch. If the
+      // fork/switch itself throws, the batch is retired so it cannot arm a
+      // later branch that happens to reuse the name.
       const markerBatch = this.discordAwarenessOutbox?.prepare({
         agentName,
         sourceBranch,
@@ -4354,25 +4407,39 @@ export class AgentFramework {
         emoji: this.discordAwarenessEmoji,
       }) ?? null;
 
-      const branchName = cm.branchAt(opts.messageId as MessageId, targetBranch);
-      await cm.switchBranch(branchName);
+      let branchName: string;
+      try {
+        branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
+        await cm.switchBranch(branchName);
+      } catch (error) {
+        if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+        throw error;
+      }
       if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
       await this.syncDiscordAwarenessMarkers();
       this.materializeConfigMountAfterBranchSwitch();
 
       console.error(
-        `[operator] rollback agent=${agentName} to=${opts.messageId} removed=${messagesRemoved} ` +
-          `branch=${branchName} by=${describeRequester(opts.requester)}`,
+        `[operator] rollback agent=${agentName} to=${tailMessageId}` +
+          `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
+          ` removed=${messagesRemoved} branch=${branchName} by=${describeRequester(opts.requester)}`,
       );
       this.recordOperatorAction({
         ...logBase,
-        result: { sourceBranch, targetBranch: branchName, messagesRemoved, discordRefs: removedRefs.length },
+        result: {
+          sourceBranch,
+          targetBranch: branchName,
+          tailMessageId,
+          messagesRemoved,
+          discordRefs: removedRefs.length,
+        },
       });
       return {
         agentName,
         sourceBranch,
         targetBranch: branchName,
         messagesRemoved,
+        tailMessageId,
         removedRefs,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
@@ -4423,9 +4490,7 @@ export class AgentFramework {
     try {
       const agent = this.agents.get(agentName);
       if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${agentName}`);
-      if (agent.state.status !== 'idle') {
-        throw new OperatorActionError('agent-busy', `Cannot suppress while agent is ${agent.state.status}`);
-      }
+      this.requireIdleForSurgery(agentName, agent, 'suppress');
       if (requestedIds.length === 0) throw new OperatorActionError('invalid', 'No message ids given');
       const cm = agent.getContextManager();
       const total = cm.getMessageCount();
@@ -4440,15 +4505,13 @@ export class AgentFramework {
       }
 
       // Build removal intervals (index-ordered, newest first). A shard expands
-      // to its whole body group — chronicle refuses to bisect one.
-      const intervals = new Map<string, { from: number; to: number; fromId: string; toId: string }>();
+      // to its whole body group — chronicle refuses to bisect one — and a
+      // group interval is always removed as a RANGE: `removeMessage` refuses
+      // any sharded message even when the group is down to one shard.
+      const intervals = new Map<string, ReturnType<typeof bodyGroupRun>>();
       for (const id of requestedIds) {
-        const hit = located.get(id)!;
-        const run = hit.bodyGroupId ? bodyGroupRun(cm, hit.index, hit.bodyGroupId) : { from: hit.index, to: hit.index };
-        const key = `${run.from}-${run.to}`;
-        if (intervals.has(key)) continue;
-        const win = cm.getMessageWindow(run.from, run.to - run.from + 1, { resolveBlobs: false }).messages;
-        intervals.set(key, { ...run, fromId: String(win[0].id), toId: String(win[win.length - 1].id) });
+        const run = bodyGroupRun(cm, located.get(id)!.index);
+        intervals.set(`${run.from}-${run.to}`, run);
       }
       const ordered = [...intervals.values()].sort((a, b) => b.from - a.from);
       const messagesRemoved = ordered.reduce((n, iv) => n + (iv.to - iv.from + 1), 0);
@@ -4477,24 +4540,53 @@ export class AgentFramework {
         activationPolicy: 'explicit',
         suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
       }) ?? null;
+      // Anything short of activation retires the batch: a prepared explicit
+      // batch re-arms through preparedSuppressionsForBranch the moment its
+      // target branch (or a descendant) becomes active — e.g. an operator
+      // opening the failed fork to look — and an un-completable resume there
+      // aborts framework start.
+      const retireBatch = (): void => {
+        if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
+      };
 
-      const createdBranch = await cm.fork(targetBranch);
+      let createdBranch: string;
       try {
+        createdBranch = await cm.fork(targetBranch);
+      } catch (error) {
+        retireBatch();
+        throw error;
+      }
+      try {
+        // fork() yielded; a turn may have started meanwhile. Redacting under
+        // a live stream corrupts wire ordering — check again before mutating.
+        this.requireIdleForSurgery(agentName, agent, 'suppress');
         for (const iv of ordered) {
-          if (iv.fromId === iv.toId) cm.removeMessage(iv.fromId as MessageId);
-          else cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
+          if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
+          else cm.removeMessage(iv.fromId as MessageId);
         }
         if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
       } catch (error) {
         // A partially suppressed branch is not safe to serve from. Keep it for
-        // diagnosis, but put the agent back on the untouched source branch.
-        if (this.store.currentBranch().name === createdBranch) {
-          await cm.switchBranch(sourceBranch);
+        // diagnosis, but put the agent back on the untouched source branch —
+        // and say honestly whether that restore happened.
+        retireBatch();
+        const cause = error instanceof Error ? error.message : String(error);
+        let restored: string;
+        if (this.store.currentBranch().name !== createdBranch) {
+          restored = `active branch is ${this.store.currentBranch().name}`;
+        } else {
+          try {
+            await cm.switchBranch(sourceBranch);
+            restored = `active branch restored to ${sourceBranch}`;
+          } catch (restoreError) {
+            restored = `RESTORE TO ${sourceBranch} ALSO FAILED (${restoreError instanceof Error ? restoreError.message : String(restoreError)}); ` +
+              `agent is still on the partially suppressed ${createdBranch}`;
+            console.error(`[operator] suppress agent=${agentName} ${restored}`);
+          }
         }
         throw new OperatorActionError(
           'failed',
-          `Suppression failed on ${createdBranch}; active branch restored to ${sourceBranch}: ` +
-            (error instanceof Error ? error.message : String(error)),
+          `Suppression failed on ${createdBranch}; ${restored}: ${cause}`,
           { cause: error },
         );
       }
@@ -4505,9 +4597,17 @@ export class AgentFramework {
         `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
           `by=${describeRequester(opts.requester)}`,
       );
+      const loggedIds = capIds(removedIds);
       this.recordOperatorAction({
         ...logBase,
-        result: { sourceBranch, targetBranch: createdBranch, messagesRemoved, removedIds, discordRefs: removedRefs.length },
+        result: {
+          sourceBranch,
+          targetBranch: createdBranch,
+          messagesRemoved,
+          removedIds: loggedIds.ids,
+          ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
+          discordRefs: removedRefs.length,
+        },
       });
       return {
         agentName,
