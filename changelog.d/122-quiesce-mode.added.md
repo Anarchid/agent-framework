@@ -53,3 +53,13 @@
   mode flag, skips ids that already landed, and the durable flag is cleared
   only after the flush completes — an interrupted resume neither loses nor
   duplicates a message.
+- Review round 3: a flushed deferred write is removed from the durable
+  recovery queue only AFTER `store.sync()` has made the appended chronicle
+  slots durable (chronicle persists the slot-chain head on sync, not on
+  append). Every deferred-drain path — resume flush, boot recovery, the
+  turn-start / turn-end / puppet-end flushes — hands its batch to an
+  un-acked set, writes, syncs, and only then rewrites the queue; a failed
+  sync keeps the batch queued (retried at the next ack and at `stop()`).
+  Regression coverage uses a real child process that `process.exit`s
+  mid-resume, both right after the first acknowledgement and before the
+  sync: the reopened host replays exactly the un-landed remainder.

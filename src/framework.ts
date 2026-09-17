@@ -1017,6 +1017,14 @@ export class AgentFramework {
   private hostModePath: string | undefined;
   private deferredWritesPath: string | undefined;
   private recoveryFallbackWarned = false;
+  /**
+   * Deferred writes that have been handed to a context manager but whose
+   * chronicle state is NOT yet durably synced. They stay in the durable
+   * recovery queue until `ackDeferredWrites()` syncs the store — chronicle
+   * persists the slot-chain head only on sync(), so acknowledging on append
+   * alone would let a hard exit forget an accepted message.
+   */
+  private unackedDeferredWrites: Array<{ id: string; participant: string; content: ContentBlock[]; metadata?: MessageMetadata; forAgent?: string }> = [];
   private deferredMessages: Array<{
     /** Durable identity for per-message flush acknowledgement: a flush
      *  interrupted by a crash replays only the messages not yet acked. */
@@ -1620,6 +1628,9 @@ export class AgentFramework {
    */
   async stop(): Promise<void> {
     this.running = false;
+    // Flushed-but-unsynced deferred writes: sync and ack now, while the
+    // store is still open, rather than leaving them to a reboot replay.
+    this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
@@ -2798,14 +2809,15 @@ export class AgentFramework {
       const target = msg.forAgent ?? this.primaryAgentName;
       (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
     }
+    // Hand-off: the batch leaves the pending queue and enters the un-acked
+    // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
+    // crash anywhere below replays the whole batch, and the deferredWriteId
+    // stamped on each stored message lets boot skip the ones that did land.
+    this.deferredMessages = keep;
+    this.unackedDeferredWrites.push(...flush);
     let stored = 0;
-    for (let i = 0; i < flush.length; i++) {
-      const msg = flush[i];
+    for (const msg of flush) {
       try {
-        // The durable id rides in the stored message's metadata: a crash
-        // between this write and its ack below would otherwise replay the
-        // message at boot — restorePersistedDeferredWrites skips ids that
-        // already landed.
         this.addMessage(
           msg.participant,
           msg.content,
@@ -2820,14 +2832,43 @@ export class AgentFramework {
           err,
         );
       }
-      // Ack: the durable queue now holds only what has not landed yet.
-      this.deferredMessages = [...keep, ...flush.slice(i + 1)];
-      this.persistDeferredWrites();
     }
+    // Ack = sync the chronicle FIRST, then rewrite the durable queue without
+    // the batch. Never the other way round.
+    this.ackDeferredWrites();
     console.error(
       `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
       (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
     );
+  }
+
+  /**
+   * Acknowledge every deferred write that has been handed to a context
+   * manager: sync the chronicle so the appended slots are durable, and only
+   * then drop them from the recovery queue. If the sync fails they stay in
+   * the durable queue (the next ack, or stop(), retries); a reboot in that
+   * state replays them, deduplicated by `deferredWriteId` for any that did
+   * reach disk. Idempotent and cheap when nothing is un-acked.
+   */
+  private ackDeferredWrites(): void {
+    if (this.unackedDeferredWrites.length === 0) return;
+    // Nothing durable to reconcile against unless the queue was persisted.
+    if (!this.deferredWritesPersisted && !this.quiesced) {
+      this.unackedDeferredWrites = [];
+      return;
+    }
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error(
+        `[host-mode] chronicle sync failed — ${this.unackedDeferredWrites.length} flushed deferred ` +
+        `write(s) stay in the recovery queue until a sync succeeds:`,
+        err,
+      );
+      return;
+    }
+    this.unackedDeferredWrites = [];
+    this.persistDeferredWrites();
   }
 
   /**
@@ -2903,24 +2944,27 @@ export class AgentFramework {
    */
   private persistDeferredWrites(): void {
     try {
-      if ((this.quiesced || this.deferredWritesPersisted) && this.deferredMessages.length > 0) {
-        const payload = JSON.stringify(this.deferredMessages);
+      // The durable queue is everything not yet acked: writes still pending
+      // AND writes handed to a context manager whose sync has not happened.
+      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages];
+      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+        const payload = JSON.stringify(durable);
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
           if (!this.deferredWritesCapWarned) {
             this.deferredWritesCapWarned = true;
             console.error(
               `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
-              `serialized (${this.deferredMessages.length} message(s)) — kept in memory only; ` +
+              `serialized (${durable.length} message(s)) — kept in memory only; ` +
               `a crash before resume loses them`,
             );
           }
           return;
         }
         if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: this.deferredMessages });
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: durable });
         } else {
           this.warnRecoveryFallbackOnce();
-          this.store.setStateJson(DEFERRED_WRITES_ID, this.deferredMessages);
+          this.store.setStateJson(DEFERRED_WRITES_ID, durable);
         }
         this.deferredWritesPersisted = true;
       } else if (this.deferredWritesPersisted) {
@@ -5565,6 +5609,10 @@ export class AgentFramework {
             }
           }
 
+          // Deferred writes handed to the store above: sync, then drop them
+          // from the durable recovery queue (no-op unless one is persisted).
+          this.ackDeferredWrites();
+
           // A newly injected CONVERSATIONAL message begins a new
           // conversational round inside the same provider inference. Remember
           // that boundary for driveStream: an explicit send in the preceding
@@ -7332,6 +7380,7 @@ export class AgentFramework {
             );
           }
         }
+        this.ackDeferredWrites();
       }
     }
 
@@ -8915,6 +8964,7 @@ export class AgentFramework {
           this.addMessage(msg.participant, msg.content, msg.metadata,
             msg.forAgent ? { forAgent: msg.forAgent } : undefined);
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -9094,6 +9144,7 @@ export class AgentFramework {
           this.addMessage(msg.participant, msg.content, msg.metadata,
             msg.forAgent ? { forAgent: msg.forAgent } : undefined);
         }
+        this.ackDeferredWrites();
       }
     }
   }
@@ -10369,7 +10420,11 @@ export class AgentFramework {
       (target === agentName ? mine : rest).push(msg);
     }
     this.deferredMessages = rest;
-    if (this.deferredWritesPersisted || this.quiesced) this.persistDeferredWrites();
+    // The drained messages are about to be written by the caller; they stay
+    // in the DURABLE queue (as un-acked) until the caller's
+    // ackDeferredWrites() has synced the chronicle. Removing them here would
+    // acknowledge before the write is durable.
+    if (this.deferredWritesPersisted || this.quiesced) this.unackedDeferredWrites.push(...mine);
     return mine;
   }
 

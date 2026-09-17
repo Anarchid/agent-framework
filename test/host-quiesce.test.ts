@@ -6,6 +6,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -852,8 +854,8 @@ test('quiesce survives a historical rollback + restart (host mode lives outside 
   }
 });
 
-test('a resume interrupted before its flush completes leaves the durable flag set; the remainder lands exactly once', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-interrupted-'));
+test('a failed chronicle sync keeps flushed deferred writes in the durable queue until a sync succeeds', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-syncfail-'));
   const storePath = join(dir, 'store');
   const config = () => ({
     storePath,
@@ -868,52 +870,85 @@ test('a resume interrupted before its flush completes leaves the durable flag se
     const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
     add('user', [{ type: 'text', text: 'one' }]);
     add('user', [{ type: 'text', text: 'two' }]);
-    add('user', [{ type: 'text', text: 'three' }]);
+    const queuePath = join(storePath, 'recovery', 'deferred-writes.json');
+    const pending = () => (JSON.parse(readFileSync(queuePath, 'utf8')) as { pending: Array<{ participant: string }> }).pending.length;
+    assert.equal(pending(), 2);
 
-    // Crash-equivalent, at the worst instruction: the resume flush has landed
-    // 'one' (acked) and 'two' (its ack is the write that dies), and never
-    // reached 'three'. The durable queue therefore still lists two AND three
-    // while the store already holds two.
-    const fw = framework as unknown as { persistDeferredWrites(): void };
-    const realPersist = fw.persistDeferredWrites.bind(framework);
-    let acks = 0;
-    fw.persistDeferredWrites = () => {
-      acks++;
-      if (acks === 2) throw new Error('SIMULATED CRASH before the second ack');
-      realPersist();
-    };
-    await assert.rejects(framework.resume(), /SIMULATED CRASH/);
-    fw.persistDeferredWrites = realPersist;
+    // Every sync during resume fails: the messages are appended in memory
+    // but must NOT be acknowledged — the durable queue keeps both.
+    const store = (framework as unknown as { store: { sync(): void } }).store;
+    const realSync = store.sync.bind(store);
+    store.sync = () => { throw new Error('disk full'); };
+    await framework.resume();
     assert.deepEqual(
       framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
         .map((m) => (m.content[0] as { text: string }).text),
       ['one', 'two'],
-      'two landed before the crash',
+      'landed in memory',
     );
-    // stop() must not "helpfully" ack anything the crash did not.
-    (framework as unknown as { persistDeferredWrites(): void }).persistDeferredWrites = () => {};
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'nothing left pending in memory');
+    assert.equal(pending(), 2, 'durable queue still lists both — not acked without a sync');
+
+    // Sync works again: stop() acks (sync, then rewrite the queue).
+    store.sync = realSync;
     await framework.stop();
+    assert.equal(pending(), 0, 'acked once the chronicle state was durable');
 
     framework = await AgentFramework.create(config());
-    const booted = framework.getHostModeStatus();
-    assert.equal(booted.quiesced, true, 'the durable flag was NOT cleared before the flush finished');
-    assert.equal(booted.deferredWrites, 1, "'two' is recognised as landed; only 'three' is restored");
-
-    await framework.resume();
-    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
-      .map((m) => (m.content[0] as { text: string }).text);
-    assert.deepEqual(texts, ['one', 'two', 'three'], 'no loss, no duplicate');
     assert.equal(framework.getHostModeStatus().deferredWrites, 0);
-    await framework.stop();
-
-    framework = await AgentFramework.create(config());
-    assert.equal(framework.getHostModeStatus().quiesced, false);
-    assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+    assert.deepEqual(
+      framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+        .map((m) => (m.content[0] as { text: string }).text),
+      ['one', 'two'],
+      'exactly once after reopen',
+    );
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+const CRASH_CHILD = fileURLToPath(new URL('./helpers/quiesce-crash-child.js', import.meta.url));
+
+for (const mode of ['after-ack', 'before-sync'] as const) {
+  test(`a REAL process exit ${mode === 'after-ack' ? 'right after the first ack' : 'before the chronicle sync'} of the resume flush loses no deferred write and duplicates none`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `host-quiesce-crash-${mode}-`));
+    const storePath = join(dir, 'store');
+    const config = () => ({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+      modules: [],
+    });
+    let framework: AgentFramework | null = null;
+    try {
+      const child = spawnSync(process.execPath, [CRASH_CHILD, storePath, mode], {
+        encoding: 'utf8',
+        timeout: 60_000,
+      });
+      assert.equal(child.status, 0, `child staged the crash (stderr: ${child.stderr.slice(-800)})`);
+
+      framework = await AgentFramework.create(config());
+      const booted = framework.getHostModeStatus();
+      assert.equal(booted.quiesced, true, 'the durable flag is cleared only after the flush completes');
+
+      await framework.resume();
+      const texts = framework.getAgent('agent')!.getContextManager().getAllMessages()
+        .map((m) => (m.content[0] as { text: string }).text)
+        .filter((t) => t === 'ACKED-BUT-NOT-SYNCED' || t === 'STILL-PENDING');
+      assert.deepEqual(texts, ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], 'both present, exactly once, in order');
+      assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+      await framework.stop();
+
+      framework = await AgentFramework.create(config());
+      assert.equal(framework.getHostModeStatus().quiesced, false);
+      assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+    } finally {
+      await framework?.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test('a serving boot recovers a stranded deferred-write queue regardless of the mode flag', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-stranded-'));
