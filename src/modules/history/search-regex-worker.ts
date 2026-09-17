@@ -57,11 +57,15 @@ try {
   const matches: SearchWorkerMatch[] = [];
   let scanned = 0;
   for (let i = 0; i < texts.length; i++) {
+    // Check the limit BEFORE doing any work for this candidate — not after
+    // pushing a match — so limit:0 (a valid clampCount value: it's >= 0)
+    // correctly yields zero matches instead of one. Checking post-push would
+    // always let through the match that first reaches the limit.
+    if (matches.length >= limit) break;
     scanned++;
     const m = matcher.exec(texts[i] ?? '');
     if (m) {
       matches.push({ candidateIndex: i, matchIndex: m.index, matchLength: m[0].length });
-      if (matches.length >= limit) break;
     }
   }
   const done: SearchWorkerMessage = { type: 'done', matches, scanned };

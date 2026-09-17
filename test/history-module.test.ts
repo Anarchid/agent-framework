@@ -240,6 +240,21 @@ describe('HistoryModule', () => {
       assert.equal((queryCall?.args as { limit?: number }).limit, 200);
     });
 
+    it('clamps an out-of-u32-range offset to the native ceiling instead of passing it through to wrap (reviewer repro)', async () => {
+      // Number.MAX_SAFE_INTEGER is not a safe ceiling for a value that
+      // eventually crosses into a native u32 argument: 4294967296 (one past
+      // u32 max) must be clamped to 4294967295, not passed through as-is —
+      // otherwise it wraps/truncates at the N-API boundary into a small
+      // offset and silently returns the wrong page instead of an empty one.
+      const { cm, calls } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm);
+
+      await h.handleToolCall(call('extract', { offset: 4294967296, limit: 1 }));
+      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
+      assert.equal((queryCall?.args as { offset?: number }).offset, 4294967295);
+    });
+
     it('surfaces the capability-absent error cleanly', async () => {
       const { cm } = buildStub(FIXTURE, { throwUnsupported: true });
       const h = new HistoryModule();
@@ -263,6 +278,34 @@ describe('HistoryModule', () => {
       const data = result.data as { matches: Array<{ id: string; snippet: string }> };
       assert.deepEqual(data.matches.map((m) => m.id), ['m3']);
       assert.match(data.matches[0]!.snippet, /BAR/);
+    });
+
+    it('limit:0 (substring) returns zero matches instead of one (reviewer repro)', async () => {
+      // clampCount accepts 0 as a valid value (it's >= 0). Both matching
+      // loops used to push a match onto the results array BEFORE checking
+      // the limit, so with a matching candidate present, limit:0 still
+      // returned exactly 1 match.
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm);
+
+      const result = await h.handleToolCall(call('search', { query: 'bar', limit: 0 }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { matches: unknown[] };
+      assert.equal(data.matches.length, 0);
+    });
+
+    it('limit:0 (regex) returns zero matches instead of one (reviewer repro)', async () => {
+      // Same bug, independently, in search-regex-worker.ts's own copy of
+      // the match loop.
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm);
+
+      const result = await h.handleToolCall(call('search', { query: '\\bworld\\b', regex: true, limit: 0 }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { matches: unknown[] };
+      assert.equal(data.matches.length, 0);
     });
 
     it('caseSensitive:true respects case', async () => {

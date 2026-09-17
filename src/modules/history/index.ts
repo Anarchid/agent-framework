@@ -74,6 +74,20 @@ interface SearchInput {
 const EXTRACT_DEFAULT_LIMIT = 50;
 const EXTRACT_MAX_LIMIT = 200;
 
+/**
+ * Real ceiling of the native chronicle pagination `offset` argument (a u32
+ * at the N-API boundary). `Number.MAX_SAFE_INTEGER` is NOT a safe ceiling
+ * for this field: a value between 0xFFFFFFFF and MAX_SAFE_INTEGER passes a
+ * naive upper-bound check unchanged, then wraps/truncates when it crosses
+ * into an unsigned 32-bit int on the native side — silently wrong
+ * pagination (repro: offset:4294967296 against a real store "succeeded"
+ * and returned page 0) instead of a clean failure. Clamping to this ceiling
+ * (same clamp-not-reject behavior `limit` already has) means anything
+ * beyond it lands on an offset no real store's message count will ever
+ * reach, i.e. a correctly-empty page, rather than wrapping onto a wrong one.
+ */
+const NATIVE_OFFSET_MAX = 0xffffffff; // 4294967295
+
 const SEARCH_DEFAULT_LIMIT = 20;
 const SEARCH_MAX_LIMIT = 100;
 const SEARCH_DEFAULT_MAX_SCAN = 5000;
@@ -158,7 +172,7 @@ export class HistoryModule implements Module {
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel.' },
             limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
-            offset: { type: 'number', description: 'Number of matching messages to skip (default 0). Must be a non-negative integer.' },
+            offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -273,7 +287,7 @@ export class HistoryModule implements Module {
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
-    const offset = clampCount(input.offset, 0, Number.MAX_SAFE_INTEGER, 'offset');
+    const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset');
     const format = input.format ?? 'text';
 
     const cm = this.cm as ContextManager;
@@ -360,6 +374,12 @@ export class HistoryModule implements Module {
     const matches: SearchMatch[] = [];
     let scanned = 0;
     for (const msg of candidates) {
+      // Check the limit BEFORE doing any work for this candidate — not
+      // after pushing a match — so limit:0 (a valid clampCount value: it's
+      // >= 0) correctly yields zero matches instead of one. Checking
+      // post-push would always let through the match that first reaches
+      // the limit. Same fix mirrored in search-regex-worker.ts's loop.
+      if (matches.length >= limit) break;
       scanned++;
       const text = flattenContent(msg.content);
       const hit = matchSubstring(text, needle, caseSensitive);
@@ -371,7 +391,6 @@ export class HistoryModule implements Module {
         channelId: getChannelId(msg) ?? null,
         snippet: snippetAround(text, hit.index, hit.length),
       });
-      if (matches.length >= limit) break;
     }
 
     return {
