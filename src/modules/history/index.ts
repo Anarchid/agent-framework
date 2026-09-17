@@ -496,9 +496,20 @@ function clampCount(value: number | undefined, def: number, max: number, field: 
  *  own native index reads from (message-store.ts's CHANNEL_FIELD). Metadata's
  *  index-signature type means this needs an explicit narrow, same as
  *  MessageStore.getChannelTokenStats does internally. */
+/**
+ * Two channel-id metadata shapes exist in the wild: `metadata.channelId`
+ * (what agent-framework's real MCPL ingestion — `handleMcplChannelIncoming`
+ * — actually writes) and `metadata.external.channelId` (an older
+ * convention). context-manager 0.9.1+ indexes and queries BOTH (see
+ * MessageStore.extractChannelId there), so a channel-filtered result can
+ * come from either shape — check the same order here so a displayed
+ * `channelId` never reads `null` on a message that was, in fact, matched by
+ * channel.
+ */
 function getChannelId(msg: StoredMessage): string | undefined {
-  const external = msg.metadata?.external as { channelId?: string } | undefined;
-  return external?.channelId;
+  const metadata = msg.metadata as { channelId?: unknown; external?: { channelId?: unknown } } | undefined;
+  if (typeof metadata?.channelId === 'string') return metadata.channelId;
+  return typeof metadata?.external?.channelId === 'string' ? metadata.external.channelId : undefined;
 }
 
 function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<string, unknown> {
