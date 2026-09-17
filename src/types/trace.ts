@@ -436,6 +436,8 @@ export type TraceEvent =
       drained: boolean;
       /** Turns still alive at return (0 unless the drain timed out). */
       activeTurns: number;
+      /** Wakes still parked on provider admission at return (see HostModeStatus). */
+      parkedAdmissions?: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
       /** Agents whose turn abandon could not cancel (token held, no stream). */

@@ -5,7 +5,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -747,6 +747,204 @@ test('context writes deferred while quiesced survive a restart and land at resum
 
     framework = await AgentFramework.create(config());
     assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'slot cleared after the flush');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Review round 2 (antra-tess): admission bypass, branch-independent
+// persistence, crash-safe resume flush.
+// ---------------------------------------------------------------------------
+
+test('a wake parked on provider admission does not start after quiesce; it runs at resume', async () => {
+  const membrane = new MockMembrane();
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'after resume' }]));
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    const internals = framework as unknown as {
+      withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T>;
+      processInferenceRequests(): Promise<void>;
+      providerGates: Map<string, { primaryDepth: number }>;
+      activeTurnTokens: Map<string, number>;
+    };
+    // Hold an auxiliary (compression-style) provider call in flight.
+    let releaseAux!: () => void;
+    const auxDone = internals.withAuxiliaryAdmission('agent', () =>
+      new Promise<void>((resolve) => { releaseAux = resolve; }));
+    await waitFor('auxiliary in flight', () => true);
+
+    // A wake passes the scheduler and parks behind the auxiliary: it owns
+    // provider admission but no turn token yet.
+    framework.nudgeAgent('agent', 'operator');
+    await internals.processInferenceRequests();
+    assert.equal(internals.providerGates.get('agent')?.primaryDepth, 1, 'admission owned');
+    assert.equal(internals.activeTurnTokens.size, 0, 'no turn token yet');
+
+    // Quiesce with a short window: the parked admission is NOT drained.
+    const status = await framework.quiesce({ reason: 'surgery', timeoutMs: 1_000 });
+    assert.equal(status.quiesced, true);
+    assert.equal(status.parkedAdmissions, 1, 'status reports the parked wake');
+    assert.equal(status.drained, false, 'a parked admission is not "drained"');
+
+    // Release the auxiliary: before the fix this started a turn while quiesced.
+    releaseAux();
+    await auxDone;
+    await waitFor('admission released', () => (internals.providerGates.get('agent')?.primaryDepth ?? 0) === 0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(membrane.calls.length, 0, 'NO inference while quiesced');
+    assert.equal(framework.getHostModeStatus().quiesced, true);
+    assert.ok(framework.getHostModeStatus().gatedRequests >= 1, 'the wake was requeued, not dropped');
+    assert.equal(framework.getHostModeStatus().drained, true, 'drained once the admission was given back');
+
+    await framework.resume();
+    await waitFor('requeued wake to run after resume', () => membrane.calls.length === 1);
+  });
+});
+
+test('quiesce survives a historical rollback + restart (host mode lives outside branch history)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-rollback-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  try {
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const checkpoint = cm.addMessage('user', [{ type: 'text', text: 'checkpoint' }]);
+    cm.addMessage('user', [{ type: 'text', text: 'later' }]);
+
+    await framework.quiesce({ reason: 'refold' });
+    (framework as unknown as { addMessage(p: string, c: unknown[]): unknown })
+      .addMessage('user', [{ type: 'text', text: 'deferred during surgery' }]);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1);
+
+    // The surgery itself: time-travel to before the quiesce marker was written.
+    const branch = cm.branchAt(checkpoint, 'rollback/agent/test');
+    await cm.switchBranch(branch);
+    assert.equal(framework.getHostModeStatus().quiesced, true, 'live flag unaffected');
+    assert.equal(existsSync(join(storePath, 'recovery', 'host-mode.json')), true, 'marker is a recovery file');
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    const booted = framework.getHostModeStatus();
+    assert.equal(booted.quiesced, true, 'a restart after a rollback still boots quiesced');
+    assert.equal(booted.reason, 'refold');
+    assert.equal(booted.deferredWrites, 1, 'deferred writes were not orphaned by the rollback either');
+    assert.equal(framework.getAgent('agent')!.getContextManager().currentBranch().name, 'rollback/agent/test');
+
+    await framework.resume();
+    assert.equal(framework.getHostModeStatus().quiesced, false);
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts.slice(-2), ['checkpoint', 'deferred during surgery']);
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().quiesced, false, 'resume cleared the recovery file durably');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a resume interrupted before its flush completes leaves the durable flag set; the remainder lands exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-interrupted-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getMessageCount();
+    const add = (framework as unknown as { addMessage(p: string, c: unknown[]): unknown }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'one' }]);
+    add('user', [{ type: 'text', text: 'two' }]);
+    add('user', [{ type: 'text', text: 'three' }]);
+
+    // Crash-equivalent, at the worst instruction: the resume flush has landed
+    // 'one' (acked) and 'two' (its ack is the write that dies), and never
+    // reached 'three'. The durable queue therefore still lists two AND three
+    // while the store already holds two.
+    const fw = framework as unknown as { persistDeferredWrites(): void };
+    const realPersist = fw.persistDeferredWrites.bind(framework);
+    let acks = 0;
+    fw.persistDeferredWrites = () => {
+      acks++;
+      if (acks === 2) throw new Error('SIMULATED CRASH before the second ack');
+      realPersist();
+    };
+    await assert.rejects(framework.resume(), /SIMULATED CRASH/);
+    fw.persistDeferredWrites = realPersist;
+    assert.deepEqual(
+      framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+        .map((m) => (m.content[0] as { text: string }).text),
+      ['one', 'two'],
+      'two landed before the crash',
+    );
+    // stop() must not "helpfully" ack anything the crash did not.
+    (framework as unknown as { persistDeferredWrites(): void }).persistDeferredWrites = () => {};
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    const booted = framework.getHostModeStatus();
+    assert.equal(booted.quiesced, true, 'the durable flag was NOT cleared before the flush finished');
+    assert.equal(booted.deferredWrites, 1, "'two' is recognised as landed; only 'three' is restored");
+
+    await framework.resume();
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['one', 'two', 'three'], 'no loss, no duplicate');
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().quiesced, false);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a serving boot recovers a stranded deferred-write queue regardless of the mode flag', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-stranded-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  let before: number;
+  try {
+    before = framework.getAgent('agent')!.getContextManager().getMessageCount();
+    await framework.stop();
+    // The state an older build could leave behind: flag cleared, queue not.
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    writeFileSync(join(storePath, 'recovery', 'host-mode.json'), JSON.stringify({ version: 1, quiesced: false }));
+    writeFileSync(join(storePath, 'recovery', 'deferred-writes.json'), JSON.stringify({
+      version: 1,
+      pending: [{ id: 'stranded-1', participant: 'user', content: [{ type: 'text', text: 'stranded' }] }],
+    }));
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().quiesced, false);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'recovered at boot');
+    const texts = framework.getAgent('agent')!.getContextManager().getAllMessages().slice(before)
+      .map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['stranded']);
+    const queue = JSON.parse(readFileSync(join(storePath, 'recovery', 'deferred-writes.json'), 'utf8')) as { pending: unknown[] };
+    assert.equal(queue.pending.length, 0, 'acked durably');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

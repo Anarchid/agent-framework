@@ -95,6 +95,24 @@ export interface FrameworkConfig {
    */
   discordAwarenessOutboxPath?: string;
 
+  /**
+   * Branch-INDEPENDENT record of the host's quiesce state (issue #122).
+   * Defaults to `<storePath>/recovery/host-mode.json`. Lives outside the
+   * chronicle because a historical rollback (branchAt + switchBranch) would
+   * otherwise move the active branch to a version of `framework/state`
+   * predating the marker, and a restart would boot SERVING mid-surgery. Set
+   * explicitly when providing an app-owned `store` without `storePath`;
+   * without either, the branch-local slot is used with a one-time warning.
+   */
+  hostModePath?: string;
+
+  /**
+   * Branch-independent durable queue of context writes deferred while
+   * quiesced. Defaults to `<storePath>/recovery/deferred-writes.json`; same
+   * rationale and fallback as `hostModePath`.
+   */
+  deferredWritesPath?: string;
+
   /** Emoji used for branch-awareness markers (default: 💤). */
   discordAwarenessEmoji?: string;
 

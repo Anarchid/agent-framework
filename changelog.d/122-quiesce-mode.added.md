@@ -38,3 +38,18 @@
   the token when one is configured, and `host-command` on the MCPL control
   plane means a surface `/undo` can now run ahead of pushes still buffered
   behind a startup/reconnect barrier.
+- Review round 2: quiesce state and the deferred-write queue now live OUTSIDE
+  branch history — `<storePath>/recovery/host-mode.json` and
+  `recovery/deferred-writes.json` (`FrameworkConfig.hostModePath` /
+  `deferredWritesPath`; the branch-local slot is only a fallback for
+  store-only configs, with a warning) — so a historical rollback can no
+  longer erase the marker of the surgery it belongs to or orphan the writes
+  it deferred. A wake parked on provider admission behind an in-flight
+  auxiliary call now rechecks quiesce when the auxiliary settles and is
+  requeued instead of starting a turn; `HostModeStatus.parkedAdmissions`
+  counts such wakes and `drained` is false while any exist. The resume flush
+  acknowledges each deferred write durably as it lands and stamps its id into
+  the stored message's metadata; boot recovers the queue regardless of the
+  mode flag, skips ids that already landed, and the durable flag is cleared
+  only after the flush completes — an interrupted resume neither loses nor
+  duplicates a message.

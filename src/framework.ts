@@ -1,7 +1,7 @@
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -520,6 +520,11 @@ export interface HostModeStatus {
    * dequeue → settled teardown, strictly wider than activeStreams). */
   drained: boolean;
   activeTurns: number;
+  /** Wakes that own provider admission while waiting for an in-flight
+   * auxiliary call — no turn token yet, but a turn is one settle away. The
+   * admission continuation rechecks quiesce and requeues them; `drained`
+   * is false until it has. */
+  parkedAdmissions: number;
   /** Inference requests parked by the quiesce wake gate (while quiesced), or
    * simply queued (while serving — non-zero right after a resume until the
    * scheduler's next pass consumes them). Continuations of a held turn
@@ -1007,7 +1012,15 @@ export class AgentFramework {
   /** True while the deferred-write queue has a persisted mirror (quiesced). */
   private deferredWritesPersisted = false;
   private deferredWritesCapWarned = false;
+  /** Branch-independent recovery files (see FrameworkConfig.hostModePath /
+   *  deferredWritesPath). Undefined → branch-local slot fallback. */
+  private hostModePath: string | undefined;
+  private deferredWritesPath: string | undefined;
+  private recoveryFallbackWarned = false;
   private deferredMessages: Array<{
+    /** Durable identity for per-message flush acknowledgement: a flush
+     *  interrupted by a crash replays only the messages not yet acked. */
+    id: string;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -1434,14 +1447,34 @@ export class AgentFramework {
     // quiesced boot needs no re-pause — completeMcplDataPlaneGate consults
     // the flag and holds data planes (control planes come up normally). The
     // gate already exists at this point, so the suppression is wired here too.
+    //
+    // Both records live OUTSIDE branch history (recovery/ files next to the
+    // store): a historical rollback must not be able to erase the marker of
+    // the very surgery it belongs to, nor orphan the writes deferred by it.
+    framework.hostModePath = config.hostModePath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'host-mode.json') : undefined);
+    framework.deferredWritesPath = config.deferredWritesPath
+      ?? (config.storePath ? join(config.storePath, 'recovery', 'deferred-writes.json') : undefined);
     {
       const hostMode = framework.readHostMode();
+      // Deferred writes are recovered REGARDLESS of the mode flag: a crash
+      // between a resume's flag clear and the end of its flush must not
+      // strand accepted messages. Per-message acks mean only the remainder
+      // replays. Serving boot with a remainder → flush it right now (no turn
+      // is alive yet, so this is a safe boundary).
+      const restoredWrites = framework.restorePersistedDeferredWrites();
+      if (!hostMode?.quiesced && restoredWrites > 0) {
+        console.error(
+          `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
+          `(an earlier resume did not finish its flush) — landing them now`,
+        );
+        await framework.flushDeferredWrites('boot-recovery');
+      }
       if (hostMode?.quiesced) {
         framework.quiesced = true;
         framework.quiesceReason = hostMode.reason;
         framework.quiescedAt = hostMode.since;
         framework.eventGate?.setQuiesced(true);
-        const restoredWrites = framework.restorePersistedDeferredWrites();
         console.error(
           `[host-mode] ============================================================\n` +
           `[host-mode] BOOTING QUIESCED (persisted${hostMode.reason ? `: ${hostMode.reason}` : ''}, ` +
@@ -2441,13 +2474,30 @@ export class AgentFramework {
   // wait depends on the event loop continuing to run.
   // -------------------------------------------------------------------------
 
+  /**
+   * Wakes that passed the scheduler and now own provider admission while
+   * waiting for an in-flight auxiliary call to settle — no turn token yet,
+   * so `activeTurnTokens` alone would call the host drained while a turn is
+   * one promise-resolution away from starting. The admission continuation
+   * rechecks quiesce and requeues, but until it runs the wake is live.
+   */
+  private parkedAdmissionCount(): number {
+    let n = 0;
+    for (const [agentName, gate] of this.providerGates) {
+      if (gate.primaryDepth > 0 && !this.activeTurnTokens.has(agentName)) n++;
+    }
+    return n;
+  }
+
   getHostModeStatus(): HostModeStatus {
+    const parkedAdmissions = this.parkedAdmissionCount();
     return {
       quiesced: this.quiesced,
       ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
       ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
-      drained: this.activeTurnTokens.size === 0,
+      drained: this.activeTurnTokens.size === 0 && parkedAdmissions === 0,
       activeTurns: this.activeTurnTokens.size,
+      parkedAdmissions,
       gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
       backgroundScripts: [...this.backgroundScripts.values()]
         .filter((record) => record.status === 'running').length,
@@ -2527,7 +2577,14 @@ export class AgentFramework {
         )
       : AgentFramework.QUIESCE_TIMEOUT_DEFAULT_MS;
     const deadline = Date.now() + timeoutMs;
-    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < deadline) {
+    // Drain = no turn token AND no wake parked on provider admission (the
+    // latter becomes a turn the moment its auxiliary settles unless the
+    // continuation's quiesce recheck requeues it — wait for that to happen).
+    while (
+      this.quiesced &&
+      (this.activeTurnTokens.size > 0 || this.parkedAdmissionCount() > 0) &&
+      Date.now() < deadline
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
@@ -2554,6 +2611,7 @@ export class AgentFramework {
       ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
       drained: status.drained,
       activeTurns: status.activeTurns,
+      ...(status.parkedAdmissions > 0 ? { parkedAdmissions: status.parkedAdmissions } : {}),
       ...(abandoned ? { abandoned: true } : {}),
       ...(unabandonable.length > 0 ? { unabandonable } : {}),
     });
@@ -2561,7 +2619,10 @@ export class AgentFramework {
       status.drained
         ? `[host-mode] quiesced — drained, ${status.gatedRequests} wake(s) parked`
         : `[host-mode] quiesced but drain ${abandoned ? 'needed abandon and' : 'timed out —'} ` +
-          `${status.activeTurns} turn(s) still alive`,
+          `${status.activeTurns} turn(s) still alive` +
+          (status.parkedAdmissions > 0
+            ? `, ${status.parkedAdmissions} wake(s) parked on provider admission`
+            : ''),
     );
     return status;
   }
@@ -2662,53 +2723,23 @@ export class AgentFramework {
     }
 
     const releasedRequests = this.pendingRequests.length;
+    // In-memory first: addMessage must stop deferring so the flush below can
+    // land. The DURABLE flag is cleared only after the flush completes — a
+    // crash in between then boots quiesced with the un-acked remainder
+    // restored (and a serving boot recovers any remainder anyway).
     this.quiesced = false;
     this.quiesceReason = undefined;
     this.quiescedAt = undefined;
     this.lastUnabandonable = [];
-    this.persistHostMode(null);
     this.eventGate?.setQuiesced(false);
 
     try {
       // Flush context writes deferred by the quiesce window (module events,
       // api message.send) — with no turn alive there is no other flush
-      // point. Per-message try/catch (mirrors the turn-start flush): one
-      // poison message or a transient store failure must not drop the
-      // messages behind it, and must never reach the plane reopen below.
-      // Per-target: an agent whose turn is still alive keeps ITS messages
-      // deferred for its own boundary; everyone else's flush now.
-      if (this.deferredMessages.length > 0) {
-        const keep: typeof this.deferredMessages = [];
-        const flush: typeof this.deferredMessages = [];
-        for (const msg of this.deferredMessages) {
-          const target = msg.forAgent ?? this.primaryAgentName;
-          (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
-        }
-        this.deferredMessages = keep;
-        let stored = 0;
-        for (const msg of flush) {
-          try {
-            this.addMessage(
-              msg.participant,
-              msg.content,
-              msg.metadata,
-              msg.forAgent ? { forAgent: msg.forAgent } : undefined,
-            );
-            stored++;
-          } catch (err) {
-            console.error(
-              `[host-mode] resume: failed to store a deferred context write ` +
-              `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
-              err,
-            );
-          }
-        }
-        console.error(
-          `[host-mode] resume: flushed ${stored}/${flush.length} deferred context write(s)` +
-          (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
-        );
-      }
-      this.persistDeferredWrites();
+      // point. Per-message try/catch and per-message durable ack (see
+      // flushDeferredWrites); nothing here may reach the plane reopen below.
+      await this.flushDeferredWrites('resume');
+      this.persistHostMode(null);
     } finally {
       // Reopen MCPL data planes through the existing barrier funnel — NOT a
       // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
@@ -2746,17 +2777,133 @@ export class AgentFramework {
   }
 
   /**
-   * Mirror the deferred-write queue into the store while quiesced. The
-   * quiesce flag itself is persisted because a crash mid-surgery is an
-   * expected event; the messages withheld BECAUSE of that surgery would
-   * otherwise die with the process — and the window is operator-length, not
-   * turn-length. Cleared (slot emptied) once the queue drains or the host
-   * resumes. Deferrals outside a quiesce window (turn-alive, mid-tool-cycle)
-   * are still memory-only: they flush within the turn, as before.
+   * Land every deferred write whose target has no turn alive, one at a time,
+   * acknowledging each durably as it lands (the persisted queue is rewritten
+   * after every message). A crash mid-flush therefore replays exactly the
+   * un-acked remainder at the next boot — no loss, no duplicates. A write
+   * the store REJECTS is logged and acked too: replaying a poison message
+   * forever would wedge every later boot on it.
+   *
+   * Per-target: an agent whose turn is still alive keeps ITS messages
+   * deferred for its own turn boundary; everyone else's flush now.
+   */
+  private async flushDeferredWrites(label: string): Promise<void> {
+    if (this.deferredMessages.length === 0) {
+      this.persistDeferredWrites();
+      return;
+    }
+    const keep: typeof this.deferredMessages = [];
+    const flush: typeof this.deferredMessages = [];
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
+    }
+    let stored = 0;
+    for (let i = 0; i < flush.length; i++) {
+      const msg = flush[i];
+      try {
+        // The durable id rides in the stored message's metadata: a crash
+        // between this write and its ack below would otherwise replay the
+        // message at boot — restorePersistedDeferredWrites skips ids that
+        // already landed.
+        this.addMessage(
+          msg.participant,
+          msg.content,
+          { ...(msg.metadata ?? {}), deferredWriteId: msg.id } as MessageMetadata,
+          msg.forAgent ? { forAgent: msg.forAgent } : undefined,
+        );
+        stored++;
+      } catch (err) {
+        console.error(
+          `[host-mode] ${label}: failed to store a deferred context write ` +
+          `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
+          err,
+        );
+      }
+      // Ack: the durable queue now holds only what has not landed yet.
+      this.deferredMessages = [...keep, ...flush.slice(i + 1)];
+      this.persistDeferredWrites();
+    }
+    console.error(
+      `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
+      (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
+    );
+  }
+
+  /**
+   * Which of `ids` already exist in some agent's store as a landed deferred
+   * write (`metadata.deferredWriteId`). Scans each context manager's recent
+   * tail blob-free — an interrupted flush is always within the last few
+   * hundred slots — and tolerates facades without windowed reads.
+   */
+  private landedDeferredWriteIds(ids: Set<string>): Set<string> {
+    const landed = new Set<string>();
+    if (ids.size === 0) return landed;
+    const SCAN = 2_000;
+    for (const agent of this.agents.values()) {
+      try {
+        const cm = agent.getContextManager() as unknown as {
+          getMessageCount?: () => number;
+          getMessageWindow?: (o: number, l: number, opts?: { resolveBlobs?: boolean }) =>
+            { messages: Array<{ metadata?: Record<string, unknown> }> };
+          getAllMessages: () => Array<{ metadata?: Record<string, unknown> }>;
+        };
+        let messages: Array<{ metadata?: Record<string, unknown> }>;
+        if (typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function') {
+          const total = cm.getMessageCount();
+          const start = Math.max(0, total - SCAN);
+          messages = cm.getMessageWindow(start, total - start, { resolveBlobs: false }).messages;
+        } else {
+          messages = cm.getAllMessages();
+        }
+        for (const m of messages) {
+          const id = m.metadata?.deferredWriteId;
+          if (typeof id === 'string' && ids.has(id)) landed.add(id);
+        }
+      } catch (err) {
+        console.error(`[host-mode] could not scan ${agent.name} for landed deferred writes:`, err);
+      }
+    }
+    return landed;
+  }
+
+  /** Atomic JSON write for the recovery files (tmp + rename, 0600) — the
+   *  same idiom as the Discord awareness outbox. */
+  private writeRecoveryFile(path: string, document: unknown): void {
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporary, path);
+  }
+
+  private readRecoveryFile(path: string): unknown {
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(readFileSync(path, 'utf8'));
+  }
+
+  private warnRecoveryFallbackOnce(): void {
+    if (this.recoveryFallbackWarned) return;
+    this.recoveryFallbackWarned = true;
+    console.error(
+      '[host-mode] no storePath / hostModePath / deferredWritesPath: quiesce state and deferred ' +
+      'writes persist in the branch-local framework/state slot — a historical rollback while ' +
+      'quiesced can erase them; configure the recovery paths',
+    );
+  }
+
+  /**
+   * Mirror the deferred-write queue durably while quiesced (and until an
+   * already-persisted queue drains). The quiesce flag itself is persisted
+   * because a crash mid-surgery is an expected event; the messages withheld
+   * BECAUSE of that surgery would otherwise die with the process — and the
+   * window is operator-length, not turn-length. Lives in the
+   * branch-independent recovery file so a rollback cannot orphan it.
+   * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
+   * still memory-only: they flush within the turn, as before.
    */
   private persistDeferredWrites(): void {
     try {
-      if (this.quiesced && this.deferredMessages.length > 0) {
+      if ((this.quiesced || this.deferredWritesPersisted) && this.deferredMessages.length > 0) {
         const payload = JSON.stringify(this.deferredMessages);
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
           if (!this.deferredWritesCapWarned) {
@@ -2769,10 +2916,19 @@ export class AgentFramework {
           }
           return;
         }
-        this.store.setStateJson(DEFERRED_WRITES_ID, this.deferredMessages);
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: this.deferredMessages });
+        } else {
+          this.warnRecoveryFallbackOnce();
+          this.store.setStateJson(DEFERRED_WRITES_ID, this.deferredMessages);
+        }
         this.deferredWritesPersisted = true;
       } else if (this.deferredWritesPersisted) {
-        this.store.setStateJson(DEFERRED_WRITES_ID, []);
+        if (this.deferredWritesPath) {
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
+        } else {
+          this.store.setStateJson(DEFERRED_WRITES_ID, []);
+        }
         this.deferredWritesPersisted = false;
       }
     } catch (err) {
@@ -2782,13 +2938,35 @@ export class AgentFramework {
 
   private restorePersistedDeferredWrites(): number {
     try {
-      const data = this.store.getStateJson(DEFERRED_WRITES_ID);
+      let data: unknown;
+      if (this.deferredWritesPath && existsSync(this.deferredWritesPath)) {
+        const doc = this.readRecoveryFile(this.deferredWritesPath) as { pending?: unknown } | undefined;
+        data = doc?.pending;
+      } else {
+        // Stores that predate the recovery file (or store-only configs).
+        data = this.store.getStateJson(DEFERRED_WRITES_ID);
+      }
       if (!Array.isArray(data) || data.length === 0) return 0;
-      const restored = data.filter((m): m is typeof this.deferredMessages[number] =>
-        !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
-          && Array.isArray((m as { content?: unknown }).content));
+      const candidates = data
+        .filter((m): m is Omit<typeof this.deferredMessages[number], 'id'> & { id?: string } =>
+          !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
+            && Array.isArray((m as { content?: unknown }).content))
+        .map((m) => ({ ...m, id: typeof m.id === 'string' ? m.id : randomUUID() }));
+      // Exactly-once: a message that landed before its ack was written is
+      // already in the store under its deferredWriteId — do not replay it.
+      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)));
+      const restored = candidates.filter((m) => !landed.has(m.id));
+      if (landed.size > 0) {
+        console.error(
+          `[host-mode] ${landed.size} deferred context write(s) had already landed before their ack ` +
+          `(interrupted flush) — skipped, not replayed`,
+        );
+      }
       this.deferredMessages.push(...restored);
       this.deferredWritesPersisted = true;
+      // Rewrite the durable queue without the already-landed entries so a
+      // second interrupted boot does not re-scan them.
+      if (landed.size > 0) this.persistDeferredWrites();
       return restored.length;
     } catch (err) {
       console.error('[host-mode] failed to restore persisted deferred context writes:', err);
@@ -3242,11 +3420,34 @@ export class AgentFramework {
    * store. Resume is always reachable (public method, WS/HTTP, control-plane
    * host/command), and every quiesced boot logs a loud banner. */
   private persistHostMode(mode: { quiesced: true; reason?: string; since: number } | null): void {
-    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-    if (mode === null) delete state.hostMode;
-    else state.hostMode = { ...mode };
-    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    if (this.hostModePath) {
+      // Branch-independent: the recovery file is the record. (`quiesced:
+      // false` is written explicitly rather than deleting the file so that
+      // its presence, not its content, decides precedence over the legacy
+      // branch-local slot below.)
+      this.writeRecoveryFile(
+        this.hostModePath,
+        mode === null ? { version: 1, quiesced: false, clearedAt: Date.now() } : { version: 1, ...mode },
+      );
+      if (mode === null) {
+        // Also drop any legacy slot marker so a downgrade cannot resurrect it.
+        try {
+          const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+          if (data && typeof data === 'object' && 'hostMode' in (data as Record<string, unknown>)) {
+            const state = { ...(data as Record<string, unknown>) };
+            delete state.hostMode;
+            this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+          }
+        } catch { /* best effort */ }
+      }
+    } else {
+      this.warnRecoveryFallbackOnce();
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      if (mode === null) delete state.hostMode;
+      else state.hostMode = { ...mode };
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    }
     // The whole feature rests on the flag surviving a crash — close the
     // window between the write and the next periodic sync.
     try {
@@ -3256,13 +3457,22 @@ export class AgentFramework {
     }
   }
 
+  /** The recovery file wins whenever it exists; the branch-local slot is
+   *  read only for stores that predate it (or store-only configs). */
   private readHostMode(): { quiesced: boolean; reason?: string; since?: number } | null {
     try {
-      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      if (!data || typeof data !== 'object') return null;
-      const mode = (data as Record<string, unknown>).hostMode;
-      if (!mode || typeof mode !== 'object') return null;
-      const record = mode as Record<string, unknown>;
+      let record: Record<string, unknown> | null = null;
+      if (this.hostModePath && existsSync(this.hostModePath)) {
+        const doc = this.readRecoveryFile(this.hostModePath);
+        if (doc && typeof doc === 'object') record = doc as Record<string, unknown>;
+      } else {
+        const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+        if (!data || typeof data !== 'object') return null;
+        const mode = (data as Record<string, unknown>).hostMode;
+        if (!mode || typeof mode !== 'object') return null;
+        record = mode as Record<string, unknown>;
+      }
+      if (!record) return null;
       return {
         quiesced: record.quiesced === true,
         ...(typeof record.reason === 'string' ? { reason: record.reason } : {}),
@@ -7017,6 +7227,20 @@ export class AgentFramework {
             console.error(`[provider-admission] ${agent.name}: turn-alive while parked — wake requeued, not started`);
             return;
           }
+          // Same gap, second hazard (#122): the host may have QUIESCED while
+          // this wake was parked. The scheduler's quiesce gate ran before the
+          // park; starting here would bypass it and run a turn against a
+          // context the operator believes frozen. Give admission back and
+          // requeue — the scheduler re-parks it (coalesced) until resume.
+          // Continuations of a held turn pass, as they do at the gate.
+          if (this.quiesced && !isTurnContinuation(trigger?.reason ?? '')) {
+            this.releasePrimaryProviderGate(agent.name);
+            this.pendingRequests.push(trigger ?? {
+              agentName: agent.name, reason: 'provider-admission:requeue', source: 'scheduler', timestamp: Date.now(),
+            });
+            console.error(`[provider-admission] ${agent.name}: host quiesced while parked — wake requeued, not started`);
+            return;
+          }
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
@@ -8836,8 +9060,8 @@ export class AgentFramework {
         cm.addMessage('user', blocks);
       } else {
         this.deferredMessages.push(
-          { participant: agentName, content: toolUse, forAgent: agentName },
-          { participant: 'user', content: blocks, forAgent: agentName },
+          { id: randomUUID(), participant: agentName, content: toolUse, forAgent: agentName },
+          { id: randomUUID(), participant: 'user', content: blocks, forAgent: agentName },
         );
       }
 
@@ -10118,8 +10342,8 @@ export class AgentFramework {
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      this.deferredMessages.push({ participant, content, metadata, forAgent: opts?.forAgent });
-      if (this.quiesced) this.persistDeferredWrites();
+      this.deferredMessages.push({ id: randomUUID(), participant, content, metadata, forAgent: opts?.forAgent });
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
