@@ -27,6 +27,7 @@ describe('live operator surgery', () => {
   let tempDir: string;
   let storePath: string;
   let framework: AgentFramework;
+  let membrane: MockMembrane;
   let traces: TraceEvent[];
   let ids: string[];
 
@@ -37,9 +38,10 @@ describe('live operator surgery', () => {
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'operator-surgery-test-'));
     storePath = join(tempDir, 'test.chronicle');
+    membrane = new MockMembrane();
     framework = await AgentFramework.create({
       storePath,
-      membrane: new MockMembrane().asMembrane(),
+      membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
       modules: [],
     });
@@ -176,6 +178,54 @@ describe('live operator surgery', () => {
     }
     assert.equal(heldDuringSwitch, 1, 'reservation held while the switch was awaited');
     assert.equal(tokens.size, 0, 'and released after');
+  });
+
+  it('holds the store against agents admitted AFTER the reservation: ephemeral admission is refused (ticket kept) and wakes are parked', async () => {
+    // Hold the awaited switch open so the surgery is mid-flight.
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
+    // An ephemeral candidate: not in this.agents, so the token snapshot
+    // cannot cover it — this is the reviewer's dynamic-admission probe.
+    const worker = await framework.createEphemeralAgent({
+      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
+    worker.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      pendingRequests: unknown[];
+      ephemeralCandidates: Map<unknown, unknown>;
+      processInferenceRequests(): Promise<void>;
+    };
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[1] });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
+
+      await assert.rejects(
+        framework.runEphemeralToCompletion(worker.agent, worker.contextManager),
+        /under live roll back/,
+      );
+      assert.equal(internals.ephemeralCandidates.get(worker.agent), worker.contextManager,
+        'refused BEFORE consuming the generation ticket — a clean retry stays possible');
+
+      // A wake arriving now is parked by the scheduler, not started.
+      framework.nudgeAgent('scout', 'test');
+      await internals.processInferenceRequests();
+      assert.equal(membrane.calls.length, 0, 'no provider call while the store is held');
+      assert.ok(internals.pendingRequests.length >= 1, 'the wake is requeued for after the surgery');
+
+      releaseSwitch();
+      const r = await rollback;
+      assert.equal(r.messagesRemoved, 3);
+      assert.equal(internals.surgeryHold, null, 'hold released with the reservation');
+      assert.equal(membrane.calls.length, 0);
+    } finally {
+      c.switchBranch = originalSwitch;
+      worker.cleanup();
+    }
   });
 
   // --- strategy-initialization failure -----------------------------------------

@@ -1088,6 +1088,14 @@ export class AgentFramework {
   private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
   /** Durable JSONL record of operator-initiated mutations (see operator-log.ts). */
   private readonly operatorLog: OperatorLog;
+  /**
+   * Store-wide admission barrier while a live surgery (rollback/suppress)
+   * holds the store. Per-agent turn tokens cover the agents registered when
+   * the reservation was taken; this flag covers everyone else — an ephemeral
+   * agent admitted mid-switch, a wake for an agent created later — at the
+   * scheduler, ephemeral admission and puppet entry points.
+   */
+  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -2783,6 +2791,15 @@ export class AgentFramework {
     if (this.ephemeralCandidates.get(agent) !== contextManager) {
       throw new Error(`Ephemeral agent "${agent.name}" has no fresh generation ticket from this framework`);
     }
+    // A live surgery holds the whole store: an agent admitted now would
+    // compile against a history that is being replaced under it. Refuse
+    // BEFORE consuming the ticket so the caller can retry once it completes.
+    if (this.surgeryHold) {
+      throw new Error(
+        `Ephemeral agent "${agent.name}" refused: the store is under live ${this.surgeryHold.verb} ` +
+          `for ${this.surgeryHold.agentName} — retry when it completes`,
+      );
+    }
     // Consume before any await/registration: the exact (Agent, ContextManager)
     // generation is one-shot even if startup later fails.
     this.ephemeralCandidates.delete(agent);
@@ -4329,7 +4346,13 @@ export class AgentFramework {
    * flushes messages that deferred behind the reservation, as the puppet
    * does. Always release in `finally`: a token nobody clears wedges the fleet.
    */
-  private reserveStoreForSurgery(verb: string): () => void {
+  private reserveStoreForSurgery(verb: string, agentName: string): () => void {
+    if (this.surgeryHold) {
+      throw new OperatorActionError(
+        'agent-busy',
+        `Cannot ${verb}: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} is already in progress`,
+      );
+    }
     const busy: string[] = [];
     for (const [name, a] of this.agents) {
       if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
@@ -4350,10 +4373,15 @@ export class AgentFramework {
       this.activeTurnTokens.set(name, token);
       reserved.set(name, token);
     }
+    // The token snapshot only covers agents that exist now; the hold covers
+    // arrivals during the awaited switch (see surgeryHold).
+    const hold = { verb, agentName, since: Date.now() };
+    this.surgeryHold = hold;
     let released = false;
     return () => {
       if (released) return;
       released = true;
+      if (this.surgeryHold === hold) this.surgeryHold = null;
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -4467,7 +4495,7 @@ export class AgentFramework {
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the switch has landed or been rolled back.
-      const release = this.reserveStoreForSurgery('roll back');
+      const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       try {
         // Prepare the external side effect before switching Chronicle. If the
@@ -4617,7 +4645,7 @@ export class AgentFramework {
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the fork is fully redacted or the source is restored.
-      const release = this.reserveStoreForSurgery('suppress');
+      const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       try {
         const markerBatch = this.discordAwarenessOutbox?.prepare({
@@ -6165,7 +6193,11 @@ export class AgentFramework {
       // auxiliary call. Keep this agent's later wakes queued, but do not block the
       // framework event loop or other residents while that auxiliary call settles.
       const providerPrimaryWaiting = (providerGate?.primaryDepth ?? 0) > 0 && !this.activeTurnTokens.has(agentName);
-      if (providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      // A live surgery (rollback/suppress) holds the whole store: no turn may
+      // start for ANY agent — including one registered after the reservation's
+      // token snapshot — until the switch has landed or been rolled back.
+      const surgeryHeld = this.surgeryHold !== null;
+      if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
         if (
@@ -6181,9 +6213,11 @@ export class AgentFramework {
           // read 'idle' while a turn's teardown is pending, and a LEAKED turn
           // token would look exactly like this — permanently requeued wakes.
           // This line is the wedge's tell (idle+turn-alive, forever).
-          const shownStatus = turnAlive && agent.state.status === 'idle'
-            ? 'idle+turn-alive'
-            : agent.state.status;
+          const shownStatus = surgeryHeld && agent.state.status === 'idle'
+            ? `idle+surgery(${this.surgeryHold!.verb})`
+            : turnAlive && agent.state.status === 'idle'
+              ? 'idle+turn-alive'
+              : agent.state.status;
           this.emitTrace({
             type: 'inference:request_stale',
             agentName,
@@ -8444,6 +8478,11 @@ export class AgentFramework {
     // Idle AND no turn alive: status reads 'idle' from dequeue until the
     // stream registers, and again while a turn's teardown is pending
     // (the scheduler's own busy test, 'idle+turn-alive').
+    if (this.surgeryHold) {
+      throw new Error(
+        `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
+      );
+    }
     if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
       const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
       throw new Error(
