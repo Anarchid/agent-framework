@@ -159,6 +159,25 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
+   * Retire a batch that was prepared but whose operation did not complete
+   * (fork failed, a removal threw and the source branch was restored). A
+   * prepared batch is armed: it re-fires at boot or on branch switch through
+   * `activatePreparedForBranch` / `preparedSuppressionsForBranch`, and an
+   * un-completable suppression there aborts framework start. Only prepared
+   * batches can be discarded — an active batch owns delivered markers and
+   * must be reconciled, not dropped. Returns false when nothing was removed.
+   */
+  discard(batchId: string): boolean {
+    const document = this.read();
+    const index = document.batches.findIndex((candidate) => candidate.id === batchId);
+    if (index < 0) return false;
+    if (document.batches[index].status !== 'prepared') return false;
+    document.batches.splice(index, 1);
+    this.write(document);
+    return true;
+  }
+
+  /**
    * Reconcile every retained ledger entry against the active branch. A marker
    * is desired when any active batch for the same ref+emoji has a target branch
    * in the active branch's ancestry.

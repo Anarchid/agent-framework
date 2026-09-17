@@ -8,6 +8,7 @@ import {
   extractDiscordAwarenessRefs,
 } from '../src/recovery/discord-awareness-outbox.js';
 import { AgentFramework } from '../src/framework.js';
+import { OperatorLog } from '../src/operator-log.js';
 
 test('extractDiscordAwarenessRefs keeps only direct Discord addressing metadata', () => {
   const refs = extractDiscordAwarenessRefs([
@@ -227,6 +228,14 @@ test('message-granular undo prepares markers before switching branches', async (
     let currentBranch = 'main';
     const contextManager = {
       getAllMessages: () => messages,
+      // Windowed reads — what the live rollback path uses so it never
+      // re-inflates every attachment on the branch.
+      getMessageCount: () => messages.length,
+      getMessageWindow: (offset: number, limit: number) => ({
+        messages: messages.slice(offset, offset + limit),
+        startIndex: offset,
+        totalCount: messages.length,
+      }),
       branchAt: (_id: string, name: string) => { calls.push(`branch:${name}`); return name; },
       switchBranch: async (name: string) => { calls.push(`switch:${name}`); currentBranch = name; },
     };
@@ -248,6 +257,13 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.mcplServerRegistry = null;
     framework.moduleRegistry = { getModule: () => null };
     framework.lastVisiblePreview = async () => null;
+    // Live rollback reserves the store: it mints turn tokens for every agent
+    // and flushes deferred writers on release — give the stub those fields.
+    framework.activeTurnTokens = new Map();
+    framework.nextTurnToken = 1;
+    framework.deferredMessages = [];
+    framework.pendingAssistantBlocks = new Map();
+    framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {
       command: 'undo', agentName: 'cairn', messages: 2,
