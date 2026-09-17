@@ -396,6 +396,21 @@ import {
 } from './recovery/discord-awareness-outbox.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+/** Snapshot slot mirroring context writes deferred while quiesced (#122). */
+const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** Above this serialized size the deferred-write mirror is skipped (kept in
+ *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
+const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
+
+/** Requests that CONTINUE a turn whose token is already held — a context-
+ *  budget restart, or the non-streaming path's tool-results round. The
+ *  quiesce wake gate lets these through: the drain is exactly the phase
+ *  where such a turn must be allowed to finish, and parking them would hold
+ *  the token until the drain timed out (and `abandon` could not clear a turn
+ *  with no stream). */
+function isTurnContinuation(reason: string): boolean {
+  return reason === 'context_budget_restart' || reason === 'tool_results_ready';
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -505,12 +520,22 @@ export interface HostModeStatus {
    * dequeue → settled teardown, strictly wider than activeStreams). */
   drained: boolean;
   activeTurns: number;
-  /** Inference requests parked by the quiesce wake gate. */
+  /** Inference requests parked by the quiesce wake gate (while quiesced), or
+   * simply queued (while serving — non-zero right after a resume until the
+   * scheduler's next pass consumes them). Continuations of a held turn
+   * (budget restart, tool results) are never counted. */
   gatedRequests: number;
   /** Background code-execution scripts still running. Quiesce does NOT stop
    * them — they hold no turn token, so drain doesn't wait for them. Reported
    * so the operator sees what is still acting during the window. */
   backgroundScripts: number;
+  /** Context writes (module events, api message.send) withheld because the
+   * host is quiesced. Persisted while quiesced and flushed by resume(). */
+  deferredWrites: number;
+  /** Agents whose turn `abandon` could NOT cancel: the turn token is held but
+   * no stream exists yet (still in hooks/compile) or ever will (puppet tool
+   * turns). Present only after an abandon that left such turns behind. */
+  unabandonable?: string[];
 }
 
 /**
@@ -976,6 +1001,12 @@ export class AgentFramework {
   /** Tune-out coordinator (issue #77); non-null iff subconscious + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
 
+  /** Agents an abandon could not cancel (token held, no stream) — surfaced
+   *  in HostModeStatus until the next quiesce/resume. */
+  private lastUnabandonable: string[] = [];
+  /** True while the deferred-write queue has a persisted mirror (quiesced). */
+  private deferredWritesPersisted = false;
+  private deferredWritesCapWarned = false;
   private deferredMessages: Array<{
     participant: string;
     content: ContentBlock[];
@@ -1192,6 +1223,11 @@ export class AgentFramework {
     } catch {
       // Already registered
     }
+    try {
+      store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
+    } catch {
+      // Already registered
+    }
 
     try {
       store.registerState({
@@ -1405,6 +1441,7 @@ export class AgentFramework {
         framework.quiesceReason = hostMode.reason;
         framework.quiescedAt = hostMode.since;
         framework.eventGate?.setQuiesced(true);
+        const restoredWrites = framework.restorePersistedDeferredWrites();
         console.error(
           `[host-mode] ============================================================\n` +
           `[host-mode] BOOTING QUIESCED (persisted${hostMode.reason ? `: ${hostMode.reason}` : ''}, ` +
@@ -1413,6 +1450,8 @@ export class AgentFramework {
           `[host-mode] until resume() — via host/command, the API server, or the\n` +
           `[host-mode] framework API. Wakes parked before the restart were in-memory\n` +
           `[host-mode] and are gone; recurring sources re-deliver on their own cadence.\n` +
+          `[host-mode] ${restoredWrites} deferred context write(s) restored from the store;\n` +
+          `[host-mode] they land at resume().\n` +
           `[host-mode] ============================================================`,
         );
         framework.emitTrace({
@@ -2409,13 +2448,20 @@ export class AgentFramework {
       ...(this.quiescedAt !== undefined ? { since: this.quiescedAt } : {}),
       drained: this.activeTurnTokens.size === 0,
       activeTurns: this.activeTurnTokens.size,
-      gatedRequests: this.quiesced
-        ? this.pendingRequests.filter((r) => r.reason !== 'context_budget_restart').length
-        : 0,
+      gatedRequests: this.pendingRequests.filter((r) => !isTurnContinuation(r.reason)).length,
       backgroundScripts: [...this.backgroundScripts.values()]
         .filter((record) => record.status === 'running').length,
+      deferredWrites: this.deferredMessages.length,
+      ...(this.lastUnabandonable.length > 0 ? { unabandonable: [...this.lastUnabandonable] } : {}),
     };
   }
+
+  /** Drain window bounds shared by every ingress (framework API, WS, HTTP,
+   *  host/command). Below the floor a drain is meaningless; above the ceiling
+   *  an awaited call would poll for days. */
+  static readonly QUIESCE_TIMEOUT_MIN_MS = 1_000;
+  static readonly QUIESCE_TIMEOUT_MAX_MS = 600_000;
+  static readonly QUIESCE_TIMEOUT_DEFAULT_MS = 120_000;
 
   /**
    * Enter quiesce mode: persist the flag, suppress gate deliveries, pause all
@@ -2438,13 +2484,14 @@ export class AgentFramework {
       // without resume()+re-quiesce (which would reopen data planes and
       // release parked wakes mid-surgery).
       if (opts?.abandon && this.activeTurnTokens.size > 0) {
-        await this.abandonActiveTurns();
+        const unabandonable = await this.abandonActiveTurns();
         this.emitTrace({
           type: 'host:quiesce',
           ...(this.quiesceReason ? { reason: this.quiesceReason } : {}),
           drained: this.activeTurnTokens.size === 0,
           activeTurns: this.activeTurnTokens.size,
           abandoned: true,
+          ...(unabandonable.length > 0 ? { unabandonable } : {}),
         });
       }
       return this.getHostModeStatus();
@@ -2452,6 +2499,7 @@ export class AgentFramework {
     this.quiesced = true;
     this.quiesceReason = opts?.reason;
     this.quiescedAt = Date.now();
+    this.lastUnabandonable = [];
     this.persistHostMode({
       quiesced: true,
       ...(opts?.reason ? { reason: opts.reason } : {}),
@@ -2466,22 +2514,38 @@ export class AgentFramework {
       connection.pauseDataPlane();
     }
 
-    // NaN-proof: timeoutMs arrives via Number()/blind casts on three
-    // ingresses, and Math.max(1_000, NaN) is NaN — which would silently
-    // collapse the drain window to zero (`Date.now() < NaN` is false).
+    // Clamp HERE, for every ingress. NaN-proof too: timeoutMs arrives via
+    // Number()/blind casts, and Math.max(1_000, NaN) is NaN — which would
+    // silently collapse the drain window to zero (`Date.now() < NaN` is
+    // false). The ceiling matters because this call is awaited: an
+    // unbounded value polls the event loop for as long as it says.
     const rawTimeout = opts?.timeoutMs;
     const timeoutMs = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout)
-      ? Math.max(1_000, rawTimeout)
-      : 120_000;
+      ? Math.max(
+          AgentFramework.QUIESCE_TIMEOUT_MIN_MS,
+          Math.min(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, Math.floor(rawTimeout)),
+        )
+      : AgentFramework.QUIESCE_TIMEOUT_DEFAULT_MS;
     const deadline = Date.now() + timeoutMs;
-    while (this.activeTurnTokens.size > 0 && Date.now() < deadline) {
+    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
+    // A concurrent resume() ended this window while we waited. Nothing here
+    // may act any more — an abandon now would cancel a turn that started
+    // legitimately AFTER the resume, and the trace/log would describe a mode
+    // the host is no longer in.
+    if (!this.quiesced) {
+      console.error('[host-mode] quiesce superseded by a concurrent resume during drain');
+      return this.getHostModeStatus();
+    }
+
     let abandoned = false;
+    let unabandonable: string[] = [];
     if (this.activeTurnTokens.size > 0 && opts?.abandon) {
       abandoned = true;
-      await this.abandonActiveTurns();
+      unabandonable = await this.abandonActiveTurns();
+      if (!this.quiesced) return this.getHostModeStatus();
     }
 
     const status = this.getHostModeStatus();
@@ -2491,6 +2555,7 @@ export class AgentFramework {
       drained: status.drained,
       activeTurns: status.activeTurns,
       ...(abandoned ? { abandoned: true } : {}),
+      ...(unabandonable.length > 0 ? { unabandonable } : {}),
     });
     console.error(
       status.drained
@@ -2504,7 +2569,8 @@ export class AgentFramework {
   /** Cancel every turn-alive stream via the quiesce_abandoned kind and give
    *  teardown a bounded grace to settle. Shared by the drain-timeout path and
    *  the already-quiesced escalation path. */
-  private async abandonActiveTurns(): Promise<void> {
+  private async abandonActiveTurns(): Promise<string[]> {
+    const unabandonable: string[] = [];
     for (const agentName of [...this.activeTurnTokens.keys()]) {
       const agent = this.agents.get(agentName);
       const state = agent?.state;
@@ -2516,13 +2582,26 @@ export class AgentFramework {
           'quiesce_abandoned',
         );
         stream.cancel();
+      } else {
+        // Token held, no stream to cancel: the turn is between dequeue and
+        // stream registration (hooks/compile), or it is a puppet tool turn,
+        // which never has one. Say so — silence here reads as "abandon acted
+        // and teardown is slow", which is a different operator decision.
+        unabandonable.push(agentName);
+        console.error(
+          `[host-mode] cannot abandon turn for ${agentName}: turn token held with no stream ` +
+          `(status=${state?.status ?? 'unknown'}) — it must settle on its own`,
+        );
       }
     }
     // Bounded grace for the cancelled streams' teardown to settle.
     const grace = Date.now() + 10_000;
-    while (this.activeTurnTokens.size > 0 && Date.now() < grace) {
+    while (this.quiesced && this.activeTurnTokens.size > 0 && Date.now() < grace) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
+    // Only turns still alive after the grace are worth reporting.
+    this.lastUnabandonable = unabandonable.filter((name) => this.activeTurnTokens.has(name));
+    return this.lastUnabandonable;
   }
 
   /**
@@ -2536,9 +2615,22 @@ export class AgentFramework {
   async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     if (!this.quiesced) return this.getHostModeStatus();
 
+    // The canonical operator flow is `maintain; resume`, and a timer-driven
+    // pass may still be mid-flight: previewContext refuses to overlap one
+    // ("already running"), which used to degrade the gate to "no opinion".
+    // Wait for the pass first, then retry a few times for the case where a
+    // fresh pass started in between.
+    if (this.maintenancePass) {
+      await this.maintenancePass.catch(() => {});
+    }
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
-      const preview = this.previewAgentRuntimeSettings(agentName);
+      let preview = this.previewAgentRuntimeSettings(agentName);
+      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+        preview = this.previewAgentRuntimeSettings(agentName);
+      }
       if (preview.available && preview.effective && !preview.effective.fits) {
         failing.push({ agentName, preview });
       } else if (!preview.available && preview.reason !== 'no_preview_support') {
@@ -2573,53 +2665,135 @@ export class AgentFramework {
     this.quiesced = false;
     this.quiesceReason = undefined;
     this.quiescedAt = undefined;
+    this.lastUnabandonable = [];
     this.persistHostMode(null);
     this.eventGate?.setQuiesced(false);
 
-    // Flush context writes deferred by the quiesce window (module events,
-    // api message.send) — with no turn alive there is no other flush point.
-    if (this.deferredMessages.length > 0 && this.activeTurnTokens.size === 0) {
-      const deferred = this.deferredMessages.splice(0);
-      for (const msg of deferred) {
-        this.addMessage(
-          msg.participant,
-          msg.content,
-          msg.metadata,
-          msg.forAgent ? { forAgent: msg.forAgent } : undefined,
+    try {
+      // Flush context writes deferred by the quiesce window (module events,
+      // api message.send) — with no turn alive there is no other flush
+      // point. Per-message try/catch (mirrors the turn-start flush): one
+      // poison message or a transient store failure must not drop the
+      // messages behind it, and must never reach the plane reopen below.
+      // Per-target: an agent whose turn is still alive keeps ITS messages
+      // deferred for its own boundary; everyone else's flush now.
+      if (this.deferredMessages.length > 0) {
+        const keep: typeof this.deferredMessages = [];
+        const flush: typeof this.deferredMessages = [];
+        for (const msg of this.deferredMessages) {
+          const target = msg.forAgent ?? this.primaryAgentName;
+          (target && this.activeTurnTokens.has(target) ? keep : flush).push(msg);
+        }
+        this.deferredMessages = keep;
+        let stored = 0;
+        for (const msg of flush) {
+          try {
+            this.addMessage(
+              msg.participant,
+              msg.content,
+              msg.metadata,
+              msg.forAgent ? { forAgent: msg.forAgent } : undefined,
+            );
+            stored++;
+          } catch (err) {
+            console.error(
+              `[host-mode] resume: failed to store a deferred context write ` +
+              `(participant=${msg.participant}, forAgent=${msg.forAgent ?? 'primary'}):`,
+              err,
+            );
+          }
+        }
+        console.error(
+          `[host-mode] resume: flushed ${stored}/${flush.length} deferred context write(s)` +
+          (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
         );
       }
-      console.error(`[host-mode] resume: flushed ${deferred.length} deferred context write(s)`);
-    }
-
-    // Reopen MCPL data planes through the existing barrier funnel — NOT a
-    // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
-    // nested-install guard (a flushed tools-list-changed can install a newer
-    // barrier mid-flush), drains any awareness work accumulated during the
-    // window before opening, and replaces a stale failed barrier by identity.
-    if (this.mcplServerRegistry) {
-      const barrier = this.installMcplDataPlaneGate();
-      this.releaseMcplDataPlaneGate(barrier);
-      try {
-        await barrier.promise;
-        this.completeMcplDataPlaneGate(barrier);
-      } catch (error) {
-        // The host IS resumed — don't rethrow. failMcplDataPlaneGate recycles
-        // the connections, and their reconnect flows re-run the funnel with
-        // quiesced=false, self-healing the data planes.
-        await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
+      this.persistDeferredWrites();
+    } finally {
+      // Reopen MCPL data planes through the existing barrier funnel — NOT a
+      // bespoke ready() loop. The funnel inherits completeMcplDataPlaneGate's
+      // nested-install guard (a flushed tools-list-changed can install a
+      // newer barrier mid-flush), drains any awareness work accumulated
+      // during the window before opening, and replaces a stale failed
+      // barrier by identity. In `finally` so that nothing above can leave
+      // the host un-quiesced with every data plane still paused.
+      if (this.mcplServerRegistry) {
+        const barrier = this.installMcplDataPlaneGate();
+        this.releaseMcplDataPlaneGate(barrier);
+        try {
+          await barrier.promise;
+          this.completeMcplDataPlaneGate(barrier);
+        } catch (error) {
+          // The host IS resumed — don't rethrow. failMcplDataPlaneGate
+          // recycles the connections, and their reconnect flows re-run the
+          // funnel with quiesced=false, self-healing the data planes.
+          await this.failMcplDataPlaneGate(barrier, 'quiesce resume', error);
+        }
       }
-    }
 
-    this.emitTrace({
-      type: 'host:resume',
-      ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
-      releasedRequests,
-    });
-    // NOTE: parked wakes and gate buffers are in-memory only — a restart
-    // mid-quiesce boots quiesced but with these queues empty (sources like
-    // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
-    console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+      this.emitTrace({
+        type: 'host:resume',
+        ...(opts?.force && failing.length > 0 ? { forced: true } : {}),
+        releasedRequests,
+      });
+      // NOTE: parked wakes and gate buffers are in-memory only — a restart
+      // mid-quiesce boots quiesced but with these queues empty (sources like
+      // heartbeats re-deliver on their own cadence; one-shot wakes are lost).
+      // Deferred context WRITES are persisted while quiesced and survive.
+      console.error(`[host-mode] resumed — ${releasedRequests} parked wake(s) released`);
+    }
     return this.getHostModeStatus();
+  }
+
+  /**
+   * Mirror the deferred-write queue into the store while quiesced. The
+   * quiesce flag itself is persisted because a crash mid-surgery is an
+   * expected event; the messages withheld BECAUSE of that surgery would
+   * otherwise die with the process — and the window is operator-length, not
+   * turn-length. Cleared (slot emptied) once the queue drains or the host
+   * resumes. Deferrals outside a quiesce window (turn-alive, mid-tool-cycle)
+   * are still memory-only: they flush within the turn, as before.
+   */
+  private persistDeferredWrites(): void {
+    try {
+      if (this.quiesced && this.deferredMessages.length > 0) {
+        const payload = JSON.stringify(this.deferredMessages);
+        if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
+          if (!this.deferredWritesCapWarned) {
+            this.deferredWritesCapWarned = true;
+            console.error(
+              `[host-mode] deferred context writes exceed ${DEFERRED_WRITES_PERSIST_CAP_BYTES} bytes ` +
+              `serialized (${this.deferredMessages.length} message(s)) — kept in memory only; ` +
+              `a crash before resume loses them`,
+            );
+          }
+          return;
+        }
+        this.store.setStateJson(DEFERRED_WRITES_ID, this.deferredMessages);
+        this.deferredWritesPersisted = true;
+      } else if (this.deferredWritesPersisted) {
+        this.store.setStateJson(DEFERRED_WRITES_ID, []);
+        this.deferredWritesPersisted = false;
+      }
+    } catch (err) {
+      console.error('[host-mode] failed to persist deferred context writes:', err);
+    }
+  }
+
+  private restorePersistedDeferredWrites(): number {
+    try {
+      const data = this.store.getStateJson(DEFERRED_WRITES_ID);
+      if (!Array.isArray(data) || data.length === 0) return 0;
+      const restored = data.filter((m): m is typeof this.deferredMessages[number] =>
+        !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
+          && Array.isArray((m as { content?: unknown }).content));
+      this.deferredMessages.push(...restored);
+      this.deferredWritesPersisted = true;
+      return restored.length;
+    } catch (err) {
+      console.error('[host-mode] failed to restore persisted deferred context writes:', err);
+      return 0;
+    }
   }
 
   /**
@@ -2629,16 +2803,16 @@ export class AgentFramework {
    * maintenance snapshot. Works while quiesced by design: `running` stays
    * true in quiesce mode precisely so this machinery stays hot.
    */
-  async maintenanceTick(): Promise<ContextMaintenanceSnapshot> {
+  async maintenanceTick(): Promise<ContextMaintenanceSnapshot & { ran: boolean }> {
     if (!this.running) {
       // startQueuedMaintenance no-ops on a stopped/never-started framework —
-      // returning a snapshot would silently masquerade as a completed pass.
+      // a bare snapshot would masquerade as a completed pass, so say so.
       console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
-      return this.getContextMaintenanceSnapshot();
+      return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
     this.startQueuedMaintenance();
     await this.maintenancePass;
-    return this.getContextMaintenanceSnapshot();
+    return { ...this.getContextMaintenanceSnapshot(), ran: true };
   }
 
   /** Counts-only context-maintenance diagnostics for authenticated debug UIs. */
@@ -3073,6 +3247,13 @@ export class AgentFramework {
     if (mode === null) delete state.hostMode;
     else state.hostMode = { ...mode };
     this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    // The whole feature rests on the flag surviving a crash — close the
+    // window between the write and the next periodic sync.
+    try {
+      this.store.sync();
+    } catch (err) {
+      console.error('[host-mode] store sync after host-mode change failed:', err);
+    }
   }
 
   private readHostMode(): { quiesced: boolean; reason?: string; since?: number } | null {
@@ -3986,6 +4167,8 @@ export class AgentFramework {
     /** Agent state at queue time — 'idle' means the turn starts on the next
      *  scheduler pass; anything else means it runs after the current turn. */
     agentStatus?: string;
+    /** True when the host is quiesced: the wake is PARKED, not running, until resume(). */
+    quiesced?: boolean;
   } {
     const name = agentName ?? [...this.agents.keys()][0];
     const agent = name ? this.agents.get(name) : undefined;
@@ -4001,8 +4184,11 @@ export class AgentFramework {
       source: 'admin',
       timestamp: Date.now(),
     });
-    console.error(`[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}`);
-    return { ok: true, agentName: name, agentStatus };
+    console.error(
+      `[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}` +
+      (this.quiesced ? ' (host quiesced — parked until resume)' : ''),
+    );
+    return { ok: true, agentName: name, agentStatus, ...(this.quiesced ? { quiesced: true } : {}) };
   }
 
   /**
@@ -4056,6 +4242,9 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `nudge`/`unstick`: the host is quiesced, so the request is parked
+     *  until resume rather than running. */
+    quiesced?: boolean;
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
@@ -4076,13 +4265,11 @@ export class AgentFramework {
     // Host-scoped verbs (issue #122) — no agent resolution.
     const requester = params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`;
     if (params.command === 'quiesce') {
-      const timeoutMs = params.timeoutMs === undefined
-        ? undefined
-        : Math.max(1_000, Math.min(600_000, Math.floor(params.timeoutMs)));
+      // quiesce() clamps timeoutMs to [1s, 10m] itself — one clamp for every ingress.
       console.error(`[host-command] quiesce by=${requester} (server=${serverId})`);
       const hostMode = await this.quiesce({
         reason: params.reason ?? `host/command by ${requester}`,
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : {}),
         ...(params.abandon ? { abandon: true } : {}),
       });
       return { ok: true, hostMode };
@@ -4120,7 +4307,7 @@ export class AgentFramework {
         agentName,
         params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`,
       );
-      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus };
+      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus, ...(r.quiesced ? { quiesced: true } : {}) };
     }
 
     // unstick: force the refusal-rewind loop on demand (even if the agent's
@@ -4152,7 +4339,7 @@ export class AgentFramework {
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
       );
-      return { ok: true, started: true, cap };
+      return { ok: true, started: true, cap, ...(this.quiesced ? { quiesced: true } : {}) };
     }
 
     // hide: redact a single message (or an inclusive range) from the active
@@ -4893,7 +5080,7 @@ export class AgentFramework {
       // block idle (only a budget restart can still run); identity-equivalent
       // to `.length > 0` when not quiesced.
       this.pendingRequests.some(
-        (r) => !this.quiesced || r.reason === 'context_budget_restart',
+        (r) => !this.quiesced || isTurnContinuation(r.reason),
       ) ||
       this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
@@ -6201,23 +6388,30 @@ export class AgentFramework {
       // kept): heartbeat/gate wakes arrive once per tick and nothing else
       // bounds a multi-day maintenance window's accumulation.
       if (this.quiesced) {
-        const parked = budgetRestart
-          ? requests.filter((r) => r.reason !== 'context_budget_restart')
-          : requests;
-        const newestByReason = new Map<string, InferenceRequest>();
+        // Continuations of a held turn (budget restart, non-streaming tool
+        // results) pass; everything else parks.
+        const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
+        const parked = requests.filter((r) => !isTurnContinuation(r.reason));
+        // Coalesce per (reason, addressed): every channel wake shares one
+        // reason, so keying on reason alone would let an ambient message
+        // parked later evict a DM/mention parked earlier — and the
+        // addressed-outranks-ambient trigger selection below would then
+        // route the resumed turn into the wrong channel.
+        const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
-          const prev = newestByReason.get(request.reason);
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}`;
+          const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
-            newestByReason.set(request.reason, request);
+            newestByKey.set(key, request);
           }
         }
-        this.pendingRequests.push(...newestByReason.values());
-        if (!budgetRestart) continue;
-        // The restart continues its held turn; its parked siblings must NOT
-        // be consumed by that turn — they were re-parked above, so narrow
-        // the batch to the restart alone before the trigger selection below.
+        this.pendingRequests.push(...newestByKey.values());
+        if (passThrough.length === 0) continue;
+        // The continuation continues its held turn; its parked siblings must
+        // NOT be consumed by that turn — they were re-parked above, so narrow
+        // the batch to the continuation(s) alone before the trigger selection.
         requests.length = 0;
-        requests.push(budgetRestart);
+        requests.push(...passThrough);
       }
 
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
@@ -8099,6 +8293,13 @@ export class AgentFramework {
               const cancelKey = `${agent.name}:${myStreamId}`;
               if (this.frameworkCancelledStreams.get(cancelKey) === 'quiesce_abandoned') {
                 this.frameworkCancelledStreams.delete(cancelKey);
+                // Same terminal as the `aborted` twin: §10.5 lifecycle reads
+                // 'aborted' (not 'completed'), and the gate is released only
+                // for THIS agent instance — a name re-registered meanwhile
+                // (ephemeral disposal, conversation replacement) owns its own
+                // gate liveness. The inference-log terminal was already
+                // written at the top of this case (`Stream error`).
+                lifecyclePhase = 'aborted';
                 this.settleAgent(agent.name, {
                   stopReason: 'exhausted',
                   speech: '',
@@ -8110,7 +8311,9 @@ export class AgentFramework {
                   durationMs,
                   reason: 'quiesce_abandoned',
                 });
-                this.eventGate?.onInferenceEnded(agent.name);
+                if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+                  this.eventGate?.onInferenceEnded(agent.name);
+                }
                 break;
               }
             }
@@ -9916,6 +10119,7 @@ export class AgentFramework {
         this.activeStreams.has(agent.name))
     ) {
       this.deferredMessages.push({ participant, content, metadata, forAgent: opts?.forAgent });
+      if (this.quiesced) this.persistDeferredWrites();
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
@@ -9941,6 +10145,7 @@ export class AgentFramework {
       (target === agentName ? mine : rest).push(msg);
     }
     this.deferredMessages = rest;
+    if (this.deferredWritesPersisted || this.quiesced) this.persistDeferredWrites();
     return mine;
   }
 

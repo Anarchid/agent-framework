@@ -120,6 +120,33 @@ test('parked wakes coalesce per (agent, reason), keeping the set bounded', async
   });
 });
 
+test('coalescing keeps an ADDRESSED wake alive when an ambient one of the same reason parks later', async () => {
+  // Every channel wake shares one reason; keying the coalescer on reason
+  // alone let an ambient message parked later evict a DM/mention parked
+  // earlier — and the resumed turn then answered into the ambient channel.
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    await framework.quiesce();
+    // Re-read on every access: the scheduler REASSIGNS pendingRequests
+    // when it takes a batch, so a captured reference goes stale.
+    const pending = () => (framework as unknown as { pendingRequests: Array<Record<string, unknown>> }).pendingRequests;
+    const t = Date.now();
+    pending().push(
+      { agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'framework', timestamp: t, addressed: true, channelId: 'dm' },
+      { agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'framework', timestamp: t + 1, addressed: false, channelId: 'lounge' },
+      { agentName: 'agent', reason: 'mcpl:channel-incoming', source: 'framework', timestamp: t + 2, addressed: false, channelId: 'lounge' },
+    );
+    await waitFor('scheduler pass to coalesce', () => framework.getHostModeStatus().gatedRequests === 2);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const survivors = pending().filter((r) => r.reason === 'mcpl:channel-incoming');
+    assert.equal(survivors.length, 2, 'one addressed + one ambient survive');
+    assert.ok(survivors.some((r) => r.addressed === true && r.channelId === 'dm'), 'the addressed wake survived');
+    assert.ok(survivors.some((r) => r.addressed === false), 'the newest ambient wake survived');
+    assert.equal(membrane.calls.length, 0);
+  });
+});
+
 test('runUntilIdle returns with gated requests parked', async () => {
   const membrane = new MockMembrane();
   await withFramework(membrane, async (framework) => {
@@ -146,33 +173,35 @@ test('ephemeral admission is refused while quiesced', async () => {
   });
 });
 
-test('drain waits for an in-flight turn; abandon cancels without failure accounting', async () => {
-  // A stream that never completes until cancelled — models a hung provider.
-  class HangingStream implements YieldingStream {
-    private pendingResolve: (() => void) | null = null;
-    private aborted = false;
-    cancel(): void {
-      this.aborted = true;
-      this.pendingResolve?.();
-    }
-    provideToolResults(): void {}
-    get isWaitingForTools() { return false; }
-    get pendingToolCallIds(): string[] { return []; }
-    get toolDepth() { return 0; }
-    async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-      if (!this.aborted) {
-        await new Promise<void>((resolve) => { this.pendingResolve = resolve; });
-      }
-      yield { type: 'aborted', reason: 'user' } as StreamEvent;
-    }
+/** A stream that never completes until cancelled — models a hung provider. */
+class HangingStream implements YieldingStream {
+  private pendingResolve: (() => void) | null = null;
+  private aborted = false;
+  cancel(): void {
+    this.aborted = true;
+    this.pendingResolve?.();
   }
-  class HangingMembrane extends MockMembrane {
-    override streamYielding(request: NormalizedRequest): YieldingStream {
-      this.calls.push(request);
-      return new HangingStream();
-    }
+  protected waitForCancel(): Promise<void> {
+    if (this.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => { this.pendingResolve = resolve; });
   }
+  provideToolResults(): void {}
+  get isWaitingForTools() { return false; }
+  get pendingToolCallIds(): string[] { return []; }
+  get toolDepth() { return 0; }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await this.waitForCancel();
+    yield { type: 'aborted', reason: 'user' } as StreamEvent;
+  }
+}
+class HangingMembrane extends MockMembrane {
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    return new HangingStream();
+  }
+}
 
+test('drain waits for an in-flight turn; abandon cancels without failure accounting', async () => {
   const membrane = new HangingMembrane();
   await withFramework(membrane, async (framework) => {
     const traces: TraceEvent[] = [];
@@ -415,16 +444,143 @@ test('MCPL: pushes buffer while quiesced; host/command resume reopens and flushe
 // Review-fix regressions (code review 08-21)
 // ---------------------------------------------------------------------------
 
+/** A membrane whose stream sleeps before producing its response — a turn
+ *  that settles on its own after `delayMs`, so a drain window's real length
+ *  becomes observable: a collapsed window returns undrained immediately, a
+ *  sane one waits for the turn. */
+class DelayedMembrane extends MockMembrane {
+  constructor(private readonly delayMs: number) { super(); }
+  override streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
+    const inner = super.streamYielding(request, options);
+    const delayMs = this.delayMs;
+    return {
+      cancel: () => inner.cancel(),
+      provideToolResults: (...args: unknown[]) => (inner.provideToolResults as (...a: unknown[]) => void)(...args),
+      get isWaitingForTools() { return inner.isWaitingForTools; },
+      get pendingToolCallIds() { return inner.pendingToolCallIds; },
+      get toolDepth() { return inner.toolDepth; },
+      async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        yield* inner as unknown as AsyncIterable<StreamEvent>;
+      },
+    } as unknown as YieldingStream;
+  }
+}
+
 test('a non-finite timeoutMs falls back to the default drain window, never NaN-collapses', async () => {
-  const membrane = new MockMembrane();
+  // NaN reached quiesce() via Number('12O000') on the HTTP ingress. With the
+  // old Math.max(1_000, NaN) the deadline was NaN and the drain window
+  // collapsed to zero. Discriminating observable: a turn that settles after
+  // 600ms is drained by a sane window and NOT by a collapsed one.
+  const membrane = new DelayedMembrane(600);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
   await withFramework(membrane, async (framework) => {
-    // NaN reached quiesce() via Number('12O000') on the HTTP ingress. With
-    // the old Math.max(1_000, NaN) the deadline was NaN and the drain window
-    // collapsed to zero. No turn is in flight here, so the observable is
-    // simply that quiesce completes sanely (drained) instead of misbehaving.
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const started = Date.now();
     const status = await framework.quiesce({ timeoutMs: Number('12O000') });
     assert.equal(status.quiesced, true);
+    assert.equal(status.drained, true, 'the window waited for the turn');
+    assert.ok(Date.now() - started >= 400, 'quiesce actually waited');
+  });
+});
+
+test('timeoutMs is clamped inside quiesce() — a sub-second value still drains a short turn', async () => {
+  const membrane = new DelayedMembrane(600);
+  membrane.pushResponse(createMockResponse([{ type: 'text', text: 'late' }]));
+  await withFramework(membrane, async (framework) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    // 1ms honoured literally would return undrained; the [1s, 10m] floor
+    // (now inside quiesce(), shared by WS/HTTP/host-command) waits it out.
+    const status = await framework.quiesce({ timeoutMs: 1 });
     assert.equal(status.drained, true);
+    assert.equal(AgentFramework.QUIESCE_TIMEOUT_MAX_MS, 600_000);
+  });
+});
+
+test('a concurrent resume() supersedes a draining quiesce: no abandon, no stale trace', async () => {
+  const membrane = new HangingMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+
+    const pending = framework.quiesce({ timeoutMs: 5_000, abandon: true });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(framework.getHostModeStatus().quiesced, true, 'draining');
+    await framework.resume();
+    const status = await pending;
+    assert.equal(status.quiesced, false, 'the superseded quiesce reports the live mode');
+    assert.ok(
+      !traces.some((t) => t.type === 'inference:aborted'),
+      'the turn that outlived the window was NOT abandoned after the resume',
+    );
+    assert.ok(!traces.some((t) => t.type === 'host:quiesce'), 'no stale host:quiesce trace');
+    // Release the hung turn so teardown is clean.
+    framework.getAgent('agent')!.cancelStream();
+    await waitFor('agent idle', () => framework.getAgent('agent')!.state.status === 'idle');
+  });
+});
+
+test('abandon reports turns it cannot cancel (token held, no stream)', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    // A turn between dequeue and stream registration: token held, agent idle.
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, object> }).activeTurnTokens;
+    tokens.set('agent', {});
+    try {
+      const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+      assert.equal(status.drained, false);
+      assert.deepEqual(status.unabandonable, ['agent']);
+      const trace = traces.find((t) => t.type === 'host:quiesce') as { unabandonable?: string[] } | undefined;
+      assert.deepEqual(trace?.unabandonable, ['agent']);
+      assert.equal(membrane.calls.length, 0, 'nothing was cancelled or started');
+    } finally {
+      tokens.delete('agent');
+    }
+  });
+});
+
+test('a cancel that surfaces as a stream ERROR still settles as an operator abort', async () => {
+  // Some stream implementations report cancellation through the error
+  // branch rather than `aborted`; the quiesce_abandoned contract must hold
+  // on both: no exhausted accounting, lifecycle 'aborted', agent back idle.
+  class ErroringHangStream extends HangingStream {
+    override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+      await this.waitForCancel();
+      yield { type: 'error', error: new Error('stream cancelled') } as StreamEvent;
+    }
+  }
+  class ErroringMembrane extends MockMembrane {
+    override streamYielding(request: NormalizedRequest): YieldingStream {
+      this.calls.push(request);
+      return new ErroringHangStream();
+    }
+  }
+  const membrane = new ErroringMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('turn to start', () => membrane.calls.length === 1);
+    const status = await framework.quiesce({ timeoutMs: 1_000, abandon: true });
+    assert.equal(status.drained, true);
+    await waitFor('agent back to idle', () => framework.getAgent('agent')!.state.status === 'idle');
+    assert.ok(traces.some((t) => t.type === 'inference:aborted'
+      && (t as { reason?: string }).reason === 'quiesce_abandoned'));
+    assert.ok(!traces.some((t) => t.type === 'inference:exhausted'));
+    const lifecycle = traces
+      .filter((t) => String(t.type).includes('lifecycle'))
+      .map((t) => (t as { phase?: string }).phase);
+    if (lifecycle.length > 0) assert.ok(!lifecycle.includes('completed'), 'an abandoned turn is not "completed"');
   });
 });
 
@@ -510,12 +666,100 @@ test('a batch carrying a budget restart re-parks its sibling wakes instead of co
       source: 'framework',
       timestamp: Date.now(),
     });
-    // Drive one scheduler pass: the restart may start a turn, but the nudge
-    // must survive as a parked request rather than being consumed by it.
+    // Drive one scheduler pass: the restart starts its continuation turn, but
+    // the nudge must survive as a parked request rather than being consumed
+    // by it — exactly one provider call, and the survivor IS the nudge.
     await framework.runUntilIdle();
     await waitFor(
       'sibling wake re-parked',
       () => framework.getHostModeStatus().gatedRequests >= 1,
     );
+    assert.equal(membrane.calls.length, 1, 'only the restart ran');
+    const parked = (framework as unknown as { pendingRequests: Array<{ reason: string }> }).pendingRequests;
+    assert.ok(parked.some((r) => r.reason.startsWith('admin-nudge')), 'the parked survivor is the nudge');
+    assert.ok(!parked.some((r) => r.reason === 'context_budget_restart'), 'the restart was consumed');
+  });
+});
+
+test('resume flushes deferred writes per message: one poison write neither drops the rest nor skips the reopen', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    const traces: TraceEvent[] = [];
+    framework.onTrace((event) => traces.push(event));
+    await framework.quiesce({ reason: 'refold' });
+    const agent = framework.getAgent('agent')!;
+    const cm = agent.getContextManager();
+    const before = cm.getAllMessages().length;
+    const add = (framework as unknown as {
+      addMessage(participant: string, content: unknown[]): unknown;
+    }).addMessage.bind(framework);
+    add('user', [{ type: 'text', text: 'first' }]);
+    add('user', [{ type: 'text', text: 'poison' }]);
+    add('user', [{ type: 'text', text: 'third' }]);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 3);
+
+    const realAdd = cm.addMessage.bind(cm);
+    (cm as unknown as { addMessage: typeof cm.addMessage }).addMessage = ((participant, content, metadata, causedBy) => {
+      const text = (content[0] as { text?: string }).text;
+      if (text === 'poison') throw new Error('store write failed');
+      return realAdd(participant, content, metadata, causedBy);
+    }) as typeof cm.addMessage;
+
+    const status = await framework.resume();
+    assert.equal(status.quiesced, false);
+    assert.equal(status.deferredWrites, 0, 'the queue is drained even though one write failed');
+    assert.deepEqual(
+      cm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text),
+      ['first', 'third'],
+      'the writes behind the poison one still landed',
+    );
+    assert.ok(traces.some((t) => t.type === 'host:resume'), 'resume completed its follow-through');
+  });
+});
+
+test('context writes deferred while quiesced survive a restart and land at resume', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'host-quiesce-deferred-'));
+  const storePath = join(dir, 'store');
+  const config = () => ({
+    storePath,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  let framework = await AgentFramework.create(config());
+  try {
+    await framework.quiesce({ reason: 'surgery' });
+    const before = framework.getAgent('agent')!.getContextManager().getAllMessages().length;
+    (framework as unknown as { addMessage(p: string, c: unknown[]): unknown })
+      .addMessage('user', [{ type: 'text', text: 'said during surgery' }]);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1);
+    await framework.stop(); // crash-equivalent: the queue was in memory
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().quiesced, true);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 1, 'restored from the store');
+    await framework.resume();
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const texts = cm.getAllMessages().slice(before).map((m) => (m.content[0] as { text: string }).text);
+    assert.deepEqual(texts, ['said during surgery']);
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0);
+    await framework.stop();
+
+    framework = await AgentFramework.create(config());
+    assert.equal(framework.getHostModeStatus().deferredWrites, 0, 'slot cleared after the flush');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nudge while quiesced says so', async () => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    const r = framework.nudgeAgent('agent', 'operator');
+    assert.equal(r.ok, true);
+    assert.equal(r.quiesced, true);
+    assert.equal(framework.getHostModeStatus().gatedRequests, 1);
   });
 });

@@ -438,6 +438,8 @@ export type TraceEvent =
       activeTurns: number;
       /** True when undrained turns were force-cancelled (abandon). */
       abandoned?: boolean;
+      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      unabandonable?: string[];
     })
   | (TraceEventBase & {
       type: 'host:resume';
