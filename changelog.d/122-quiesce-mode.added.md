@@ -72,3 +72,12 @@
   instead of minting a second replayable one. Two more real child-process
   crash regressions: exit between an ordinary turn-start flush's sync and
   its queue rewrite, and exit at a re-deferral's recovery-file write.
+- Review round 5: deferred-write entries carry a monotonic `seq` from first
+  deferral; the durable queue is written, restored, drained and flushed in
+  that order whatever the pending/un-acked split, so a re-deferred member
+  of a batch keeps its place. Each hand-off persists a receipt of the
+  target's store position before anything is written; boot dedup scans from
+  that position to the tail (the whole store when a receipt predates it),
+  never a fixed 2,000-message tail — a synced-but-unacked batch of any size
+  is recognised in full. Recovery file/slot format is v2
+  (`{pending, scanFrom}`); v1 is still read.

@@ -51,6 +51,8 @@ function puppetHarness(opts?: {
   // Flushed-but-unsynced deferred writes (durable-queue ack bookkeeping);
   // a prototype-built harness must seed it like the constructor does.
   fw.unackedDeferredWrites = [];
+  fw.deferredSeq = 0;
+  fw.deferredScanFrom = new Map();
   fw.pendingAssistantBlocks = new Map();
   fw.primaryAgentName = 'princess';
   // Cross-turn writer path (what a channel message goes through): defers

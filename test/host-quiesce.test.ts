@@ -917,8 +917,10 @@ const CRASH_SCENARIOS = [
     expect: ['ACKED-BUT-NOT-SYNCED', 'STILL-PENDING'], bootQuiesced: true },
   { mode: 'turn-start-ack', label: "after an ORDINARY turn-start flush's sync but before its queue rewrite",
     expect: ['ONCE-ONLY'], bootQuiesced: false },
-  { mode: 'redefer', label: "at the recovery-file write of a re-deferral (abandoned turn's teardown while quiesced)",
-    expect: ['REDEFER-ONCE'], bootQuiesced: true },
+  { mode: 'redefer', label: "at the first re-deferral write of a two-message batch (abandoned turn's teardown while quiesced)",
+    expect: ['REDEFER-FIRST', 'REDEFER-SECOND'], bootQuiesced: true },
+  { mode: 'big-batch', label: 'after a 2,101-message resume batch was synced but before it was acked',
+    expect: Array.from({ length: 2_101 }, (_, i) => `BIG-${i}`), bootQuiesced: true },
 ] as const;
 
 for (const scenario of CRASH_SCENARIOS) {

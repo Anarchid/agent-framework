@@ -408,6 +408,17 @@ const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
  *  where such a turn must be allowed to finish, and parking them would hold
  *  the token until the drain timed out (and `abandon` could not clear a turn
  *  with no stream). */
+/** One entry of the deferred-write queue (see AgentFramework.deferredMessages). */
+interface DeferredWrite {
+  id: string;
+  seq: number;
+  participant: string;
+  content: ContentBlock[];
+  metadata?: MessageMetadata;
+  forAgent?: string;
+}
+const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
+
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
@@ -1031,11 +1042,24 @@ export class AgentFramework {
    * persists the slot-chain head only on sync(), so acknowledging on append
    * alone would let a hard exit forget an accepted message.
    */
-  private unackedDeferredWrites: Array<{ id: string; participant: string; content: ContentBlock[]; metadata?: MessageMetadata; forAgent?: string }> = [];
+  private unackedDeferredWrites: DeferredWrite[] = [];
+  /** Monotonic order stamp for deferred writes: the durable queue is always
+   *  written, restored, drained and flushed in `seq` order, whatever the
+   *  pending/un-acked split — a re-deferred entry keeps its place. */
+  private deferredSeq = 0;
+  /**
+   * Per target agent: the store's message count when the OLDEST currently
+   * un-acked entry for it was handed off. Persisted with the queue so a boot
+   * after an interrupted flush knows exactly which slot range the batch
+   * could occupy and dedups against all of it — never a fixed tail.
+   */
+  private deferredScanFrom = new Map<string, number>();
   private deferredMessages: Array<{
     /** Durable identity for per-message flush acknowledgement: a flush
      *  interrupted by a crash replays only the messages not yet acked. */
     id: string;
+    /** Order stamp (see deferredSeq). */
+    seq: number;
     participant: string;
     content: ContentBlock[];
     metadata?: MessageMetadata;
@@ -2820,8 +2844,9 @@ export class AgentFramework {
     // set. The DURABLE queue (pending + un-acked) is unchanged by this, so a
     // crash anywhere below replays the whole batch, and the deferredWriteId
     // stamped on each stored message lets boot skip the ones that did land.
+    flush.sort(bySeq);
     this.deferredMessages = keep;
-    this.unackedDeferredWrites.push(...flush);
+    this.handOffDeferredWrites(flush);
     let stored = 0;
     for (const msg of flush) {
       try {
@@ -2873,6 +2898,34 @@ export class AgentFramework {
       return;
     }
     this.unackedDeferredWrites = [];
+    this.deferredScanFrom.clear();
+    this.persistDeferredWrites();
+  }
+
+  /**
+   * Move drained entries into the un-acked set and record, per target
+   * agent, the store position they will be appended after — then persist
+   * that receipt BEFORE any of them is written. Boot recovery scans from the
+   * recorded position to the tail, so every member of an interrupted batch
+   * is visible to the dedup, however large the batch.
+   */
+  private handOffDeferredWrites(entries: DeferredWrite[]): void {
+    if (entries.length === 0) return;
+    const durable = this.deferredWritesPersisted || this.quiesced;
+    if (!durable) return; // memory-only deferrals: nothing to reconcile at boot
+    for (const entry of entries) {
+      const target = entry.forAgent ?? this.primaryAgentName;
+      const agent = target ? this.agents.get(target) : undefined;
+      if (!agent) continue;
+      let count = 0;
+      try {
+        const cm = agent.getContextManager() as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
+        count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+      } catch { count = 0; }
+      const prev = this.deferredScanFrom.get(target!);
+      this.deferredScanFrom.set(target!, prev === undefined ? count : Math.min(prev, count));
+    }
+    this.unackedDeferredWrites.push(...entries);
     this.persistDeferredWrites();
   }
 
@@ -2882,10 +2935,10 @@ export class AgentFramework {
    * tail blob-free — an interrupted flush is always within the last few
    * hundred slots — and tolerates facades without windowed reads.
    */
-  private landedDeferredWriteIds(ids: Set<string>): Set<string> {
+  private landedDeferredWriteIds(ids: Set<string>, scanFrom: Map<string, number>): Set<string> {
     const landed = new Set<string>();
     if (ids.size === 0) return landed;
-    const SCAN = 2_000;
+    const WINDOW = 500;
     for (const agent of this.agents.values()) {
       try {
         const cm = agent.getContextManager() as unknown as {
@@ -2894,17 +2947,21 @@ export class AgentFramework {
             { messages: Array<{ metadata?: Record<string, unknown> }> };
           getAllMessages: () => Array<{ metadata?: Record<string, unknown> }>;
         };
-        let messages: Array<{ metadata?: Record<string, unknown> }>;
-        if (typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function') {
-          const total = cm.getMessageCount();
-          const start = Math.max(0, total - SCAN);
-          messages = cm.getMessageWindow(start, total - start, { resolveBlobs: false }).messages;
-        } else {
-          messages = cm.getAllMessages();
-        }
-        for (const m of messages) {
+        const consider = (m: { metadata?: Record<string, unknown> }): void => {
           const id = m.metadata?.deferredWriteId;
           if (typeof id === 'string' && ids.has(id)) landed.add(id);
+        };
+        if (typeof cm.getMessageCount === 'function' && typeof cm.getMessageWindow === 'function') {
+          const total = cm.getMessageCount();
+          // From the receipt position (0 = whole store when unknown) to the
+          // tail, in blob-free windows — the batch can only be after it.
+          const from = Math.min(scanFrom.get(agent.name) ?? 0, total);
+          for (let start = from; start < total; start += WINDOW) {
+            const win = cm.getMessageWindow(start, Math.min(WINDOW, total - start), { resolveBlobs: false });
+            for (const m of win.messages) consider(m);
+          }
+        } else {
+          for (const m of cm.getAllMessages()) consider(m);
         }
       } catch (err) {
         console.error(`[host-mode] could not scan ${agent.name} for landed deferred writes:`, err);
@@ -2951,7 +3008,10 @@ export class AgentFramework {
     try {
       // The durable queue is everything not yet acked: writes still pending
       // AND writes handed to a context manager whose sync has not happened.
-      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages];
+      // Always in original deferral order, whatever the pending/un-acked
+      // split: a re-deferred entry must not jump the queue.
+      const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
+      const scanFrom = Object.fromEntries(this.deferredScanFrom);
       if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
         const payload = JSON.stringify(durable);
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
@@ -2966,10 +3026,10 @@ export class AgentFramework {
           return;
         }
         if (this.deferredWritesPath) {
-          this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: durable });
+          this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
         } else {
           this.warnRecoveryFallbackOnce();
-          this.store.setStateJson(DEFERRED_WRITES_ID, durable);
+          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
         }
         this.deferredWritesPersisted = true;
       } else if (this.deferredWritesPersisted) {
@@ -2987,23 +3047,42 @@ export class AgentFramework {
 
   private restorePersistedDeferredWrites(): number {
     try {
-      let data: unknown;
+      let raw: unknown;
       if (this.deferredWritesPath && existsSync(this.deferredWritesPath)) {
-        const doc = this.readRecoveryFile(this.deferredWritesPath) as { pending?: unknown } | undefined;
-        data = doc?.pending;
+        raw = this.readRecoveryFile(this.deferredWritesPath);
       } else {
         // Stores that predate the recovery file (or store-only configs).
-        data = this.store.getStateJson(DEFERRED_WRITES_ID);
+        raw = this.store.getStateJson(DEFERRED_WRITES_ID);
       }
+      // v1 slot payloads were a bare array; v1/v2 files and v2 slots are
+      // `{ pending, scanFrom? }`.
+      const doc = Array.isArray(raw) ? { pending: raw } : (raw as { pending?: unknown; scanFrom?: unknown } | undefined);
+      const data = doc?.pending;
       if (!Array.isArray(data) || data.length === 0) return 0;
+      const scanFrom = new Map<string, number>();
+      if (doc?.scanFrom && typeof doc.scanFrom === 'object') {
+        for (const [k, v] of Object.entries(doc.scanFrom as Record<string, unknown>)) {
+          if (typeof v === 'number' && Number.isFinite(v)) scanFrom.set(k, Math.max(0, Math.floor(v)));
+        }
+      }
       const candidates = data
-        .filter((m): m is Omit<typeof this.deferredMessages[number], 'id'> & { id?: string } =>
+        .filter((m): m is Omit<DeferredWrite, 'id' | 'seq'> & { id?: string; seq?: number } =>
           !!m && typeof m === 'object' && typeof (m as { participant?: unknown }).participant === 'string'
             && Array.isArray((m as { content?: unknown }).content))
-        .map((m) => ({ ...m, id: typeof m.id === 'string' ? m.id : randomUUID() }));
+        .map((m, i) => ({
+          ...m,
+          id: typeof m.id === 'string' ? m.id : randomUUID(),
+          // Files that predate `seq` are in write order already.
+          seq: typeof m.seq === 'number' ? m.seq : i + 1,
+        }))
+        .sort(bySeq);
+      this.deferredSeq = Math.max(this.deferredSeq, ...candidates.map((m) => m.seq));
       // Exactly-once: a message that landed before its ack was written is
       // already in the store under its deferredWriteId — do not replay it.
-      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)));
+      // The scan covers every slot the interrupted batch could occupy (from
+      // the receipt's per-agent position), or the whole store when the
+      // receipt predates the position field.
+      const landed = this.landedDeferredWriteIds(new Set(candidates.map((m) => m.id)), scanFrom);
       const restored = candidates.filter((m) => !landed.has(m.id));
       if (landed.size > 0) {
         console.error(
@@ -9119,8 +9198,8 @@ export class AgentFramework {
         cm.addMessage('user', blocks);
       } else {
         this.deferredMessages.push(
-          { id: randomUUID(), participant: agentName, content: toolUse, forAgent: agentName },
-          { id: randomUUID(), participant: 'user', content: blocks, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: agentName, content: toolUse, forAgent: agentName },
+          { id: randomUUID(), seq: ++this.deferredSeq, participant: 'user', content: blocks, forAgent: agentName },
         );
       }
 
@@ -10415,10 +10494,13 @@ export class AgentFramework {
       // A re-deferral of a drained entry keeps its id and leaves the un-acked
       // set: one logical message, one durable identity — never two entries.
       const id = opts?.deferredWriteId ?? randomUUID();
+      let seq: number | undefined;
       if (opts?.deferredWriteId) {
+        const prior = this.unackedDeferredWrites.find((m) => m.id === id);
+        seq = prior?.seq;
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, participant, content, metadata, forAgent: opts?.forAgent });
+      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
@@ -10452,11 +10534,12 @@ export class AgentFramework {
       (target === agentName ? mine : rest).push(msg);
     }
     this.deferredMessages = rest;
+    mine.sort(bySeq);
     // The drained messages are about to be written by the caller; they stay
     // in the DURABLE queue (as un-acked) until the caller's
     // ackDeferredWrites() has synced the chronicle. Removing them here would
     // acknowledge before the write is durable.
-    if (this.deferredWritesPersisted || this.quiesced) this.unackedDeferredWrites.push(...mine);
+    this.handOffDeferredWrites(mine);
     return mine;
   }
 

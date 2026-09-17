@@ -15,9 +15,13 @@
  *                  release the token and drive an ORDINARY wake; exit after
  *                  the turn-start flush's ack synced the chronicle but
  *                  before it rewrote the recovery queue.
- *   redefer        hanging turn; quiesce({abandon}); defer REDEFER-ONCE while
- *                  quiesced; the abandonment teardown drains and re-defers it;
- *                  exit at that re-deferral's recovery-file write.
+ *   redefer        hanging turn; quiesce({abandon}); defer REDEFER-FIRST and
+ *                  REDEFER-SECOND while quiesced; the abandonment teardown
+ *                  drains and re-defers them; exit at the FIRST re-deferral's
+ *                  recovery-file write (queue split across un-acked/pending).
+ *   big-batch      quiesce; defer 2,101 small messages (larger than any fixed
+ *                  scan tail); sync; resume(); exit after the batch's
+ *                  chronicle sync but BEFORE the queue rewrite that acks it.
  *
  * argv[2] = store path.
  */
@@ -25,7 +29,7 @@ import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/
 import { AgentFramework } from '../../src/index.js';
 import { MockMembrane, createMockResponse } from './mock-membrane.js';
 
-const MODES = ['after-ack', 'before-sync', 'turn-start-ack', 'redefer'] as const;
+const MODES = ['after-ack', 'before-sync', 'turn-start-ack', 'redefer', 'big-batch'] as const;
 type Mode = typeof MODES[number];
 const [storePath, modeArg] = process.argv.slice(2);
 if (!storePath || !MODES.includes(modeArg as Mode)) {
@@ -81,6 +85,15 @@ const exitAfterNextPersist = (): void => {
     if (armed) { armed = false; process.exit(0); }
   };
 };
+/** Exit at the START of the n-th persist from now (before it rewrites anything). */
+const exitBeforePersist = (n: number): void => {
+  let seen = 0;
+  internals.persistDeferredWrites = () => {
+    seen++;
+    if (seen === n) process.exit(0);
+    realPersist();
+  };
+};
 
 if (mode === 'after-ack' || mode === 'before-sync') {
   await framework.quiesce({ reason: 'crash probe' });
@@ -127,11 +140,41 @@ if (mode === 'redefer') {
   await waitFor(() => membrane.calls.length === 1);
   const quiescing = framework.quiesce({ timeoutMs: 1_000, abandon: true });
   await waitFor(() => framework.getHostModeStatus().quiesced);
-  say('REDEFER-ONCE'); // deferred (quiesced) and persisted
-  if (framework.getHostModeStatus().deferredWrites !== 1) process.exit(3);
-  // The abandonment teardown drains it (→ un-acked), tries to write it,
-  // and — still quiesced — re-defers it. Exit at that recovery-file write.
-  exitAfterNextPersist();
+  say('REDEFER-FIRST'); // deferred (quiesced) and persisted
+  say('REDEFER-SECOND');
+  if (framework.getHostModeStatus().deferredWrites !== 2) process.exit(3);
+  // The abandonment teardown drains both (→ un-acked; the hand-off persists
+  // a receipt), tries to write them, and — still quiesced — re-defers each.
+  // Exit at the FIRST re-deferral's recovery-file write: at that instant
+  // FIRST is pending and SECOND still un-acked, the case that used to be
+  // written out of order.
+  // Exit right after the first recovery-file write made while the batch is
+  // SPLIT — one entry re-deferred (pending) while the other is still
+  // un-acked. That is the write whose order used to be wrong, whatever the
+  // number of persists that precede it.
+  const split = internals as unknown as { unackedDeferredWrites: unknown[]; deferredMessages: unknown[] };
+  internals.persistDeferredWrites = () => {
+    realPersist();
+    if (split.unackedDeferredWrites.length > 0 && split.deferredMessages.length > 0) process.exit(0);
+  };
   await quiescing;
   await new Promise(() => {});
+}
+
+if (mode === 'big-batch') {
+  const N = 2_101;
+  await framework.quiesce({ reason: 'crash probe' });
+  // Stage the queue without 2,101 growing rewrites of the recovery file.
+  internals.persistDeferredWrites = () => {};
+  for (let i = 0; i < N; i++) say(`BIG-${i}`);
+  internals.persistDeferredWrites = realPersist;
+  realPersist();
+  if (framework.getHostModeStatus().deferredWrites !== N) process.exit(3);
+  internals.store.sync();
+  // Resume flush: persist #1 = hand-off receipt (before any write),
+  // persist #2 = the ack after the batch's chronicle sync. Exit at the start
+  // of #2: everything is in the synced store, nothing is acked.
+  exitBeforePersist(2);
+  await framework.resume();
+  process.exit(4);
 }
