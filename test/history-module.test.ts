@@ -581,7 +581,12 @@ describe('HistoryModule', () => {
             if (spec === '#c1-label') return { channelId: 'c1' };
             // Unresolvable, but the resolver still offers a near-match
             // suggestion — exactly what a real ChannelRegistry miss returns.
-            return { error: `no channel matches "${spec}"`, candidates: ['#c1-label'] };
+            // The underlying error text deliberately mimics
+            // resolveProseTarget's SEND-flavored DM wording ("use the
+            // send_dm tool") — resolveChannel must not surface it verbatim
+            // (see the next test): a read-only history tool needs its own
+            // wording, not send-context advice.
+            return { error: `no registered DM found for "${spec}" — use the send_dm tool`, candidates: ['#c1-label'] };
           },
         } as unknown as ChannelRegistry,
       );
@@ -589,8 +594,26 @@ describe('HistoryModule', () => {
       const result = await h.handleToolCall(call('extract', { channelId: '#c1-labl' })); // typo
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
-      assert.match(result.error ?? '', /no channel matches/);
+      assert.match(result.error ?? '', /No channel history found/i);
       assert.match(result.error ?? '', /#c1-label/); // the suggestion made it into the error
+    });
+
+    it('never reuses the live resolver\'s send_dm-flavored error text — always uses read-only-tool wording (finding: DM error text)', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(
+        cm,
+        {
+          resolveProseTargetDurable(_spec: string) {
+            return { error: 'no registered DM found for "@ghost" — for someone without a registered DM channel, use the send_dm tool' };
+          },
+        } as unknown as ChannelRegistry,
+      );
+
+      const result = await h.handleToolCall(call('extract', { channelId: '@ghost' }));
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.doesNotMatch(result.error ?? '', /send_dm/, 'send-context advice must never leak into a read-only tool error');
     });
 
     it('a bare (non-#/@) unresolvable spec still passes through unchanged — the escape hatch is preserved for non-label-shaped input', async () => {

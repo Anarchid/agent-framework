@@ -59,6 +59,16 @@ function descriptor(id: string, label: string) {
   return { id, type: 'discord', label, direction: 'bidirectional' as const };
 }
 
+function dmDescriptor(id: string, label: string, recipientId?: string) {
+  return {
+    id,
+    type: 'discord',
+    label,
+    direction: 'bidirectional' as const,
+    metadata: { channelType: 'dm', ...(recipientId ? { recipientId } : {}) },
+  };
+}
+
 test('a label sighting persists across a simulated restart', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'channel-label-history-'));
   try {
@@ -311,4 +321,65 @@ test('a genuine label collision across two different channels reports ambiguity,
   const restarted = makeRegistry(store);
   const result = restarted.resolveProseTargetDurable('#shared');
   assert.ok('error' in result, `expected an ambiguity error, got ${JSON.stringify(result)}`);
+});
+
+test('a DM registered live resolves after a restart via @name, not just the literal stored label (DM-addressing regression)', async () => {
+  const { store } = memoryStore();
+  const first = makeRegistry(store);
+  await first.handleRegister('discord', {
+    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', '123456789')],
+  });
+
+  // Live check: '@antra' already resolves live, before any restart —
+  // establishes this is real DM-shaped addressing, not a coincidence.
+  assert.deepEqual(first.resolveProseTarget('@antra'), {
+    channelId: 'discord:dm:antra',
+    label: 'DM: antra',
+  });
+
+  // Simulated restart: fresh registry, live `channels` map starts empty —
+  // resolveProseTarget() alone can no longer see this DM at all.
+  const restarted = makeRegistry(store);
+  const liveMiss = restarted.resolveProseTarget('@antra');
+  assert.ok('error' in liveMiss, 'expected a live-path miss on a fresh registry');
+
+  // The durable fallback must still resolve '@antra' — normalizeChannelLabel
+  // alone (its previous only tool) has no '@'-handling at all, so this used
+  // to fail silently before falling through to resolveProseTarget's
+  // original (post-#8-fix: now HARD-thrown from HistoryModule) error.
+  assert.deepEqual(restarted.resolveProseTargetDurable('@antra'), {
+    channelId: 'discord:dm:antra',
+    label: 'DM: antra',
+  });
+});
+
+test('a DM registered live resolves after a restart via the <@id> mention form (recipientId persisted durably)', async () => {
+  const { store } = memoryStore();
+  const first = makeRegistry(store);
+  await first.handleRegister('discord', {
+    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', '123456789')],
+  });
+
+  const restarted = makeRegistry(store);
+  assert.ok('error' in restarted.resolveProseTarget('<@123456789>'), 'expected a live-path miss on a fresh registry');
+  assert.deepEqual(restarted.resolveProseTargetDurable('<@123456789>'), {
+    channelId: 'discord:dm:antra',
+    label: 'DM: antra',
+  });
+});
+
+test('a bare (non-DM-metadata) channel whose id merely contains ":dm:" is still DM-matched by @name after a restart', async () => {
+  // Exercises the id-shape half of isDmChannelId() independently of the
+  // 'DM: ' label-prefix half — a descriptor with no metadata.channelType
+  // at all, the way ensureChannelRegistered's lazy DM path (no server
+  // metadata yet) actually looks.
+  const { store } = memoryStore();
+  const first = makeRegistry(store);
+  first.ensureChannelRegistered('discord', 'discord:dm:5', 'DM: ghost');
+
+  const restarted = makeRegistry(store);
+  assert.deepEqual(restarted.resolveProseTargetDurable('@ghost'), {
+    channelId: 'discord:dm:5',
+    label: 'DM: ghost',
+  });
 });

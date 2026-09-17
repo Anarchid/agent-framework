@@ -85,6 +85,7 @@ interface OverviewInput {
   to?: string;
   channelId?: string;
   level?: number;
+  limit?: number;
 }
 
 // ============================================================================
@@ -114,13 +115,16 @@ const SEARCH_DEFAULT_MAX_SCAN = 5000;
 const SEARCH_MAX_MAX_SCAN = 50000;
 
 /**
- * Minimum gap size `overview` will bother probing with a `getChannelTokenStats`
- * call. Sub-second/empty seams between adjacent summaries (or between a
- * range bound and the nearest summary) are compression-log bookkeeping
- * noise, not a real unsummarized span — probing every one of them would add
- * native calls without adding anything useful to the response.
+ * `overview` response entry cap — unlike `stats`/`extract`/`search`, which
+ * all clamp their result sizes, `overview` had none: an unbounded call
+ * against a long-lived resident with thousands of minted summaries would
+ * return every overlapping summary's full `content` text inlined, with one
+ * `getChannelTokenStats` native call per entry, synchronously, with no
+ * limit — exactly the resource this tool exists to conserve. Default/max
+ * roughly match `extract`'s own scale.
  */
-const OVERVIEW_MIN_GAP_MS = 5_000;
+const OVERVIEW_DEFAULT_LIMIT = 50;
+const OVERVIEW_MAX_LIMIT = 200;
 
 /** Characters of surrounding context kept on each side of a search snippet. */
 const SNIPPET_CONTEXT_CHARS = 80;
@@ -181,13 +185,22 @@ export class HistoryModule implements Module {
    * depends on whether the spec actually looks like a label: `#general` or
    * `@name` (the syntax `resolveProseTarget` itself treats as unambiguously
    * label-shaped — see its own leading `#`/`@` handling) is very likely a
-   * typo, not a raw internal id, so a miss there throws the resolver's own
-   * error (with its `candidates` suggestions folded in) instead of quietly
+   * typo, not a raw internal id, so a miss there throws a clean tool error
+   * (with any `candidates` suggestions folded in) instead of quietly
    * treating the typo as an empty/nonexistent channel. Anything else is
    * passed through as an escape hatch — an agent can legitimately already
    * hold a raw channelId (e.g. echoed back by a prior
    * `stats`/`extract`/`search`/`overview` call), and erroring on that would
    * break working addressing to "fix" a spec that was never a label at all.
+   *
+   * The thrown message is deliberately NOT `resolved.error` verbatim:
+   * `resolveProseTargetDurable`'s underlying live resolver
+   * (`resolveProseTarget`) writes its error text for a SEND context (e.g.
+   * a DM miss says '...use the send_dm tool') — sensible advice when
+   * you're trying to deliver a message, nonsense advice from a read-only
+   * history tool. This module always uses its own read-only-appropriate
+   * wording instead, regardless of which branch of the live resolver
+   * produced the miss.
    */
   private resolveChannel(input: string | undefined): string | undefined {
     if (!input || !this.channelRegistry) return input;
@@ -195,7 +208,9 @@ export class HistoryModule implements Module {
     if (!('error' in resolved)) return resolved.channelId;
     if (input.startsWith('#') || input.startsWith('@')) {
       const suggestions = resolved.candidates?.length ? ` Did you mean: ${resolved.candidates.join(', ')}?` : '';
-      throw new Error(`Could not resolve channel "${input}": ${resolved.error}.${suggestions}`);
+      throw new Error(
+        `No channel history found for "${input}" — it may never have been seen by this resident, or predates this feature.${suggestions}`,
+      );
     }
     return input;
   }
@@ -303,7 +318,10 @@ export class HistoryModule implements Module {
           'kept entry\'s summary TEXT to that channel: compression doesn\'t chunk per-channel, so a ' +
           'summary may describe other channels\' traffic too. A wide or unbounded from/to can be expensive ' +
           'on a cold cache — same cost class as `stats`\'s tokenStatsForRange — since gap-filling still ' +
-          'walks the underlying message range wherever nothing has been summarized yet.',
+          'walks the underlying message range wherever nothing has been summarized yet. Response spans are ' +
+          'capped at `limit`, keeping the MOST RECENT spans and reporting truncated:true + totalSpans when ' +
+          'more exist — narrow the range or raise `limit` to see further back. `from` after `to` is rejected ' +
+          'with a clear error rather than silently returning no spans.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -317,6 +335,10 @@ export class HistoryModule implements Module {
                 'each span\'s own coarsest currently-available summary (a mix of levels across the response ' +
                 'is expected and normal), reduced so a folded summary\'s now-superseded child does not also ' +
                 'appear alongside a coarser entry that already covers its span.',
+            },
+            limit: {
+              type: 'number',
+              description: `Max spans to return, keeping the most recent (default ${OVERVIEW_DEFAULT_LIMIT}, hard cap ${OVERVIEW_MAX_LIMIT}). Must be a non-negative integer.`,
             },
           },
         },
@@ -601,6 +623,8 @@ export class HistoryModule implements Module {
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
+    assertOrderedRange(fromMs, toMs, input.from, input.to);
+    const limit = clampCount(input.limit, OVERVIEW_DEFAULT_LIMIT, OVERVIEW_MAX_LIMIT, 'limit');
     const cm = this.cm as ContextManager;
 
     let entries: TimeRangeSummaryEntry[];
@@ -631,6 +655,18 @@ export class HistoryModule implements Module {
       //     level) and its span fully contains this one — that entry
       //     already covers the same messages regardless of whether the
       //     parentId pointer chain between them survived intact.
+      //     EXCEPTION: a zero-width entry (e.startMs === e.endMs — a tiny
+      //     chunk that landed entirely within one millisecond) that merely
+      //     TOUCHES a coarser entry's boundary at exactly that one point
+      //     trivially satisfies "f.startMs <= e.startMs && f.endMs >=
+      //     e.endMs" without f actually being an ancestor — a genuinely
+      //     unrelated, later-starting/earlier-ending coarser summary can
+      //     coincidentally share one endpoint with it. A real (non-zero-
+      //     width) entry can't trigger this false positive: satisfying
+      //     containment on BOTH ends while only touching at one means f
+      //     must still genuinely extend past the entry's other, non-touching
+      //     side. A genuine same-point fold is still caught by the
+      //     immediate-parentId check above when the chain is intact.
       // O(n^2) in the fetched set size, which is fine at summary-archive
       // scale (bounded by how much has been compressed into this range, not
       // by raw message count).
@@ -638,7 +674,12 @@ export class HistoryModule implements Module {
       const idsInSet = new Set(all.map((e) => e.id));
       entries = all.filter((e) => {
         if (e.parentId && idsInSet.has(e.parentId)) return false;
-        return !all.some((f) => f.id !== e.id && f.level > e.level && f.startMs <= e.startMs && f.endMs >= e.endMs);
+        return !all.some((f) => {
+          if (f.id === e.id || f.level <= e.level) return false;
+          if (!(f.startMs <= e.startMs && f.endMs >= e.endMs)) return false;
+          if (e.startMs === e.endMs && (e.startMs === f.startMs || e.endMs === f.endMs)) return false;
+          return true;
+        });
       });
     }
     entries.sort((a, b) => a.startMs - b.startMs);
@@ -700,14 +741,23 @@ export class HistoryModule implements Module {
       // as if they were unsummarized — fabricating a phantom gap between
       // EVERY pair of adjacent summaries, even when they cover 100% of
       // traffic with zero real gap between them. Narrow to a half-open
-      // probe instead, and let the width check below run AFTER narrowing —
-      // a seam that looked wide pre-narrow can collapse to zero or go
-      // negative once both ends are pulled in by 1ms; the `>` comparison
-      // naturally skips both a trivial and a negative width, no separate
-      // guard needed.
+      // probe instead, and only skip the call when narrowing collapsed the
+      // width to zero or negative (`probeTo < probeFrom` — an entry that
+      // starts exactly where the previous one ended, or crosses it).
+      //
+      // Deliberately NO minimum-width threshold beyond that: an earlier
+      // version skipped any seam narrower than a fixed few seconds as
+      // "bookkeeping noise", but that check ran BEFORE the
+      // stats.totalMessages > 0 check below that actually decides whether
+      // real traffic exists — so a query window or a between-summaries
+      // seam narrower than the threshold silently reported entries:[] even
+      // when full of real messages (verified repro: 300 real messages,
+      // zero summaries, a 4-second window). The totalMessages > 0 check
+      // that follows is the one that's actually correct; nothing should
+      // gate the probe ahead of it.
       const probeFrom = cursorIsEntryBoundary ? cursor + 1 : cursor;
       const probeTo = entry.startMs - 1;
-      if (probeTo - probeFrom > OVERVIEW_MIN_GAP_MS) {
+      if (probeTo >= probeFrom) {
         const stats = cm.getChannelTokenStats({ fromMs: probeFrom, toMs: probeTo });
         if (stats.totalMessages > 0) gaps.push({ startMs: probeFrom, endMs: probeTo, summarized: false, stats });
       }
@@ -718,9 +768,10 @@ export class HistoryModule implements Module {
       // Trailing gap: rangeEnd is either the caller's own inclusive `to`
       // bound or Date.now() — never a summary boundary — so only the LOWER
       // end gets the half-open nudge (same reasoning as inside the loop).
+      // Same no-threshold reasoning as above.
       const probeFrom = cursorIsEntryBoundary ? cursor + 1 : cursor;
       const probeTo = rangeEnd;
-      if (probeTo - probeFrom > OVERVIEW_MIN_GAP_MS) {
+      if (probeTo >= probeFrom) {
         const stats = cm.getChannelTokenStats({ fromMs: probeFrom, toMs: probeTo });
         if (stats.totalMessages > 0) gaps.push({ startMs: probeFrom, endMs: probeTo, summarized: false, stats });
       }
@@ -736,6 +787,16 @@ export class HistoryModule implements Module {
       ? merged.filter((e) => e.stats.byChannel.some((c) => c.channelId === channelId))
       : merged;
 
+    // Cap the final entry list — mirrors search's truncated:true contract.
+    // Keeps the MOST RECENT `limit` spans when the cap is hit (a browse
+    // tool defaulting to "what's happened lately" should keep the tail, not
+    // silently cut off at the oldest end) while the survivors stay in their
+    // own chronological (oldest-first) order within the response, matching
+    // extract's/search's own ordering convention.
+    const totalSpans = filtered.length;
+    const truncated = totalSpans > limit;
+    const capped = truncated ? filtered.slice(-limit) : filtered;
+
     return {
       success: true,
       data: {
@@ -750,7 +811,9 @@ export class HistoryModule implements Module {
         // case, distinctly named so it can't be mistaken for a uniform
         // per-entry level.
         ...(input.level !== undefined ? { level: input.level } : { maxLevelAvailable: cm.getMaxSummaryLevel() }),
-        entries: filtered.map((e) => {
+        truncated,
+        totalSpans,
+        entries: capped.map((e) => {
           // When channelId narrows the response, the numbers an agent will
           // actually reason over (messageCount/tokensEstimate) are scoped
           // to THAT channel — not the whole span, which can otherwise
@@ -793,6 +856,19 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
     throw new Error(`Invalid ISO 8601 date for "${field}": ${JSON.stringify(value)}`);
   }
   return ms;
+}
+
+/**
+ * Reject an inverted range (`from` after `to`) with a clear error instead of
+ * silently matching nothing. Used by `overview`, where "found nothing" is
+ * reported as `entries: []` — the same shape a caller sees for a genuinely
+ * quiet span — so a simple from/to mixup should never be allowed to look
+ * like "you have no history here" instead of the input mistake it is.
+ */
+function assertOrderedRange(fromMs: number | undefined, toMs: number | undefined, fromRaw: string | undefined, toRaw: string | undefined): void {
+  if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) {
+    throw new Error(`"from" (${fromRaw}) must not be after "to" (${toRaw}).`);
+  }
 }
 
 /**

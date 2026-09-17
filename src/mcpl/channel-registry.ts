@@ -115,6 +115,20 @@ interface ChannelLabelSightingEvent {
   channelId: string;
   label: string;
   ts: number;
+  /** DM recipient id (e.g. a Discord snowflake), when the descriptor's
+   *  metadata carried one — persisted so a `<@id>` mention form can still
+   *  resolve a DM's channelId after a restart, the same way
+   *  `resolveProseTarget()`'s live `dmMeta().recipientId` matching does. */
+  recipientId?: string;
+}
+
+/** Extract a DM's recipientId from a descriptor's metadata, if present —
+ *  mirrors `resolveProseTarget()`'s own local `dmMeta()` read. Used to
+ *  durably persist the id alongside a label sighting (see
+ *  `ChannelLabelSightingEvent.recipientId`). */
+function extractRecipientId(metadata: Record<string, unknown> | undefined): string | undefined {
+  const id = metadata?.recipientId;
+  return typeof id === 'string' ? id : undefined;
 }
 
 /**
@@ -523,6 +537,14 @@ export class ChannelRegistry {
    */
   private allLabelsSeen = new Map<string, Set<string>>();
 
+  /**
+   * DM recipientId per channelId, durably replayed alongside `labelHistory`
+   * — the piece a `<@id>` mention-form lookup needs that `allLabelsSeen`'s
+   * label strings alone can't provide. See `resolveLabelFromHistory()`'s
+   * DM-aware arm.
+   */
+  private dmRecipientIds = new Map<string, string>();
+
   /** Most recent incoming channel ID — used for speech routing / default publish. */
   private defaultPublishChannel: string | null = null;
 
@@ -626,7 +648,7 @@ export class ChannelRegistry {
         descriptor: channel,
         open: false,
       });
-      this.appendLabelSighting(channel.id, channel.label);
+      this.appendLabelSighting(channel.id, channel.label, extractRecipientId(channel.metadata));
       registeredIds.push(channel.id);
       results.push({ id: channel.id, accepted: true });
     }
@@ -696,7 +718,7 @@ export class ChannelRegistry {
           continue;
         }
         existing.descriptor = channel;
-        this.appendLabelSighting(channel.id, channel.label);
+        this.appendLabelSighting(channel.id, channel.label, extractRecipientId(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
       }
     }
@@ -716,7 +738,7 @@ export class ChannelRegistry {
           descriptor: channel,
           open: false,
         });
-        this.appendLabelSighting(channel.id, channel.label);
+        this.appendLabelSighting(channel.id, channel.label, extractRecipientId(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
         accepted.push(channel);
       }
@@ -904,7 +926,11 @@ export class ChannelRegistry {
           existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
         }
         // The channel now has a real label, not just the bare id — durable.
-        this.appendLabelSighting(existing.descriptor.id, existing.descriptor.label);
+        this.appendLabelSighting(
+          existing.descriptor.id,
+          existing.descriptor.label,
+          extractRecipientId(existing.descriptor.metadata),
+        );
       }
       return;
     }
@@ -933,7 +959,7 @@ export class ChannelRegistry {
     // descriptor above still carries the placeholder for in-process
     // routing; only the durable write is skipped when there's no real
     // label to record.
-    if (label) this.appendLabelSighting(channelId, label);
+    if (label) this.appendLabelSighting(channelId, label, extractRecipientId(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1346,19 +1372,26 @@ export class ChannelRegistry {
         this.allLabelsSeen.set(event.channelId, seen);
       }
       seen.add(event.label);
+      if (typeof event.recipientId === 'string' && event.recipientId) {
+        this.dmRecipientIds.set(event.channelId, event.recipientId);
+      }
     }
   }
 
   /**
-   * Record that `channelId` was most recently seen with `label`. Called from
-   * every place a `ChannelDescriptor` is set into the live `channels` map
+   * Record that `channelId` was most recently seen with `label` (and,
+   * optionally, a DM `recipientId`). Called from every place a
+   * `ChannelDescriptor` is set into the live `channels` map
    * (`handleRegister`, `handleChanged`'s update/add branches,
    * `ensureChannelRegistered`) so the label survives disconnect and restart
    * for `resolveLabelFromHistory()` / `resolveProseTargetDurable()`.
    *
    * Guarded like `setDesiredState()`: a reconnect or re-registration that
-   * reports the same label as last time is a no-op, so the append log
-   * doesn't grow without bound on every boot/resubscribe.
+   * reports the same label AND recipientId as last time is a no-op, so the
+   * append log doesn't grow without bound on every boot/resubscribe — but a
+   * later call that newly supplies a recipientId for an already-known label
+   * (label unchanged) still records, since that's genuinely new durable
+   * information, not a no-op resighting.
    *
    * `label` is `string | undefined` (not just `string`) even though
    * `ChannelDescriptor.label` is typed `string`: that typing is a
@@ -1370,7 +1403,7 @@ export class ChannelRegistry {
    * `HistoryModule` tool call passes through unguarded via
    * `resolveProseTargetDurable()`.
    */
-  private appendLabelSighting(channelId: string, label: string | undefined): void {
+  private appendLabelSighting(channelId: string, label: string | undefined, recipientId?: string): void {
     if (typeof label !== 'string' || !label) return;
     // Never let a bare-id placeholder (ensureChannelRegistered's fallback
     // `label ?? channelId` when no real label was ever supplied — e.g. a
@@ -1383,7 +1416,9 @@ export class ChannelRegistry {
     // ensureChannelRegistered's own guard, which should stop this before
     // it ever gets here — see there for the primary fix.)
     if (label === channelId && this.labelHistory.has(channelId)) return;
-    if (this.labelHistory.get(channelId) === label) return;
+    const labelUnchanged = this.labelHistory.get(channelId) === label;
+    const recipientIdUnchanged = recipientId === undefined || recipientId === this.dmRecipientIds.get(channelId);
+    if (labelUnchanged && recipientIdUnchanged) return;
     this.labelHistory.set(channelId, label);
     let seen = this.allLabelsSeen.get(channelId);
     if (!seen) {
@@ -1391,10 +1426,12 @@ export class ChannelRegistry {
       this.allLabelsSeen.set(channelId, seen);
     }
     seen.add(label);
+    if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
     this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
       channelId,
       label,
       ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
     } satisfies ChannelLabelSightingEvent);
   }
 
@@ -1429,6 +1466,19 @@ export class ChannelRegistry {
     // Fast path: spec is already a channelId we have label history for.
     if (this.labelHistory.has(trimmed)) return trimmed;
 
+    // DM-aware arm, mirroring resolveProseTarget()'s own `@name` / `<@id>`
+    // handling (see there) — but over durable history instead of the live
+    // `channels` map, so a disconnected/post-restart DM stays addressable
+    // by the natural forms an agent would type, not just the exact stored
+    // label string. Tried BEFORE the generic byLabel/byName loop below
+    // because a bare `@antra` would otherwise also partially match via
+    // normalizeChannelLabel's '#'-only stripping (which does nothing for a
+    // leading '@') and fail confusingly instead of going through DM rules.
+    const mention = /^<@!?(\d+)>$/.exec(trimmed);
+    if (trimmed.startsWith('@') || mention) {
+      return this.resolveDmFromHistory(trimmed, mention);
+    }
+
     const normSpec = normalizeChannelLabel(trimmed);
     let byLabel: string | undefined;
     let byLabelAmbiguous = false;
@@ -1462,6 +1512,67 @@ export class ChannelRegistry {
   }
 
   /**
+   * A channel counts as a DM (for the purposes of durable-history lookup)
+   * if EITHER its id shape says so, or any label it has ever carried says
+   * so — approximating `resolveProseTarget()`'s live `isDmEntry()`, which
+   * additionally checks `descriptor.metadata.channelType === 'dm'`. That
+   * metadata field isn't part of what's durably persisted (only the label
+   * and, now, recipientId are — see `ChannelLabelSightingEvent`), so this
+   * is intentionally a slightly coarser approximation; the two signals it
+   * DOES check cover the real-world cases (id containing `:dm:`, or a
+   * `DM: ` label prefix) that this codebase's own descriptors actually use.
+   */
+  private isDmChannelId(channelId: string): boolean {
+    if (channelId.includes(':dm:')) return true;
+    const labels = this.allLabelsSeen.get(channelId);
+    if (!labels) return false;
+    for (const label of labels) {
+      if (label.toLowerCase().startsWith('dm: ')) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Durable-history counterpart to `resolveProseTarget()`'s DM-matching arm
+   * (see there for the live version this mirrors). Handles the two forms
+   * `resolveProseTarget()` supports: a `<@id>` mention (matched against
+   * `dmRecipientIds`, persisted alongside a label sighting specifically for
+   * this) and a bare `@name` (matched against the `DM: `-stripped form of
+   * each DM channel's CURRENT label in `labelHistory` — historical DM
+   * labels aren't name-matched here the way non-DM labels are in
+   * `resolveLabelFromHistory`'s main loop, since a DM's label is a person's
+   * name, not a channel name subject to the same kind of rename).
+   *
+   * Returns undefined on no-match OR ambiguity, same contract as
+   * `resolveLabelFromHistory` — the caller falls back to the live
+   * resolver's original error.
+   */
+  private resolveDmFromHistory(trimmed: string, mention: RegExpExecArray | null): string | undefined {
+    const dmChannelIds = [...this.allLabelsSeen.keys()].filter((id) => this.isDmChannelId(id));
+
+    if (mention) {
+      const id = mention[1]!;
+      const matches = dmChannelIds.filter((cid) => this.dmRecipientIds.get(cid) === id);
+      return matches.length === 1 ? matches[0] : undefined;
+    }
+
+    const name = trimmed.slice(1).toLowerCase();
+    const dmName = (channelId: string): string => {
+      const label = (this.labelHistory.get(channelId) ?? '').toLowerCase();
+      return label.startsWith('dm: ') ? label.slice(4) : label;
+    };
+    const exact = dmChannelIds.filter((cid) => dmName(cid) === name);
+    const pool =
+      exact.length > 0
+        ? exact
+        : dmChannelIds.filter((cid) => {
+            const n = dmName(cid);
+            return n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name));
+          });
+    return pool.length === 1 ? pool[0] : undefined;
+  }
+
+  /**
    * Durable-history-aware counterpart to `resolveProseTarget()`. Resolves a
    * label or channelId to a canonical channel id even for a channel the bot
    * is not currently connected to (browsing message history is exactly the
@@ -1473,6 +1584,17 @@ export class ChannelRegistry {
    * miss. If history has no answer either, the original error/candidates
    * from `resolveProseTarget()` are returned unchanged, so callers keep the
    * same debuggability they'd get from the live-only path.
+   *
+   * CAVEAT (prose-misdelivery safety): if two channels once shared a label
+   * but only ONE of them ever got a durable label-history record (e.g. the
+   * other was lazily registered label-less, or predates this feature), this
+   * can return a single confident answer where `resolveProseTarget()` on
+   * fuller live data would have said "ambiguous" — the durable fallback
+   * only sees what was actually persisted, not what's structurally true.
+   * This is harmless for the current sole caller
+   * (`HistoryModule.resolveChannel`, read-only), but a future caller wiring
+   * this into a SEND path should be aware the ambiguity guarantee is weaker
+   * here than on the live path.
    */
   resolveProseTargetDurable(
     spec: string,

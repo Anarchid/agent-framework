@@ -446,6 +446,160 @@ describe('HistoryModule.overview', () => {
     assert.equal(data.entries[0]!.level, 3);
   });
 
+  it('a query window narrower than the old (now-removed) width threshold still finds real messages within it (finding #1 completeness)', async () => {
+    const { cm } = buildStub({
+      summaries: [],
+      messages: [
+        { ms: 500, channelId: 'c1', tokens: 5 },
+        { ms: 1500, channelId: 'c1', tokens: 5 },
+        { ms: 2500, channelId: 'c1', tokens: 5 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    // 3-second window — narrower than the old (now-removed) 5-second gate.
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(0).toISOString(), to: new Date(3000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+    assert.equal(data.entries.length, 1, `expected the 3 messages to surface as one gap entry, got ${JSON.stringify(data.entries)}`);
+    assert.equal(data.entries[0]!.summarized, false);
+    assert.equal(data.entries[0]!.messageCount, 3);
+  });
+
+  it('a narrow (<5s) seam between two summaries with real messages in it is found, not silently dropped (finding #1 completeness)', async () => {
+    const s1 = summary('s1', 1, 1000, 1500, 'first chapter');
+    const s2 = summary('s2', 1, 4000, 4500, 'second chapter');
+    const { cm } = buildStub({
+      summaries: [s1, s2],
+      messages: [
+        { ms: 1200, channelId: 'c1', tokens: 5 },
+        { ms: 2500, channelId: 'c1', tokens: 5 }, // sits in the ~2.5s seam between s1 and s2
+        { ms: 4200, channelId: 'c1', tokens: 5 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(1000).toISOString(), to: new Date(4500).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+    assert.equal(data.entries.length, 3, `expected s1, the seam gap, and s2, got ${JSON.stringify(data.entries)}`);
+    assert.equal(data.entries[0]!.summarized, true);
+    assert.equal(data.entries[1]!.summarized, false);
+    assert.equal(data.entries[1]!.messageCount, 1);
+    assert.equal(data.entries[2]!.summarized, true);
+  });
+
+  it('an inverted from > to range is rejected with a clear error instead of silently returning empty', async () => {
+    const { cm } = buildStub({ summaries: [], messages: [] });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(5000).toISOString(), to: new Date(1000).toISOString() }),
+    );
+    assert.equal(result.success, false);
+    assert.equal(result.isError, true);
+    assert.match(result.error ?? '', /must not be after/);
+  });
+
+  it('caps the entry list at an explicit `limit`, keeping the most recent spans and signaling truncated/totalSpans (no-cap finding)', async () => {
+    const summaries = Array.from({ length: 5 }, (_, i) =>
+      summary(`s${i}`, 1, 1000 + i * 10_000, 1000 + i * 10_000 + 100, `chapter ${i}`),
+    );
+    const { cm } = buildStub({ summaries, messages: [] });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', {
+        from: new Date(0).toISOString(),
+        to: new Date(1000 + 4 * 10_000 + 100).toISOString(),
+        limit: 2,
+      }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[]; truncated: boolean; totalSpans: number };
+    assert.equal(data.truncated, true);
+    assert.equal(data.totalSpans, 5);
+    assert.equal(data.entries.length, 2);
+    // Most recent 2 of the 5 chapters (indices 3 and 4), still in
+    // chronological order within the (capped) response.
+    assert.equal(data.entries[0]!.content, 'chapter 3');
+    assert.equal(data.entries[1]!.content, 'chapter 4');
+  });
+
+  it('caps at the DEFAULT limit (50) when more entries exist than that, with no explicit limit param (no-cap finding)', async () => {
+    const summaries = Array.from({ length: 55 }, (_, i) =>
+      summary(`s${i}`, 1, i * 10_000, i * 10_000 + 100, `chapter ${i}`),
+    );
+    const { cm } = buildStub({ summaries, messages: [] });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(0).toISOString(), to: new Date(55 * 10_000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[]; truncated: boolean; totalSpans: number };
+    assert.equal(data.totalSpans, 55);
+    assert.equal(data.truncated, true);
+    assert.equal(data.entries.length, 50);
+    assert.equal(data.entries[0]!.content, 'chapter 5');
+    assert.equal(data.entries[49]!.content, 'chapter 54');
+  });
+
+  it('a zero-width entry sharing exactly one boundary millisecond with an unrelated coarser entry survives (containment false-positive finding)', async () => {
+    // L1 is a tiny (zero-width) chunk landing entirely at ms=2000. L2 is a
+    // completely UNRELATED, later, coarser summary that happens to start at
+    // exactly the same millisecond — not L1's parent or ancestor.
+    const l1 = summary('L1', 1, 2000, 2000, 'zero-width chunk');
+    const l2 = summary('L2', 2, 2000, 5000, 'unrelated later chapter');
+    const { cm } = buildStub({
+      summaries: [l1, l2],
+      messages: [{ ms: 2000, channelId: 'c1', tokens: 5 }],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(2000).toISOString(), to: new Date(5000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+    const contents = data.entries.map((e) => e.content).sort();
+    assert.deepEqual(contents, ['unrelated later chapter', 'zero-width chunk']);
+  });
+
+  it('a message sitting exactly at an explicit `from` bound is not skipped by the half-open nudge (leading-gap, non-anchor case)', async () => {
+    const s1 = summary('s1', 1, 10_000, 11_000, 'later chapter');
+    const { cm } = buildStub({
+      summaries: [s1],
+      // This message sits EXACTLY at the caller-supplied `from` — the
+      // cursorIsEntryBoundary===false path (fromMs actually supplied, not
+      // the earliest-message-anchor case) must probe it inclusively, not
+      // nudge it away the way an interior/trailing gap's cursor is nudged.
+      messages: [{ ms: 5000, channelId: 'c1', tokens: 5 }],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(5000).toISOString(), to: new Date(11_000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+    assert.equal(data.entries.length, 2, `expected the leading gap AND the summary, got ${JSON.stringify(data.entries)}`);
+    assert.equal(data.entries[0]!.summarized, false);
+    assert.equal(data.entries[0]!.messageCount, 1);
+    assert.equal(data.entries[0]!.from, new Date(5000).toISOString());
+  });
+
   it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
     const cm = {
       getSummariesInRange() {
