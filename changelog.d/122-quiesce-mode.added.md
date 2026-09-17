@@ -19,3 +19,22 @@
   throws `BudgetPreflightError` when the folded floor cannot fit (paced
   descents, increases, no-op rewrites and boot restore are never blocked;
   `allowInfeasible` overrides).
+- Review hardening of the above: `resume()` flushes deferred writes per
+  message (a poison write cannot drop the rest or skip the data-plane
+  reopen, which now runs in a `finally`); writes deferred while quiesced are
+  persisted (`framework/deferred-writes` slot) and restored at a quiesced
+  boot (`HostModeStatus.deferredWrites`); parked wakes coalesce per
+  (reason, addressed) so a DM/mention parked earlier survives ambient
+  traffic parked later; the `[1s, 10m]` drain clamp lives in `quiesce()` for
+  every ingress; a `quiesce()` superseded by a concurrent `resume()` returns
+  without abandoning anything; `resume()` waits for an in-flight maintenance
+  pass instead of skipping the feasibility verdict; `abandon` reports turns
+  it cannot cancel (`unabandonable`); `tool_results_ready` continuations pass
+  the wake gate like budget restarts; `maintenanceTick()` returns `ran`;
+  `nudge`/`unstick` replies carry `quiesced: true` while parked. ApiServer:
+  WebSocket upgrades from foreign browser origins are refused
+  (`ApiServerConfig.allowedOrigins`; same-host and non-browser clients pass),
+  an empty `adminToken` is rejected at construction, `GET /hostmode` requires
+  the token when one is configured, and `host-command` on the MCPL control
+  plane means a surface `/undo` can now run ahead of pushes still buffered
+  behind a startup/reconnect barrier.
