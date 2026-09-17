@@ -6196,7 +6196,9 @@ export class AgentFramework {
       // A live surgery (rollback/suppress) holds the whole store: no turn may
       // start for ANY agent — including one registered after the reservation's
       // token snapshot — until the switch has landed or been rolled back.
-      const surgeryHeld = this.surgeryHold !== null;
+      // Truthiness, not `!== null`: prototype-built harnesses (and any field
+      // added later) leave the slot undefined, which must read as "not held".
+      const surgeryHeld = !!this.surgeryHold;
       if (surgeryHeld || providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
