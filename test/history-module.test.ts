@@ -287,6 +287,46 @@ describe('HistoryModule', () => {
       assert.deepEqual(data.matches.map((m) => m.id), ['m1']);
     });
 
+    it('forcibly terminates a catastrophically-backtracking (ReDoS) regex instead of hanging', async () => {
+      // Reviewer's repro: 32 'a's followed by a non-matching character, plus
+      // a classic exponential-backtracking pattern. `(a+)+$` against this
+      // input backtracks exponentially and (verified separately in an
+      // isolated child process) has to be force-killed after several
+      // seconds; the equivalent linear pattern `^a+$` returns instantly.
+      // This must never block the framework's single event loop — matching
+      // has to happen off-thread with a real, forcible deadline.
+      const evil = 'a'.repeat(32) + '!';
+      const { cm } = buildStub([msg('r1', 1000, 'User', [textBlock(evil)], 'c1')]);
+      const h = new HistoryModule();
+      h.bind(cm);
+
+      const start = Date.now();
+      const result = await h.handleToolCall(call('search', { query: '(a+)+$', regex: true, maxScan: 1 }));
+      const elapsed = Date.now() - start;
+
+      // Returns well within a bounded time (module deadline is 2s; generous
+      // slack here for worker spawn/CI jitter) — proves the test runner
+      // itself never hung waiting on this call.
+      assert.ok(elapsed < 8000, `search took ${elapsed}ms — should have been forcibly terminated near the deadline`);
+      // A cut-short match MUST be a clean, unambiguous failure, never
+      // success:true with an empty matches array — that would be
+      // indistinguishable from "no matches found", which is a lie.
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.match(result.error ?? '', /timed out/i);
+    });
+
+    it('a normal regex against the same kind of input still matches correctly (worker path is not just failing everything)', async () => {
+      const { cm } = buildStub([msg('r1', 1000, 'User', [textBlock('aaaa!')], 'c1')]);
+      const h = new HistoryModule();
+      h.bind(cm);
+
+      const result = await h.handleToolCall(call('search', { query: '^a+!$', regex: true }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { matches: Array<{ id: string }> };
+      assert.deepEqual(data.matches.map((m) => m.id), ['r1']);
+    });
+
     it('returns a clean error for an invalid regex instead of throwing', async () => {
       const { cm } = buildStub(FIXTURE);
       const h = new HistoryModule();
@@ -332,6 +372,85 @@ describe('HistoryModule', () => {
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
       assert.match(result.error ?? '', /Chronicle history index unsupported/);
+    });
+  });
+
+  describe('pagination input validation', () => {
+    // Math.min(value, max) alone only enforces an UPPER bound —
+    // Math.min(-1, 200) is -1, not clamped up to anything — so a negative
+    // (or non-integer/non-finite) limit/offset/maxScan would previously
+    // reach context-manager's native query unbounded. Each of these must
+    // now be rejected before the native call is ever made.
+    const badValues: Array<[string, number]> = [
+      ['negative', -1],
+      ['non-integer', 1.5],
+      ['NaN', NaN],
+      ['Infinity', Infinity],
+    ];
+
+    for (const [label, value] of badValues) {
+      it(`extract: rejects a ${label} limit before it reaches context-manager`, async () => {
+        const { cm, calls } = buildStub(FIXTURE);
+        const h = new HistoryModule();
+        h.bind(cm);
+        const result = await h.handleToolCall(call('extract', { limit: value }));
+        assert.equal(result.success, false);
+        assert.equal(result.isError, true);
+        assert.equal(calls.length, 0, 'must reject before ever calling context-manager');
+      });
+
+      it(`extract: rejects a ${label} offset before it reaches context-manager`, async () => {
+        const { cm, calls } = buildStub(FIXTURE);
+        const h = new HistoryModule();
+        h.bind(cm);
+        const result = await h.handleToolCall(call('extract', { offset: value }));
+        assert.equal(result.success, false);
+        assert.equal(result.isError, true);
+        assert.equal(calls.length, 0);
+      });
+
+      it(`search: rejects a ${label} limit before it reaches context-manager`, async () => {
+        const { cm, calls } = buildStub(FIXTURE);
+        const h = new HistoryModule();
+        h.bind(cm);
+        const result = await h.handleToolCall(call('search', { query: 'm', limit: value }));
+        assert.equal(result.success, false);
+        assert.equal(result.isError, true);
+        assert.equal(calls.length, 0);
+      });
+
+      it(`search: rejects a ${label} maxScan before it reaches context-manager`, async () => {
+        const { cm, calls } = buildStub(FIXTURE);
+        const h = new HistoryModule();
+        h.bind(cm);
+        const result = await h.handleToolCall(call('search', { query: 'm', maxScan: value }));
+        assert.equal(result.success, false);
+        assert.equal(result.isError, true);
+        assert.equal(calls.length, 0);
+      });
+    }
+
+    it('extract: a real 250-message store with limit:-1 does NOT return everything (reviewer repro)', async () => {
+      // Reviewer's exact repro shape: a store larger than the hard cap, and
+      // a negative limit that must not bypass it.
+      const many = Array.from({ length: 250 }, (_, i) => msg(`p${i}`, 1000 + i, 'User', [textBlock(`m${i}`)], 'c1'));
+      const { cm } = buildStub(many);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const result = await h.handleToolCall(call('extract', { limit: -1 }));
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+    });
+
+    it('search: a real large candidate pool with maxScan:-2 does NOT fetch everything (reviewer repro)', async () => {
+      const many = Array.from({ length: 248 }, (_, i) => msg(`q${i}`, 1000 + i, 'User', [textBlock(`m${i}`)], 'c1'));
+      const { cm, calls } = buildStub(many);
+      const h = new HistoryModule();
+      h.bind(cm);
+      const result = await h.handleToolCall(call('search', { query: 'm', maxScan: -2 }));
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.equal(calls.length, 0);
     });
   });
 

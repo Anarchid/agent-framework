@@ -27,11 +27,15 @@
  * module doesn't need to re-decide which of the three query methods to call.
  */
 
+import { Worker } from 'node:worker_threads';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import type { ContextManager, StoredMessage, ChannelCount, ChannelTokenStats } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { Module, ModuleContext } from '../../types/module.js';
 import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../types/events.js';
 import type { EventResponse, ProcessState } from '../../types/module.js';
+import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 
 // ============================================================================
 // Tool input shapes
@@ -79,6 +83,22 @@ const SEARCH_MAX_MAX_SCAN = 50000;
 const SNIPPET_CONTEXT_CHARS = 80;
 /** Fallback snippet length when a match position isn't meaningful to center on. */
 const SNIPPET_FALLBACK_CHARS = 160;
+
+/**
+ * Wall-clock deadline for a single regex-mode search call, enforced by
+ * forcibly terminating the worker thread doing the matching (see
+ * search-regex-worker.ts's header for why a worker — not a
+ * Promise.race/setTimeout — is required to actually interrupt a stuck
+ * synchronous RegExp.exec()). Generous enough for any legitimate pattern
+ * against a few thousand short strings; short enough that a catastrophic
+ * pattern doesn't tie up a worker (or an agent's turn) for long.
+ */
+const SEARCH_REGEX_TIMEOUT_MS = 2000;
+
+/** Compiled sibling of search-regex-worker.ts — resolved at runtime the same
+ *  way gate-script.ts locates gate-script-worker.js, so it tracks whatever
+ *  directory this module's own compiled output lives in. */
+const SEARCH_WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'search-regex-worker.js');
 
 export class HistoryModule implements Module {
   readonly name = 'history';
@@ -137,8 +157,8 @@ export class HistoryModule implements Module {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel.' },
-            limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}).` },
-            offset: { type: 'number', description: 'Number of matching messages to skip (default 0).' },
+            limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
+            offset: { type: 'number', description: 'Number of matching messages to skip (default 0). Must be a non-negative integer.' },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -150,7 +170,8 @@ export class HistoryModule implements Module {
           'range/channel window. Narrows candidates via the same query as `extract` before matching, up ' +
           'to maxScan candidates — if the narrowed window is larger than maxScan, the response reports ' +
           'truncated:true up front rather than silently missing later matches; narrow the filter or raise ' +
-          'maxScan and retry.',
+          'maxScan and retry. regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
+          `(not silently empty) if a pattern is too slow — avoid nested-quantifier patterns like (a+)+.`,
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -160,8 +181,8 @@ export class HistoryModule implements Module {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel.' },
-            limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}).` },
-            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}).` },
+            limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
+            maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
           },
           required: ['query'],
         },
@@ -180,18 +201,22 @@ export class HistoryModule implements Module {
         case 'extract':
           return this.handleExtract((call.input ?? {}) as ExtractInput);
         case 'search':
-          return this.handleSearch((call.input ?? {}) as SearchInput);
+          return await this.handleSearch((call.input ?? {}) as SearchInput);
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
     } catch (error) {
-      // Catches both our own validation errors (bad ISO date, invalid regex,
-      // unbound module) and context-manager's capability-absent error
-      // ("Chronicle history index unsupported...", thrown by
-      // queryMessagesByTime/queryMessagesByChannel/queryMessagesByTimeAndChannel/
-      // getChannelMessageCounts/getChannelTokenStats on a chronicle build that
-      // predates the native index-query capability) — surfaced as a normal
-      // tool error rather than crashing the module.
+      // Catches our own validation errors (bad ISO date, invalid regex,
+      // out-of-range limit/offset/maxScan, unbound module), a regex-search
+      // worker timeout or worker-side error (see handleSearch/
+      // searchWithRegexWorker — a ReDoS-shaped pattern surfaces here as a
+      // clean timeout error, never a hang), and context-manager's
+      // capability-absent error ("Chronicle history index unsupported...",
+      // thrown by queryMessagesByTime/queryMessagesByChannel/
+      // queryMessagesByTimeAndChannel/getChannelMessageCounts/
+      // getChannelTokenStats on a chronicle build that predates the native
+      // index-query capability) — all surfaced as a normal tool error
+      // rather than crashing the module.
       return {
         success: false,
         isError: true,
@@ -247,8 +272,8 @@ export class HistoryModule implements Module {
   private handleExtract(input: ExtractInput): ToolResult {
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = Math.min(input.limit ?? EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT);
-    const offset = input.offset ?? 0;
+    const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
+    const offset = clampCount(input.offset, 0, Number.MAX_SAFE_INTEGER, 'offset');
     const format = input.format ?? 'text';
 
     const cm = this.cm as ContextManager;
@@ -274,22 +299,25 @@ export class HistoryModule implements Module {
   // search
   // ==========================================================================
 
-  private handleSearch(input: SearchInput): ToolResult {
+  private async handleSearch(input: SearchInput): Promise<ToolResult> {
     if (!input.query) {
       throw new Error('search requires a non-empty "query".');
     }
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
-    const limit = Math.min(input.limit ?? SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT);
-    const maxScan = Math.min(input.maxScan ?? SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN);
+    const limit = clampCount(input.limit, SEARCH_DEFAULT_LIMIT, SEARCH_MAX_LIMIT, 'limit');
+    const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan');
     const caseSensitive = input.caseSensitive ?? false;
+    const flags = caseSensitive ? '' : 'i';
 
-    // Compile the matcher up front — an invalid regex is a clean tool error,
-    // not a crash mid-scan.
-    let matcher: RegExp | null = null;
+    // Validate regex SYNTAX up front — an invalid pattern is a clean tool
+    // error, not a crash mid-scan. This does NOT bound match TIME (a
+    // syntactically valid pattern can still backtrack catastrophically),
+    // which is why regex-mode matching itself runs on a worker below rather
+    // than here.
     if (input.regex) {
       try {
-        matcher = new RegExp(input.query, caseSensitive ? '' : 'i');
+        new RegExp(input.query, flags);
       } catch (error) {
         throw new Error(`Invalid regex "${input.query}": ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -311,12 +339,30 @@ export class HistoryModule implements Module {
     const truncated = probe.messages.length > maxScan;
     const candidates = truncated ? probe.messages.slice(0, maxScan) : probe.messages;
 
-    const matches: Array<{ id: string; timestamp: string; participant: string; channelId: string | null; snippet: string }> = [];
+    if (input.regex) {
+      // Regex matching against caller-supplied patterns is ReDoS-shaped: a
+      // pathological pattern (e.g. `(a+)+$`) can take catastrophically long
+      // against one candidate string, and a synchronous RegExp.exec() on
+      // this thread would block the WHOLE framework's event loop — every
+      // agent's turns, health checks, timers — for as long as it runs, with
+      // no way to interrupt it from this same thread. Route matching
+      // through a worker thread instead, which can be forcibly terminated
+      // on a deadline. See search-regex-worker.ts's header for the full
+      // rationale.
+      const { matches, scanned } = await this.searchWithRegexWorker(candidates, input.query, flags, limit);
+      return { success: true, data: { scanned, candidatePoolSize: candidates.length, truncated, matches } };
+    }
+
+    // Plain substring search (String.prototype.indexOf) is inherently
+    // linear in input length — no ReDoS-equivalent risk — so it stays
+    // in-process. This is also the common case, so it pays no worker-spawn
+    // overhead.
+    const matches: SearchMatch[] = [];
     let scanned = 0;
     for (const msg of candidates) {
       scanned++;
       const text = flattenContent(msg.content);
-      const hit = matcher ? matchRegex(matcher, text) : matchSubstring(text, needle, caseSensitive);
+      const hit = matchSubstring(text, needle, caseSensitive);
       if (!hit) continue;
       matches.push({
         id: String(msg.id),
@@ -330,13 +376,77 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: {
-        scanned,
-        candidatePoolSize: candidates.length,
-        truncated,
-        matches,
-      },
+      data: { scanned, candidatePoolSize: candidates.length, truncated, matches },
     };
+  }
+
+  /**
+   * Run regex matching for `search` on a worker thread with a hard
+   * wall-clock deadline, so a catastrophically-backtracking pattern can be
+   * forcibly killed instead of hanging the framework. One worker per call
+   * (not per candidate — spawn overhead would dominate at scale; not a
+   * persistent pool — a fresh worker per call means one bad pattern can
+   * never contaminate a later search). Always terminated on the way out,
+   * success or failure, so nothing lingers.
+   *
+   * On timeout or a worker-side error this THROWS (caught by
+   * handleToolCall's try/catch, same as every other error path in this
+   * module) rather than returning an empty match list — a timed-out search
+   * must never be indistinguishable from a clean "no matches" result.
+   */
+  private async searchWithRegexWorker(
+    candidates: StoredMessage[],
+    pattern: string,
+    flags: string,
+    limit: number,
+  ): Promise<{ matches: SearchMatch[]; scanned: number }> {
+    const texts = candidates.map((msg) => flattenContent(msg.content));
+    let worker: Worker | undefined;
+    try {
+      const { matches: rawMatches, scanned } = await new Promise<{ matches: SearchWorkerMatch[]; scanned: number }>(
+        (resolve, reject) => {
+          worker = new Worker(SEARCH_WORKER_PATH, { workerData: { texts, pattern, flags, limit } });
+          const timer = setTimeout(() => {
+            reject(
+              new Error(
+                `search timed out after ${SEARCH_REGEX_TIMEOUT_MS}ms while matching regex "${pattern}" against ` +
+                  `up to ${texts.length} candidate(s) — the pattern may be catastrophically slow (exponential ` +
+                  'backtracking) against this data; try a simpler pattern, a literal substring search ' +
+                  '(regex:false), or a smaller maxScan.',
+              ),
+            );
+          }, SEARCH_REGEX_TIMEOUT_MS);
+          timer.unref?.();
+          worker.once('message', (msg: SearchWorkerMessage) => {
+            clearTimeout(timer);
+            if (msg.type === 'error') reject(new Error(msg.error));
+            else resolve({ matches: msg.matches, scanned: msg.scanned });
+          });
+          worker.once('error', (err) => {
+            clearTimeout(timer);
+            reject(err);
+          });
+        },
+      );
+
+      const matches: SearchMatch[] = rawMatches.map(({ candidateIndex, matchIndex, matchLength }) => {
+        const msg = candidates[candidateIndex]!;
+        const text = texts[candidateIndex]!;
+        return {
+          id: String(msg.id),
+          timestamp: msg.timestamp.toISOString(),
+          participant: msg.participant,
+          channelId: getChannelId(msg) ?? null,
+          snippet: snippetAround(text, matchIndex, matchLength),
+        };
+      });
+      return { matches, scanned };
+    } finally {
+      // Always kill the worker — whether it finished, errored, or is still
+      // stuck mid-backtrack when the deadline hit. terminate() on an
+      // already-exited worker is a harmless no-op.
+      if (worker) void worker.terminate().catch(() => {});
+    }
   }
 }
 
@@ -354,6 +464,32 @@ function parseIsoDate(value: string | undefined, field: string): number | undefi
     throw new Error(`Invalid ISO 8601 date for "${field}": ${JSON.stringify(value)}`);
   }
   return ms;
+}
+
+/**
+ * Validate a pagination-ish numeric input (limit/offset/maxScan) and clamp
+ * it to an upper bound. `Math.min(value, max)` alone is NOT sufficient here:
+ * it only enforces an upper bound, so `Math.min(-1, 200)` is `-1`, not a
+ * sane value — a negative limit/offset/maxScan would sail straight past the
+ * "hard cap" and reach a native chronicle call expecting an unsigned
+ * pagination argument (observed: `extract({limit:-1})` returning every
+ * message in the store instead of being capped). Rejects (rather than
+ * silently clamping) anything that isn't a finite non-negative integer, so
+ * a caller mistake is surfaced as a clean tool error instead of silently
+ * doing something other than what was asked.
+ */
+function clampCount(value: number | undefined, def: number, max: number, field: string): number {
+  if (value === undefined) return def;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`"${field}" must be a finite number, got ${JSON.stringify(value)}.`);
+  }
+  if (!Number.isInteger(value)) {
+    throw new Error(`"${field}" must be an integer, got ${value}.`);
+  }
+  if (value < 0) {
+    throw new Error(`"${field}" must be >= 0, got ${value}.`);
+  }
+  return Math.min(value, max);
 }
 
 /** channelId lives at metadata.external.channelId — same path context-manager's
@@ -416,17 +552,21 @@ interface MatchHit {
   length: number;
 }
 
+/** One `search` result entry — shared shape between the in-process substring
+ *  path and the worker-backed regex path. */
+interface SearchMatch {
+  id: string;
+  timestamp: string;
+  participant: string;
+  channelId: string | null;
+  snippet: string;
+}
+
 function matchSubstring(text: string, needle: string, caseSensitive: boolean): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
   const index = haystack.indexOf(needle);
   if (index === -1) return null;
   return { index, length: needle.length };
-}
-
-function matchRegex(matcher: RegExp, text: string): MatchHit | null {
-  const m = matcher.exec(text);
-  if (!m) return null;
-  return { index: m.index, length: m[0].length };
 }
 
 /** ~SNIPPET_CONTEXT_CHARS of surrounding context on each side of a match, or
