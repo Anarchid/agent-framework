@@ -426,6 +426,34 @@ export type TraceEvent =
       message: string;
       /** Kind-specific structured payload (mirrors the failures.log record). */
       data?: Record<string, unknown>;
+    })
+
+  // Host quiesce/maintenance mode (issue #122)
+  | (TraceEventBase & {
+      type: 'host:quiesce';
+      reason?: string;
+      /** Whether all turns settled within the drain window. */
+      drained: boolean;
+      /** Turns still alive at return (0 unless the drain timed out). */
+      activeTurns: number;
+      /** Wakes still parked on provider admission at return (see HostModeStatus). */
+      parkedAdmissions?: number;
+      /** True when undrained turns were force-cancelled (abandon). */
+      abandoned?: boolean;
+      /** Agents whose turn abandon could not cancel (token held, no stream). */
+      unabandonable?: string[];
+    })
+  | (TraceEventBase & {
+      type: 'host:resume';
+      /** True when a failing feasibility verdict was overridden. */
+      forced?: boolean;
+      /** Gated inference requests released back to the scheduler. */
+      releasedRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'host:quiesced_boot';
+      reason?: string;
+      since?: number;
     });
 
 /**

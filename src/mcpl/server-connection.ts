@@ -199,6 +199,15 @@ export class McplServerConnection extends EventEmitter {
   private controlPlaneReady = false;
   private dataPlaneReady = false;
   private bufferedEvents: Array<{ event: string; args: unknown[] }> = [];
+  /** Cap on buffered responder-less events during a plane pause (issue #122).
+   *  Held server→host requests are never dropped and may exceed this. */
+  private static readonly MAX_BUFFERED_EVENTS = 1000;
+  private droppedBufferedEvents = 0;
+  /** True while ready()/readyControlPlane() re-emit a buffer snapshot. Items
+   *  re-buffering mid-flush were already admitted once — applying the cap to
+   *  them again would evict events that were legally held (the cap targets
+   *  NEW arrivals during a pause, not churn from control-plane flushes). */
+  private flushDepth = 0;
 
   // Reconnect state (adapted from Anarchid/agent-framework@mcpl-module-proto)
   private config: McplServerConfig | null = null;
@@ -250,11 +259,22 @@ export class McplServerConnection extends EventEmitter {
     this.dataPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    for (const { event, args } of pending) {
-      // Re-enter the gate for every buffered item. A control handler (notably
-      // tools/list_changed) may install a newer data-plane barrier while this
-      // snapshot is being flushed; later data items must observe that pause.
-      this.emit(event, ...args);
+    if (pending.length > 200) {
+      console.error(
+        `[mcpl] ${this.id}: flushing ${pending.length} buffered event(s) synchronously ` +
+        `(long pause backlog${this.droppedBufferedEvents > 0 ? `; ${this.droppedBufferedEvents} dropped at cap` : ''})`,
+      );
+    }
+    this.flushDepth++;
+    try {
+      for (const { event, args } of pending) {
+        // Re-enter the gate for every buffered item. A control handler (notably
+        // tools/list_changed) may install a newer data-plane barrier while this
+        // snapshot is being flushed; later data items must observe that pause.
+        this.emit(event, ...args);
+      }
+    } finally {
+      this.flushDepth--;
     }
   }
 
@@ -268,13 +288,18 @@ export class McplServerConnection extends EventEmitter {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
     this.bufferedEvents = [];
-    for (const item of pending) {
-      // Re-enter the ADMISSION gate (this.emit), never super.emit: control
-      // events include channels-register/changed, which are grant-gated —
-      // the old direct flush bypassed positive-grant enforcement entirely
-      // (PR #79 review blocker 3). Data-plane items re-buffer in order via
-      // the same call, since dataPlaneReady is still false.
-      this.emit(item.event, ...item.args);
+    this.flushDepth++;
+    try {
+      for (const item of pending) {
+        // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+        // events include channels-register/changed, which are grant-gated —
+        // the old direct flush bypassed positive-grant enforcement entirely
+        // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+        // the same call, since dataPlaneReady is still false.
+        this.emit(item.event, ...item.args);
+      }
+    } finally {
+      this.flushDepth--;
     }
   }
 
@@ -335,6 +360,34 @@ export class McplServerConnection extends EventEmitter {
       }
       return super.emit(event, ...args);
     }
+    // Buffer cap (issue #122): a long data-plane pause (quiesce window) on a
+    // busy server would otherwise grow this array without bound. Only
+    // responder-LESS events are ever dropped — a buffered server→host REQUEST
+    // holds a live responder the server is blocking on, and dropping it would
+    // strand that call forever (the server timing out and reconnecting is the
+    // accepted bound there, and reconnect re-runs the barrier funnel).
+    if (this.flushDepth === 0 && this.bufferedEvents.length >= McplServerConnection.MAX_BUFFERED_EVENTS) {
+      const hasResponder = (item: { args: unknown[] }): boolean => {
+        const responder = item.args[1] as { respond?: unknown } | undefined;
+        return typeof responder?.respond === 'function';
+      };
+      if (!hasResponder({ args })) {
+        this.droppedBufferedEvents++;
+        if (this.droppedBufferedEvents % 100 === 1) {
+          console.error(
+            `[mcpl] ${this.id}: buffered-event cap (${McplServerConnection.MAX_BUFFERED_EVENTS}) — ` +
+            `dropped ${this.droppedBufferedEvents} responder-less event(s) while the plane is paused`,
+          );
+        }
+        const dropIndex = this.bufferedEvents.findIndex((item) => !hasResponder(item));
+        if (dropIndex >= 0) {
+          this.bufferedEvents.splice(dropIndex, 1); // drop-oldest non-request
+          this.bufferedEvents.push({ event: name, args });
+        }
+        // else: buffer is all held requests — drop the incoming event instead.
+        return true;
+      }
+    }
     this.bufferedEvents.push({ event: name, args });
     return true;
   }
@@ -359,7 +412,14 @@ export class McplServerConnection extends EventEmitter {
       || event === 'tools-list-changed'
       || event === 'connect-failed'
       || event === 'reconnect-failed'
-      || event === 'orphaned-response';
+      || event === 'orphaned-response'
+      // host/command is OPERATOR traffic, not agent-wake traffic: it must
+      // stay deliverable while the data plane is paused, or a quiesced host
+      // could never receive the `resume` that lifts the pause (issue #122 —
+      // the command would buffer behind the very gate it is meant to open).
+      // The allowHostCommands authority check lives on the emit pass path
+      // below, so promotion does not widen who may issue commands.
+      || event === 'host-command';
   }
 
   private static isLifecycleEvent(event: string): boolean {

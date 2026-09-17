@@ -539,4 +539,19 @@ export interface ApiServerConfig {
   path?: string;
   /** Enable HTTP endpoints alongside WebSocket (default: true) */
   enableHttp?: boolean;
+  /** Opt-in shared secret for the HTTP host verbs (POST /quiesce, /resume,
+   *  /maintenance/tick). When set, those requests must carry it in the
+   *  `x-admin-token` header (401 otherwise). Unset preserves the historical
+   *  bind-address-is-the-security-model behavior — the default bind is
+   *  localhost; deployments that front the port with a proxy should set this. */
+  adminToken?: string;
+  /**
+   * Browser origins allowed to open the WebSocket. Browsers do not apply
+   * CORS to WebSocket handshakes, so without this check any web page the
+   * operator visits could drive the WS command surface on a localhost bind.
+   * Upgrades with no Origin header (non-browser clients) always pass; a
+   * browser Origin passes when it names this server's own host (the
+   * request's Host header) or appears here. Default: none beyond same-host.
+   */
+  allowedOrigins?: string[];
 }

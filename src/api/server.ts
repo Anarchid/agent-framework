@@ -8,8 +8,10 @@
 
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
+import { ResumeBlockedError } from '../framework.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
   ApiServerConfig,
@@ -46,7 +48,9 @@ import type {
 
 export * from './types.js';
 
-const DEFAULT_CONFIG: Required<ApiServerConfig> = {
+type ResolvedApiServerConfig = Required<Omit<ApiServerConfig, 'adminToken' | 'allowedOrigins'>> & Pick<ApiServerConfig, 'adminToken' | 'allowedOrigins'>;
+
+const DEFAULT_CONFIG: ResolvedApiServerConfig = {
   port: 8765,
   host: 'localhost',
   path: '/ws',
@@ -56,11 +60,19 @@ const DEFAULT_CONFIG: Required<ApiServerConfig> = {
 /** Polling interval for subscriptions (ms) */
 const SUBSCRIPTION_POLL_INTERVAL = 50;
 
+/** Constant-time token comparison (length leak is acceptable; content isn't). */
+function timingSafeTokenEqual(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
 /**
  * API Server for the agent framework.
  */
 export class ApiServer {
-  private config: Required<ApiServerConfig>;
+  private config: ResolvedApiServerConfig;
   private framework: AgentFramework;
   private wss: WebSocketServer | null = null;
   private httpServer: ReturnType<typeof createServer> | null = null;
@@ -74,7 +86,35 @@ export class ApiServer {
 
   constructor(framework: AgentFramework, config: ApiServerConfig = {}) {
     this.framework = framework;
+    // An empty token would look configured while matching an empty header:
+    // the gate would pass for anyone. Refuse it at construction.
+    if (config.adminToken !== undefined && config.adminToken.length === 0) {
+      throw new Error('ApiServerConfig.adminToken must be non-empty when set (omit it to disable the gate)');
+    }
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * WebSocket upgrade origin policy (see ApiServerConfig.allowedOrigins).
+   * Non-browser clients send no Origin and pass; a browser Origin must match
+   * this server's own host or the configured allow-list.
+   */
+  private originAllowed(origin: string | undefined, hostHeader: string | undefined): boolean {
+    if (origin === undefined || origin === '' || origin === 'null') return origin !== 'null';
+    let originHost: string;
+    try {
+      originHost = new URL(origin).host;
+    } catch {
+      return false;
+    }
+    if (hostHeader && originHost.toLowerCase() === hostHeader.toLowerCase()) return true;
+    return (this.config.allowedOrigins ?? []).some((allowed) => {
+      try {
+        return new URL(allowed).host.toLowerCase() === originHost.toLowerCase();
+      } catch {
+        return allowed.toLowerCase() === originHost.toLowerCase();
+      }
+    });
   }
 
   /**
@@ -95,6 +135,14 @@ export class ApiServer {
     this.wss = new WebSocketServer({
       server: this.httpServer,
       path: this.config.path,
+      // Browsers skip CORS for WS handshakes, so the Origin check is the
+      // only thing standing between a visited web page and this command
+      // surface on a localhost bind (host.quiesce, undo, branch.delete…).
+      verifyClient: (info: { origin: string; req: IncomingMessage }, done: (ok: boolean, code?: number, msg?: string) => void) => {
+        const ok = this.originAllowed(info.origin, info.req.headers.host);
+        if (!ok) console.warn(`[api] rejected WebSocket upgrade from origin ${info.origin}`);
+        done(ok, 403, 'origin not allowed');
+      },
     });
 
     this.wss.on('connection', (ws) => {
@@ -357,8 +405,34 @@ export class ApiServer {
       case 'events.subscribe':
         return this.cmdEventsSubscribe(params as unknown as EventsSubscribeParams);
 
+      // Host quiesce/maintenance mode (issue #122). When an adminToken is
+      // configured, the mutating verbs require it here too — the WS surface
+      // must not be a token-free path to the same authority as the HTTP verbs.
+      case 'host.quiesce':
+        this.requireAdminToken(params);
+        return this.framework.quiesce(params as
+          { reason?: string; timeoutMs?: number; abandon?: boolean } | undefined);
+      case 'host.resume':
+        this.requireAdminToken(params);
+        return this.framework.resume(params as { force?: boolean } | undefined);
+      case 'host.status':
+        return this.framework.getHostModeStatus();
+      case 'host.maintenanceTick':
+        this.requireAdminToken(params);
+        return this.framework.maintenanceTick();
+
       default:
         throw new Error(`Unknown command: ${command}`);
+    }
+  }
+
+  /** WS-side admin gate for the mutating host verbs: no-op unless an
+   *  adminToken is configured, then `params.adminToken` must match. */
+  private requireAdminToken(params?: Record<string, unknown>): void {
+    if (this.config.adminToken === undefined) return;
+    const presented = params?.adminToken;
+    if (typeof presented !== 'string' || !timingSafeTokenEqual(presented, this.config.adminToken)) {
+      throw new Error('adminToken required for host verbs on this server');
     }
   }
 
@@ -861,8 +935,91 @@ export class ApiServer {
           agents: agents.map((a) => ({ name: a.name, status: a.state.status })),
           clients: this.clients.size,
           queueDepth: this.framework.getQueueDepth(),
+          quiesced: this.framework.getHostModeStatus().quiesced,
         })
       );
+      return;
+    }
+
+    // Host quiesce/maintenance mode (issue #122). Options ride the query
+    // string — this file has no body parser and these verbs don't warrant
+    // introducing one. Auth: opt-in shared secret (config.adminToken); the
+    // default bind is localhost and the WS surface carries the same authority,
+    // so no ambient remoteAddress check is attempted (it breaks behind
+    // proxies both ways and adds nothing on a local bind).
+    if (url.pathname === '/hostmode') {
+      // Carries the operator's free-text reason; when a token is configured,
+      // reads require it too (ACAO:* makes this cross-origin readable).
+      if (this.config.adminToken !== undefined) {
+        const presented = req.headers['x-admin-token'];
+        if (typeof presented !== 'string' || !timingSafeTokenEqual(presented, this.config.adminToken)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'x-admin-token required' }));
+          return;
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(this.framework.getHostModeStatus()));
+      return;
+    }
+    const hostVerb = req.method === 'POST'
+      && ['/quiesce', '/resume', '/maintenance/tick'].includes(url.pathname);
+    if (hostVerb) {
+      // CSRF guard: the x-admin-token header is REQUIRED even when no token
+      // is configured (any value then). A custom header makes the request
+      // non-simple, forcing a CORS preflight — and the OPTIONS response only
+      // allows Content-Type, so browsers refuse to send it cross-origin.
+      // Without this, ACAO:* + query-string options made POST /quiesce a
+      // simple request any web page could fire at a localhost bind.
+      const presented = req.headers['x-admin-token'];
+      const authorized = typeof presented === 'string' && (
+        this.config.adminToken === undefined || timingSafeTokenEqual(presented, this.config.adminToken)
+      );
+      if (!authorized) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: this.config.adminToken !== undefined
+            ? 'x-admin-token required (configured token mismatch or missing header)'
+            : 'x-admin-token header required (any value; forces CORS preflight)',
+        }));
+        return;
+      }
+      const respond = (code: number, body: unknown) => {
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      void (async () => {
+        try {
+          if (url.pathname === '/quiesce') {
+            const timeoutMs = url.searchParams.get('timeoutMs');
+            respond(200, await this.framework.quiesce({
+              ...(url.searchParams.get('reason')
+                ? { reason: url.searchParams.get('reason')! } : {}),
+              ...(timeoutMs ? { timeoutMs: Number(timeoutMs) } : {}),
+              ...(url.searchParams.get('abandon') === 'true' ? { abandon: true } : {}),
+            }));
+          } else if (url.pathname === '/resume') {
+            respond(200, await this.framework.resume(
+              url.searchParams.get('force') === 'true' ? { force: true } : undefined,
+            ));
+          } else {
+            respond(200, await this.framework.maintenanceTick());
+          }
+        } catch (error) {
+          if (error instanceof ResumeBlockedError) {
+            respond(409, {
+              error: error.message,
+              verdicts: error.verdicts,
+              hostMode: this.framework.getHostModeStatus(),
+            });
+          } else {
+            respond(500, { error: error instanceof Error ? error.message : String(error) });
+          }
+        }
+      })().catch(() => {
+        // The client went away mid-drain: respond() threw, and the fallback
+        // respond(500) threw again. Nothing left to tell anyone.
+      });
       return;
     }
 

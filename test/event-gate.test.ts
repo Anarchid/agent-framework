@@ -898,3 +898,54 @@ describe('defaultDecisions counters', () => {
     assert.strictEqual(status.defaultDecisions.byEventType['other'].skipped, 1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Host quiesce suppression (issue #122)
+// ---------------------------------------------------------------------------
+
+describe('quiesce suppression', () => {
+  it('buffers debounce firings while quiesced and flushes on setQuiesced(false)', async () => {
+    const path = writeConfig('quiesce-debounce.json', {
+      policies: [
+        { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 120 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages, inferenceRequests } = makeGate(path);
+
+    gate.setQuiesced(true);
+    gate.evaluate(event({ content: 'edit 1' }));
+    gate.evaluate(event({ content: 'edit 2' }));
+
+    // Debounce fires while quiesced → buffered, no context write, no wake.
+    await new Promise(r => setTimeout(r, 250));
+    assert.strictEqual(messages.length, 0, 'no gate message mid-surgery');
+    assert.strictEqual(inferenceRequests.length, 0);
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 2);
+
+    gate.setQuiesced(false);
+    await new Promise(r => setTimeout(r, 20)); // flush is deferred a microtask
+    assert.strictEqual(messages.length, 1, 'buffered events compose one delivery');
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 0);
+  });
+
+  it('a turn ending while quiesced does not flush the buffer', async () => {
+    const path = writeConfig('quiesce-turn-end.json', {
+      policies: [
+        { name: 'editor', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 120 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+
+    gate.setQuiesced(true);
+    gate.onInferenceStarted('agent');
+    gate.evaluate(event({ content: 'during drain' }));
+    await new Promise(r => setTimeout(r, 250));
+    gate.onInferenceEnded('agent'); // drain completes mid-quiesce
+    await new Promise(r => setTimeout(r, 20));
+    assert.strictEqual(messages.length, 0, 'buffer holds until resume, not turn end');
+    assert.strictEqual(gate.inferenceDiagnostics().bufferedEvents, 1);
+  });
+});
