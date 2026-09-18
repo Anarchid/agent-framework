@@ -1638,22 +1638,50 @@ export class ChannelRegistry {
     }
 
     const name = trimmed.slice(1).toLowerCase();
-    const dmCandidateNames = (channelId: string): string[] => {
+    const labelName = (channelId: string): string => {
+      const label = (this.labelHistory.get(channelId) ?? '').toLowerCase();
+      return label.startsWith('dm: ') ? label.slice(4) : label;
+    };
+
+    // Three strict tiers, mirroring the LIVE resolver's precedence (which
+    // prefers recipientName over the label outright, never a flat pool of
+    // equal-priority candidates): (1) EXACT match against a channel's own
+    // recorded recipientName, (2) EXACT match against a channel's label
+    // (only tried when tier 1 found NOTHING — not merely "didn't match
+    // this channel", genuinely zero matches across every dm channel), (3)
+    // fuzzy/substring match across the combined name pool, as a last
+    // resort. Each tier stops at real ambiguity (2+ matches) rather than
+    // falling through — an ambiguous EXACT recipientName match is a
+    // genuine collision between two real usernames, not something a
+    // weaker label-based tier should silently resolve.
+    //
+    // Tier 1 taking outright precedence (not "additive" the way label
+    // fuzzy-matching is within a single channel) is the actual fix: a flat
+    // combined pool let a DIFFERENT channel's stale/unrelated display
+    // label collide with THIS channel's real recorded username, making an
+    // otherwise-unique lookup falsely ambiguous after a restart — even
+    // though the persisted recipientName data was sufficient on its own to
+    // resolve it. See the regression for the exact collision shape.
+    const exactRecipientName = dmChannelIds.filter((cid) => this.dmRecipientNames.get(cid)?.toLowerCase() === name);
+    if (exactRecipientName.length === 1) return exactRecipientName[0];
+    if (exactRecipientName.length > 1) return undefined;
+
+    const exactLabel = dmChannelIds.filter((cid) => labelName(cid) === name);
+    if (exactLabel.length === 1) return exactLabel[0];
+    if (exactLabel.length > 1) return undefined;
+
+    const candidateNames = (channelId: string): string[] => {
       const names: string[] = [];
       const recipientName = this.dmRecipientNames.get(channelId);
       if (recipientName) names.push(recipientName.toLowerCase());
-      const label = (this.labelHistory.get(channelId) ?? '').toLowerCase();
-      if (label) names.push(label.startsWith('dm: ') ? label.slice(4) : label);
+      const label = labelName(channelId);
+      if (label) names.push(label);
       return names;
     };
-    const exact = dmChannelIds.filter((cid) => dmCandidateNames(cid).includes(name));
-    const pool =
-      exact.length > 0
-        ? exact
-        : dmChannelIds.filter((cid) =>
-            dmCandidateNames(cid).some((n) => n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name))),
-          );
-    return pool.length === 1 ? pool[0] : undefined;
+    const fuzzy = dmChannelIds.filter((cid) =>
+      candidateNames(cid).some((n) => n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name))),
+    );
+    return fuzzy.length === 1 ? fuzzy[0] : undefined;
   }
 
   /**

@@ -331,6 +331,42 @@ test('a genuine label collision across two different channels reports ambiguity,
   assert.ok('error' in result, `expected an ambiguity error, got ${JSON.stringify(result)}`);
 });
 
+test("durable DM resolution keeps the live resolver's recipientName-over-label precedence, not a flat equal-priority pool (finding: false ambiguity across two channels)", async () => {
+  // Two fully-recorded DMs whose identity data happens to cross-reference:
+  // A's actual username is 'alpha_user', but its stale/leftover display
+  // label is 'DM: beta_user'; B's actual username IS 'beta_user', with an
+  // unrelated display label. Live, '@beta_user' resolves uniquely to B —
+  // the live resolver prefers recipientName outright and never considers
+  // A's label a candidate at all. A flat "equal priority" pool of
+  // recipientName+label candidates made this falsely ambiguous after a
+  // restart (both A's label and B's recipientName satisfied the same
+  // query), even though the persisted recipientName data was sufficient on
+  // its own to resolve it uniquely, exactly like the live path does.
+  const { store } = memoryStore();
+  const registry = makeRegistry(store);
+
+  await registry.handleRegister('discord', {
+    channels: [
+      dmDescriptor('discord:dm:A', 'DM: beta_user', { recipientId: 'a', recipientName: 'alpha_user' }),
+      dmDescriptor('discord:dm:B', 'DM: unrelated-label', { recipientId: 'b', recipientName: 'beta_user' }),
+    ],
+  });
+
+  const restarted = makeRegistry(store);
+  const resolved = restarted.resolveProseTargetDurable('@beta_user');
+  assert.ok('channelId' in resolved, `expected a unique resolution, got ${JSON.stringify(resolved)}`);
+  assert.equal((resolved as { channelId: string }).channelId, 'discord:dm:B');
+
+  // The label-derived fallback for a channel WITHOUT a competing
+  // recipientName match still works (recipientName tier only blocks the
+  // label tier when it actually resolves the query, not unconditionally) —
+  // '@unrelated-label' isn't anyone's recipientName, so it should still
+  // resolve to B via B's own label.
+  const byLabel = restarted.resolveProseTargetDurable('@unrelated-label');
+  assert.ok('channelId' in byLabel, `expected B's own label to still resolve it, got ${JSON.stringify(byLabel)}`);
+  assert.equal((byLabel as { channelId: string }).channelId, 'discord:dm:B');
+});
+
 test('a DM registered live resolves after a restart via @name, not just the literal stored label (DM-addressing regression)', async () => {
   const { store } = memoryStore();
   const first = makeRegistry(store);

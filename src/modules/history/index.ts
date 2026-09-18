@@ -761,6 +761,14 @@ export class HistoryModule implements Module {
           ? Math.min(earliestMessageMs, firstEntryStartMs)
           : earliestMessageMs ?? firstEntryStartMs ?? Date.now();
     }
+    // Effective query start — captured BEFORE the gap loop below mutates
+    // `cursor` (it walks forward past each entry's endMs). Needed by the
+    // boundary-tie correction pass further down to clamp its output to
+    // what the caller actually asked for (see the comment there): when
+    // `fromMs` is omitted this equals the resolved anchor above, not
+    // `-Infinity` — an open-ended query still has a concrete effective
+    // start, it's just not caller-supplied.
+    const rangeStart = cursor;
 
     const gaps: Array<{ startMs: number; endMs: number; summarized: false; stats: ChannelTokenStats; boundaryUncertain?: boolean }> = [];
     // True once `cursor` has been advanced past at least one real summary
@@ -907,13 +915,28 @@ export class HistoryModule implements Module {
       own.stats = subtractMessagesFromStats(own.stats, [...foreignById.values()]);
       own.boundaryUncertain = true;
 
+      // getSummariesInRange intentionally returns WHOLE summaries that
+      // overlap the query — a summary's own startMs/endMs can legitimately
+      // extend past the caller's requested [rangeStart, rangeEnd] (that's
+      // correct: the summary itself, and its corrected messageCount above,
+      // belong in the response either way). But a correction-pass GAP
+      // anchored at entry.startMs/entry.endMs must NOT be added when that
+      // boundary itself falls outside the query window — the ordinary gap
+      // walk elsewhere in this function never synthesizes a gap outside
+      // [rangeStart, rangeEnd], and this pass shouldn't either. Without
+      // this check, a narrow-window query landing entirely inside an
+      // already-summarized span could still surface phantom
+      // summarized:false rows anchored at that summary's FAR boundaries,
+      // outside anything the caller asked about.
       const before = genuinelyUnsummarized.filter((m) => m.sequence < entry.firstSequence);
       const after = genuinelyUnsummarized.filter((m) => m.sequence > entry.lastSequence);
-      if (before.length > 0) {
+      const startInRange = entry.startMs >= rangeStart && entry.startMs <= rangeEnd;
+      const endInRange = entry.endMs >= rangeStart && entry.endMs <= rangeEnd;
+      if (before.length > 0 && startInRange) {
         mergeForeignIntoGap(gaps, entry.startMs, 'before', before);
         for (const m of before) alreadyMergedForeignIds.add(String(m.id));
       }
-      if (after.length > 0) {
+      if (after.length > 0 && endInRange) {
         mergeForeignIntoGap(gaps, entry.endMs, 'after', after);
         for (const m of after) alreadyMergedForeignIds.add(String(m.id));
       }

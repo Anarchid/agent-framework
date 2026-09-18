@@ -834,6 +834,59 @@ describe('HistoryModule.overview', () => {
     assert.equal(totalMessageCount, 5, `all 5 real messages must be counted exactly once across the whole response, got ${totalMessageCount}`);
   });
 
+  it("the boundary-tie correction pass does not synthesize a gap OUTSIDE the caller's requested range (finding: out-of-range phantom gap)", async () => {
+    // getSummariesInRange intentionally returns WHOLE overlapping summaries
+    // — this one spans 1000-10000ms, well beyond the narrow window actually
+    // queried below. Two genuinely-unsummarized messages sit tied at the
+    // summary's OWN far boundaries (1000 and 10000) — outside [5000,6000],
+    // the actual requested range. The correction pass must still correct
+    // the summary's own messageCount (it's being returned either way,
+    // regardless of range), but must NOT fabricate summarized:false gap
+    // entries anchored at 1000/10000 — those boundaries are outside
+    // anything the caller asked about, and the ordinary (non-correction)
+    // gap walk elsewhere in this function already respects that same rule.
+    const { cm } = buildStub({
+      summaries: [
+        summary('S', 1, 1000, 10000, 'wide chapter', { firstSequence: 1, lastSequence: 3, firstMessageId: 's1', lastMessageId: 's2' }),
+      ],
+      messages: [
+        { id: 'leading-stray', sequence: 0, ms: 1000, channelId: 'c1', tokens: 5 }, // tied with S's own start, outside the query
+        { id: 's1', sequence: 1, ms: 1000, channelId: 'c1', tokens: 5 }, // S's own first message
+        { id: 'mid', sequence: 2, ms: 5500, channelId: 'c1', tokens: 5 }, // the only message actually inside the query window
+        { id: 's2', sequence: 3, ms: 10000, channelId: 'c1', tokens: 5 }, // S's own last message
+        { id: 'trailing-stray', sequence: 4, ms: 10000, channelId: 'c1', tokens: 5 }, // tied with S's own end, outside the query
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(5000).toISOString(), to: new Date(6000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+
+    const gapEntries = data.entries.filter((e) => !e.summarized);
+    assert.equal(
+      gapEntries.length,
+      0,
+      `no gap should be synthesized outside the requested [5000,6000] range, got ${JSON.stringify(gapEntries)}`,
+    );
+    // The summary itself is still returned (it overlaps the query), and its
+    // corrected messageCount still excludes the two out-of-range strays —
+    // they were never part of this summary regardless of where the caller
+    // happened to query.
+    const [summaryEntry] = data.entries;
+    assert.equal(summaryEntry?.summarized, true);
+    // S's genuine messages are s1 (seq 1), mid (seq 2), s2 (seq 3) — three
+    // distinct messages whose sequence falls in S's own [1,3] range. The
+    // two strays (seq 0 and seq 4) are correctly subtracted regardless of
+    // where the caller happened to query — that correction is unconditional
+    // (see subtractMessagesFromStats above); only the SYNTHESIS of a new
+    // gap entry for them is what needed to respect the query range.
+    assert.equal(summaryEntry?.messageCount, 3, 'S should report its 3 genuine messages (s1, mid, s2), with the two out-of-range strays correctly subtracted but no gap entry synthesized for them');
+  });
+
   it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
     const cm = {
       getSummariesInRange() {
