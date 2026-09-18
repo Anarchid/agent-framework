@@ -4,6 +4,7 @@ import { HistoryModule } from '../src/modules/history/index.js';
 import type { ContextManager, StoredMessage, IndexedMessageQueryResult, ChannelCount, ChannelTokenStats } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { ToolCall } from '../src/types/events.js';
+import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 
 /**
  * HistoryModule's own logic is dispatch (always via
@@ -494,6 +495,184 @@ describe('HistoryModule', () => {
       assert.equal(result.success, false);
       assert.equal(result.isError, true);
       assert.equal(calls.length, 0);
+    });
+  });
+
+  describe('channel-label retrofit (resolveChannel via ChannelRegistry)', () => {
+    /**
+     * Minimal ChannelRegistry-shaped stub — HistoryModule's resolveChannel()
+     * only ever calls resolveProseTargetDurable(), so that's all this needs
+     * to implement. `known` maps a label spec to the raw channelId it
+     * resolves to; anything else is an unresolvable miss (mirrors
+     * ChannelRegistry's own {error} return).
+     */
+    function stubRegistry(known: Record<string, string>): ChannelRegistry {
+      return {
+        resolveProseTargetDurable(spec: string) {
+          const channelId = known[spec];
+          return channelId !== undefined ? { channelId } : { error: `no such channel: ${spec}` };
+        },
+      } as unknown as ChannelRegistry;
+    }
+
+    it('stats: resolves a label to the raw channelId before calling context-manager', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm, stubRegistry({ '#c1-label': 'c1' }));
+
+      const result = await h.handleToolCall(call('stats', { channelId: '#c1-label' }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { messageCountsAllTime: ChannelCount[]; tokenStatsForRange: ChannelTokenStats };
+      // Same result as passing the raw 'c1' id directly (see the plain
+      // stats/channelId test above) — proves the label was resolved, not
+      // passed through as a literal (nonexistent) channelId.
+      assert.deepEqual(data.messageCountsAllTime.map((c) => c.channelId), ['c1']);
+      assert.deepEqual(data.tokenStatsForRange.byChannel.map((c) => c.channelId), ['c1']);
+    });
+
+    it('extract: resolves a label to the raw channelId before calling context-manager', async () => {
+      const { cm, calls } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm, stubRegistry({ '#c1-label': 'c1' }));
+
+      const result = await h.handleToolCall(
+        call('extract', { channelId: '#c1-label', from: new Date(1500).toISOString() }),
+      );
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { messages: Array<{ id: string }> };
+      assert.deepEqual(data.messages.map((m) => m.id), ['m2', 'm6']);
+      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
+      assert.equal((queryCall?.args as { channelId?: string }).channelId, 'c1', 'context-manager must see the resolved raw id, not the label');
+    });
+
+    it('search: resolves a label to the raw channelId before calling context-manager', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm, stubRegistry({ '#c1-label': 'c1' }));
+
+      const result = await h.handleToolCall(call('search', { query: 'searchterm', channelId: '#c1-label' }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { matches: Array<{ id: string }> };
+      assert.deepEqual(data.matches.map((m) => m.id), ['m6']);
+    });
+
+    it('an unresolvable spec is passed through unchanged (escape hatch for an already-raw channelId)', async () => {
+      const { cm, calls } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      // Registry is bound but knows nothing about 'c1' as a *label* — only
+      // resolveProseTargetDurable would be asked, and it misses.
+      h.bind(cm, stubRegistry({}));
+
+      const result = await h.handleToolCall(call('extract', { channelId: 'c1' }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { messages: Array<{ id: string }> };
+      assert.deepEqual(data.messages.map((m) => m.id), ['m1', 'm2', 'm6']);
+      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
+      assert.equal((queryCall?.args as { channelId?: string }).channelId, 'c1');
+    });
+
+    it('a typo\'d label-shaped spec (starts with # or @) surfaces a clean error with suggestions instead of silently looking empty (finding #8)', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(
+        cm,
+        {
+          resolveProseTargetDurable(spec: string) {
+            if (spec === '#c1-label') return { channelId: 'c1' };
+            // Unresolvable, but the resolver still offers a near-match
+            // suggestion — exactly what a real ChannelRegistry miss returns.
+            // The underlying error text deliberately mimics
+            // resolveProseTarget's SEND-flavored DM wording ("use the
+            // send_dm tool") — resolveChannel must not surface it verbatim
+            // (see the next test): a read-only history tool needs its own
+            // wording, not send-context advice.
+            return { error: `no registered DM found for "${spec}" — use the send_dm tool`, candidates: ['#c1-label'] };
+          },
+        } as unknown as ChannelRegistry,
+      );
+
+      const result = await h.handleToolCall(call('extract', { channelId: '#c1-labl' })); // typo
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.match(result.error ?? '', /No channel history found/i);
+      assert.match(result.error ?? '', /#c1-label/); // the suggestion made it into the error
+    });
+
+    it('never reuses the live resolver\'s send_dm-flavored error text — always uses read-only-tool wording (finding: DM error text)', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(
+        cm,
+        {
+          resolveProseTargetDurable(_spec: string) {
+            return { error: 'no registered DM found for "@ghost" — for someone without a registered DM channel, use the send_dm tool' };
+          },
+        } as unknown as ChannelRegistry,
+      );
+
+      const result = await h.handleToolCall(call('extract', { channelId: '@ghost' }));
+      assert.equal(result.success, false);
+      assert.equal(result.isError, true);
+      assert.doesNotMatch(result.error ?? '', /send_dm/, 'send-context advice must never leak into a read-only tool error');
+    });
+
+    it('a bare (non-#/@) unresolvable spec still passes through unchanged — the escape hatch is preserved for non-label-shaped input', async () => {
+      const { cm, calls } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(
+        cm,
+        {
+          resolveProseTargetDurable(_spec: string) {
+            return { error: 'no such channel', candidates: ['c1'] };
+          },
+        } as unknown as ChannelRegistry,
+      );
+
+      // 'c1' doesn't start with '#' or '@' — even on a registry miss, this
+      // must still be treated as an already-raw id, not an error.
+      const result = await h.handleToolCall(call('extract', { channelId: 'c1' }));
+      assert.equal(result.success, true, result.error);
+      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
+      assert.equal((queryCall?.args as { channelId?: string }).channelId, 'c1');
+    });
+
+    it('an unresolvable <@id>/<@!id> mention form surfaces the clean error on extract/stats/search/overview, not a silent empty result (finding: mention-form escape-hatch gap)', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const registry = {
+        resolveProseTargetDurable(_spec: string) {
+          return { error: 'no registered DM matches the mention <@999>' };
+        },
+      } as unknown as ChannelRegistry;
+
+      for (const mention of ['<@999>', '<@!999>']) {
+        for (const toolName of ['extract', 'stats', 'search', 'overview']) {
+          const h = new HistoryModule();
+          h.bind(cm, registry);
+          const input: Record<string, unknown> = { channelId: mention };
+          if (toolName === 'search') input.query = 'x';
+          const result = await h.handleToolCall(call(toolName, input));
+          assert.equal(result.success, false, `${toolName}(${mention}) should error, not silently succeed`);
+          assert.equal(result.isError, true);
+          assert.match(
+            result.error ?? '',
+            /No channel history found/i,
+            `${toolName}(${mention}) should surface the clean resolution error`,
+          );
+        }
+      }
+    });
+
+    it('regression guard: an unbound module (bind(cm) only, no registry) still accepts a raw id unchanged', async () => {
+      const { cm, calls } = buildStub(FIXTURE);
+      const h = new HistoryModule();
+      h.bind(cm); // no ChannelRegistry passed — today's pre-retrofit call shape.
+
+      const result = await h.handleToolCall(call('extract', { channelId: 'c1' }));
+      assert.equal(result.success, true, result.error);
+      const data = result.data as { messages: Array<{ id: string }> };
+      assert.deepEqual(data.messages.map((m) => m.id), ['m1', 'm2', 'm6']);
+      const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
+      assert.equal((queryCall?.args as { channelId?: string }).channelId, 'c1');
     });
   });
 
