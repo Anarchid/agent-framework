@@ -59,13 +59,21 @@ function descriptor(id: string, label: string) {
   return { id, type: 'discord', label, direction: 'bidirectional' as const };
 }
 
-function dmDescriptor(id: string, label: string, recipientId?: string) {
+function dmDescriptor(
+  id: string,
+  label: string,
+  opts: { recipientId?: string; recipientName?: string; channelType?: string } = {},
+) {
   return {
     id,
     type: 'discord',
     label,
     direction: 'bidirectional' as const,
-    metadata: { channelType: 'dm', ...(recipientId ? { recipientId } : {}) },
+    metadata: {
+      channelType: opts.channelType ?? 'dm',
+      ...(opts.recipientId ? { recipientId: opts.recipientId } : {}),
+      ...(opts.recipientName ? { recipientName: opts.recipientName } : {}),
+    },
   };
 }
 
@@ -327,7 +335,7 @@ test('a DM registered live resolves after a restart via @name, not just the lite
   const { store } = memoryStore();
   const first = makeRegistry(store);
   await first.handleRegister('discord', {
-    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', '123456789')],
+    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', { recipientId: '123456789' })],
   });
 
   // Live check: '@antra' already resolves live, before any restart —
@@ -357,7 +365,7 @@ test('a DM registered live resolves after a restart via the <@id> mention form (
   const { store } = memoryStore();
   const first = makeRegistry(store);
   await first.handleRegister('discord', {
-    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', '123456789')],
+    channels: [dmDescriptor('discord:dm:antra', 'DM: antra', { recipientId: '123456789' })],
   });
 
   const restarted = makeRegistry(store);
@@ -382,4 +390,86 @@ test('a bare (non-DM-metadata) channel whose id merely contains ":dm:" is still 
     channelId: 'discord:dm:5',
     label: 'DM: ghost',
   });
+});
+
+test('a DM whose live username differs from its display label resolves by USERNAME after a restart (finding: recipientName persistence)', async () => {
+  // id `discord:dm:42`, label "DM: Tess" — but the actual live resolver
+  // prefers metadata.recipientName ("antra_tessera") over the label for
+  // DM name-matching, so '@antra_tessera' must resolve live, and the
+  // durable fallback (which previously only had the label "Tess" to
+  // search) needs recipientName persisted to answer it too.
+  const { store } = memoryStore();
+  const first = makeRegistry(store);
+  await first.handleRegister('discord', {
+    channels: [dmDescriptor('discord:dm:42', 'DM: Tess', { recipientName: 'antra_tessera' })],
+  });
+
+  // Live check: the live resolver already prefers recipientName over the
+  // label for DM matching — establishes this is real behavior to mirror,
+  // not an invented requirement.
+  assert.deepEqual(first.resolveProseTarget('@antra_tessera'), {
+    channelId: 'discord:dm:42',
+    label: 'DM: Tess',
+  });
+
+  const restarted = makeRegistry(store);
+  const liveMiss = restarted.resolveProseTarget('@antra_tessera');
+  assert.ok('error' in liveMiss, 'expected a live-path miss on a fresh registry');
+
+  // Durable fallback must resolve it by USERNAME, not just by the label text.
+  assert.deepEqual(restarted.resolveProseTargetDurable('@antra_tessera'), {
+    channelId: 'discord:dm:42',
+    label: 'DM: Tess',
+  });
+  // The label-derived name ("tess") must still work too — recipientName is
+  // additive, not a replacement for the label fallback.
+  assert.deepEqual(restarted.resolveProseTargetDurable('@tess'), {
+    channelId: 'discord:dm:42',
+    label: 'DM: Tess',
+  });
+});
+
+test('a DM classified only via metadata.channelType (non-conventional id/label) is still recognized and resolvable after a restart (finding: isDm persistence)', async () => {
+  // id `private-room-42` (no ":dm:"), label "Tess" (no "DM: " prefix) — the
+  // ONLY signal this is a DM at all is metadata.channelType === 'dm',
+  // which the live resolver checks FIRST. Without persisting that
+  // classification, the durable fallback's DM classifier has no way to
+  // even consider this channel a DM once disconnected, let alone resolve
+  // a <@id> mention against it.
+  const { store } = memoryStore();
+  const first = makeRegistry(store);
+  await first.handleRegister('discord', {
+    channels: [dmDescriptor('private-room-42', 'Tess', { recipientId: '42', channelType: 'dm' })],
+  });
+
+  // Live check: classified as a DM live via metadata alone.
+  assert.deepEqual(first.resolveProseTarget('<@42>'), {
+    channelId: 'private-room-42',
+    label: 'Tess',
+  });
+
+  const restarted = makeRegistry(store);
+  const liveMiss = restarted.resolveProseTarget('<@42>');
+  assert.ok('error' in liveMiss, 'expected a live-path miss on a fresh registry');
+
+  // Durable fallback must still recognize it as a DM (via the persisted
+  // isDm classification, not id/label shape) and resolve the mention.
+  assert.deepEqual(restarted.resolveProseTargetDurable('<@42>'), {
+    channelId: 'private-room-42',
+    label: 'Tess',
+  });
+  assert.deepEqual(restarted.resolveProseTargetDurable('@tess'), {
+    channelId: 'private-room-42',
+    label: 'Tess',
+  });
+});
+
+test('a non-DM channel sighting never durably asserts isDm:false (only positive classification is ever persisted)', async () => {
+  const { store, events } = memoryStore();
+  const registry = makeRegistry(store);
+  await registry.handleRegister('discord', { channels: [descriptor('discord:g1:c1', '#general')] });
+
+  const log = events.get(CHANNEL_LABEL_HISTORY_LOG_ID) ?? [];
+  assert.equal(log.length, 1);
+  assert.equal((log[0] as { isDm?: boolean }).isDm, undefined, 'a plain guild channel must not record isDm at all');
 });

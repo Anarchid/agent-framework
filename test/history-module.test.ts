@@ -636,6 +636,32 @@ describe('HistoryModule', () => {
       assert.equal((queryCall?.args as { channelId?: string }).channelId, 'c1');
     });
 
+    it('an unresolvable <@id>/<@!id> mention form surfaces the clean error on extract/stats/search/overview, not a silent empty result (finding: mention-form escape-hatch gap)', async () => {
+      const { cm } = buildStub(FIXTURE);
+      const registry = {
+        resolveProseTargetDurable(_spec: string) {
+          return { error: 'no registered DM matches the mention <@999>' };
+        },
+      } as unknown as ChannelRegistry;
+
+      for (const mention of ['<@999>', '<@!999>']) {
+        for (const toolName of ['extract', 'stats', 'search', 'overview']) {
+          const h = new HistoryModule();
+          h.bind(cm, registry);
+          const input: Record<string, unknown> = { channelId: mention };
+          if (toolName === 'search') input.query = 'x';
+          const result = await h.handleToolCall(call(toolName, input));
+          assert.equal(result.success, false, `${toolName}(${mention}) should error, not silently succeed`);
+          assert.equal(result.isError, true);
+          assert.match(
+            result.error ?? '',
+            /No channel history found/i,
+            `${toolName}(${mention}) should surface the clean resolution error`,
+          );
+        }
+      }
+    });
+
     it('regression guard: an unbound module (bind(cm) only, no registry) still accepts a raw id unchanged', async () => {
       const { cm, calls } = buildStub(FIXTURE);
       const h = new HistoryModule();

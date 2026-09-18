@@ -126,6 +126,16 @@ const SEARCH_MAX_MAX_SCAN = 50000;
 const OVERVIEW_DEFAULT_LIMIT = 50;
 const OVERVIEW_MAX_LIMIT = 200;
 
+/**
+ * A `<@id>`/`<@!id>` Discord-style mention — same shape `ChannelRegistry`
+ * uses for its own DM mention-form matching. A string matching this can
+ * never legitimately BE a raw internal channelId (unlike a bare word,
+ * which an agent could plausibly be echoing back), so `resolveChannel`
+ * treats an unresolved mention the same as an unresolved `#`/`@` label:
+ * a clean error, not a silent empty-result passthrough.
+ */
+const DM_MENTION_RE = /^<@!?\d+>$/;
+
 /** Characters of surrounding context kept on each side of a search snippet. */
 const SNIPPET_CONTEXT_CHARS = 80;
 /** Fallback snippet length when a match position isn't meaningful to center on. */
@@ -182,12 +192,16 @@ export class HistoryModule implements Module {
    *
    * Falls through the input unchanged when no registry is bound (host
    * without MCPL — today's behavior). On a registry MISS, the response
-   * depends on whether the spec actually looks like a label: `#general` or
-   * `@name` (the syntax `resolveProseTarget` itself treats as unambiguously
-   * label-shaped — see its own leading `#`/`@` handling) is very likely a
-   * typo, not a raw internal id, so a miss there throws a clean tool error
-   * (with any `candidates` suggestions folded in) instead of quietly
-   * treating the typo as an empty/nonexistent channel. Anything else is
+   * depends on whether the spec actually looks like a label: `#general`,
+   * `@name`, or a `<@id>`/`<@!id>` mention (the syntaxes `resolveProseTarget`
+   * itself treats as unambiguously label-shaped — see its own leading
+   * `#`/`@` and mention-regex handling) is very likely a typo or a
+   * never-registered target, not a raw internal id, so a miss there throws
+   * a clean tool error (with any `candidates` suggestions folded in)
+   * instead of quietly treating it as an empty/nonexistent channel. A
+   * mention in particular can never legitimately BE a raw internal
+   * channelId, so the escape-hatch rationale below doesn't even apply to
+   * it. Anything else is
    * passed through as an escape hatch — an agent can legitimately already
    * hold a raw channelId (e.g. echoed back by a prior
    * `stats`/`extract`/`search`/`overview` call), and erroring on that would
@@ -206,7 +220,7 @@ export class HistoryModule implements Module {
     if (!input || !this.channelRegistry) return input;
     const resolved = this.channelRegistry.resolveProseTargetDurable(input);
     if (!('error' in resolved)) return resolved.channelId;
-    if (input.startsWith('#') || input.startsWith('@')) {
+    if (input.startsWith('#') || input.startsWith('@') || DM_MENTION_RE.test(input)) {
       const suggestions = resolved.candidates?.length ? ` Did you mean: ${resolved.candidates.join(', ')}?` : '';
       throw new Error(
         `No channel history found for "${input}" — it may never have been seen by this resident, or predates this feature.${suggestions}`,
@@ -229,6 +243,19 @@ export class HistoryModule implements Module {
     const cm = this.cm as ContextManager;
     const probe = cm.queryMessagesByTime({ toMs, limit: 1 });
     return probe.messages[0]?.timestamp.getTime();
+  }
+
+  /**
+   * Every raw message sharing exactly `ms` (a single-point, both-ends-
+   * inclusive time query). Used by `handleOverview`'s boundary-tie
+   * disambiguation to see past `getChannelTokenStats`'s aggregate-only,
+   * sequence-blind view of a millisecond — see the correction pass there
+   * for why. Cheap: at most a handful of messages share one millisecond in
+   * practice.
+   */
+  private boundaryMessagesAt(ms: number): StoredMessage[] {
+    const cm = this.cm as ContextManager;
+    return cm.queryMessagesByTime({ fromMs: ms, toMs: ms }).messages;
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -321,7 +348,10 @@ export class HistoryModule implements Module {
           'walks the underlying message range wherever nothing has been summarized yet. Response spans are ' +
           'capped at `limit`, keeping the MOST RECENT spans and reporting truncated:true + totalSpans when ' +
           'more exist — narrow the range or raise `limit` to see further back. `from` after `to` is rejected ' +
-          'with a clear error rather than silently returning no spans.',
+          'with a clear error rather than silently returning no spans. An entry marked boundaryUncertain:true ' +
+          'had a millisecond-timestamp collision at its edge with another span (rare — two distinct messages ' +
+          'landing in the same millisecond); its messageCount is still exact but tokensEstimate may be off by ' +
+          'a small, bounded amount.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -686,7 +716,15 @@ export class HistoryModule implements Module {
 
     // Per-summary channel/token stats — same call `stats` uses, scoped to
     // just this entry's own source span.
-    const summarized = entries.map((entry) => ({
+    const summarized: Array<{
+      startMs: number;
+      endMs: number;
+      summarized: true;
+      content: string;
+      level: number;
+      stats: ChannelTokenStats;
+      boundaryUncertain?: boolean;
+    }> = entries.map((entry) => ({
       startMs: entry.startMs,
       endMs: entry.endMs,
       summarized: true as const,
@@ -724,7 +762,7 @@ export class HistoryModule implements Module {
           : earliestMessageMs ?? firstEntryStartMs ?? Date.now();
     }
 
-    const gaps: Array<{ startMs: number; endMs: number; summarized: false; stats: ChannelTokenStats }> = [];
+    const gaps: Array<{ startMs: number; endMs: number; summarized: false; stats: ChannelTokenStats; boundaryUncertain?: boolean }> = [];
     // True once `cursor` has been advanced past at least one real summary
     // entry's endMs — only THEN is `cursor` itself a value that a summary
     // already claims (and so needs a +1 nudge below to probe half-open).
@@ -775,6 +813,75 @@ export class HistoryModule implements Module {
         const stats = cm.getChannelTokenStats({ fromMs: probeFrom, toMs: probeTo });
         if (stats.totalMessages > 0) gaps.push({ startMs: probeFrom, endMs: probeTo, summarized: false, stats });
       }
+    }
+
+    // Boundary-tie disambiguation: getChannelTokenStats operates on
+    // wall-clock TIME ranges and has no visibility into chronicle's
+    // sequence numbers, so whenever a message that's genuinely NOT part of
+    // a summary's source span happens to share the EXACT millisecond with
+    // that summary's own first/last covered message (rapid-fire appends —
+    // wall-clock ms resolution isn't unique, sequence is), the per-span
+    // aggregate calls above silently fold it into the summary's counts —
+    // and the adjacent gap probe (which deliberately EXCLUDES that same ms
+    // via the half-open nudge, on the assumption the boundary ms belongs
+    // entirely to the neighboring summary) has no way to see it at all: it
+    // doesn't just get miscounted, it vanishes from the response entirely.
+    //
+    // Resolved using TimeRangeSummaryEntry's firstSequence/lastSequence
+    // (chronicle's per-record sequence number — strictly monotonic, never
+    // ties, unlike wall-clock ms) against the ACTUAL messages at each
+    // boundary ms (queried directly via boundaryMessagesAt — cheap, at
+    // most a handful of messages share one millisecond in practice).
+    //
+    // A "foreign" message found this way either belongs to ANOTHER fetched
+    // summary entry (its sequence falls in THAT entry's own range — its
+    // own inclusive-range getChannelTokenStats call already counts it
+    // correctly, so this entry just needs the erroneous count subtracted,
+    // nothing added elsewhere) or is genuinely unsummarized (belongs to the
+    // adjacent gap, extending it — or creating a new point-width gap
+    // fragment if no gap was probed there at all, which is exactly the
+    // "vanishes entirely" failure mode this fix exists for).
+    //
+    // MESSAGE COUNT/membership is corrected exactly — we know precisely
+    // which raw messages are foreign and their channelId. TOKEN weight for
+    // those specific messages is deliberately NOT recomputed:
+    // getChannelTokenStats can only report tokens for a TIME range, never
+    // for an arbitrary message subset, and reimplementing token estimation
+    // locally would silently drift from context-manager's own (mutable,
+    // calibration-adjusted) estimate — worse than admitting the gap. Any
+    // entry this pass touches is marked `boundaryUncertain: true` so a
+    // caller knows its tokensEstimate may be off by the small, bounded
+    // weight of the message(s) that moved, even though messageCount there
+    // is exact.
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i]!;
+      const own = summarized[i]!;
+      const boundaryMsList = entry.startMs === entry.endMs ? [entry.startMs] : [entry.startMs, entry.endMs];
+      const foreignById = new Map<string, StoredMessage>();
+      for (const ms of boundaryMsList) {
+        for (const m of this.boundaryMessagesAt(ms)) {
+          if (m.sequence < entry.firstSequence || m.sequence > entry.lastSequence) {
+            foreignById.set(String(m.id), m);
+          }
+        }
+      }
+      if (foreignById.size === 0) continue;
+
+      const genuinelyUnsummarized: StoredMessage[] = [];
+      for (const m of foreignById.values()) {
+        const owner = entries.find(
+          (e) => e.id !== entry.id && m.sequence >= e.firstSequence && m.sequence <= e.lastSequence,
+        );
+        if (!owner) genuinelyUnsummarized.push(m);
+      }
+
+      own.stats = subtractMessagesFromStats(own.stats, [...foreignById.values()]);
+      own.boundaryUncertain = true;
+
+      const before = genuinelyUnsummarized.filter((m) => m.sequence < entry.firstSequence);
+      const after = genuinelyUnsummarized.filter((m) => m.sequence > entry.lastSequence);
+      if (before.length > 0) mergeForeignIntoGap(gaps, entry.startMs, 'before', before);
+      if (after.length > 0) mergeForeignIntoGap(gaps, entry.endMs, 'after', after);
     }
 
     // Merge summary-backed + gap-filled spans, apply the channel filter
@@ -838,6 +945,12 @@ export class HistoryModule implements Module {
             to: new Date(e.endMs).toISOString(),
             summarized: e.summarized,
             ...(e.summarized ? { content: e.content, level: e.level } : {}),
+            // Set only when this entry's boundary-tie disambiguation (see
+            // the correction pass above) found and corrected a
+            // millisecond-timestamp collision at its edge. messageCount is
+            // still exact there; tokensEstimate may be off by the small,
+            // bounded weight of the message(s) that moved.
+            ...(e.boundaryUncertain ? { boundaryUncertain: true } : {}),
             messageCount: channelStats ? channelStats.messages : e.stats.totalMessages,
             tokensEstimate: channelStats ? channelStats.tokensEstimate : e.stats.totalTokensEstimate,
             ...(channelId ? { spanMessageCount: e.stats.totalMessages, spanTokensEstimate: e.stats.totalTokensEstimate } : {}),
@@ -922,6 +1035,106 @@ function getChannelId(msg: StoredMessage): string | undefined {
   const metadata = msg.metadata as { channelId?: unknown; external?: { channelId?: unknown } } | undefined;
   if (typeof metadata?.channelId === 'string') return metadata.channelId;
   return typeof metadata?.external?.channelId === 'string' ? metadata.external.channelId : undefined;
+}
+
+// ============================================================================
+// overview: boundary-tie correction helpers (see handleOverview)
+// ============================================================================
+
+/**
+ * Subtract the exact per-channel MESSAGE COUNT of `foreign` from `stats` —
+ * used to correct a summary entry's own stats once boundary-tie
+ * disambiguation finds messages counted in error (see handleOverview's
+ * correction pass). Deliberately leaves totalTokensEstimate/
+ * byChannel[].tokensEstimate untouched — see that pass's header comment
+ * for why an exact token subtraction isn't achievable from the available
+ * API.
+ */
+function subtractMessagesFromStats(stats: ChannelTokenStats, foreign: StoredMessage[]): ChannelTokenStats {
+  if (foreign.length === 0) return stats;
+  const countByChannel = new Map<string, number>();
+  for (const m of foreign) {
+    const ch = getChannelId(m);
+    if (ch === undefined) continue; // unchanneled messages aren't tracked in byChannel at all
+    countByChannel.set(ch, (countByChannel.get(ch) ?? 0) + 1);
+  }
+  const byChannel = stats.byChannel
+    .map((c) => ({ ...c, messages: Math.max(0, c.messages - (countByChannel.get(c.channelId) ?? 0)) }))
+    .filter((c) => c.messages > 0);
+  return {
+    totalMessages: Math.max(0, stats.totalMessages - foreign.length),
+    totalTokensEstimate: stats.totalTokensEstimate,
+    byChannel,
+  };
+}
+
+/**
+ * Exact per-channel MESSAGE COUNT for a small raw message list, with
+ * tokensEstimate left at 0 (unknown — see handleOverview's boundary-tie
+ * correction pass). Only ever used to build a BRAND NEW synthetic gap
+ * fragment out of boundary-tie foreign messages — a real query result
+ * always goes through the real getChannelTokenStats aggregate instead.
+ */
+function statsFromMessages(messages: StoredMessage[]): ChannelTokenStats {
+  const byChannel = new Map<string, number>();
+  for (const m of messages) {
+    const ch = getChannelId(m);
+    if (ch === undefined) continue;
+    byChannel.set(ch, (byChannel.get(ch) ?? 0) + 1);
+  }
+  return {
+    totalMessages: messages.length,
+    totalTokensEstimate: 0,
+    byChannel: [...byChannel.entries()].map(([channelId, count]) => ({ channelId, messages: count, tokensEstimate: 0 })),
+  };
+}
+
+/** Add `b`'s counts into `a` — used to fold boundary-tie foreign messages
+ *  into an already-probed gap's stats. */
+function mergeStats(a: ChannelTokenStats, b: ChannelTokenStats): ChannelTokenStats {
+  const byChannel = new Map<string, { messages: number; tokensEstimate: number }>();
+  for (const c of a.byChannel) byChannel.set(c.channelId, { messages: c.messages, tokensEstimate: c.tokensEstimate });
+  for (const c of b.byChannel) {
+    const cur = byChannel.get(c.channelId) ?? { messages: 0, tokensEstimate: 0 };
+    cur.messages += c.messages;
+    cur.tokensEstimate += c.tokensEstimate;
+    byChannel.set(c.channelId, cur);
+  }
+  return {
+    totalMessages: a.totalMessages + b.totalMessages,
+    totalTokensEstimate: a.totalTokensEstimate + b.totalTokensEstimate,
+    byChannel: [...byChannel.entries()].map(([channelId, v]) => ({ channelId, ...v })),
+  };
+}
+
+/**
+ * Fold boundary-tie `foreign` messages into whichever gap sits immediately
+ * `side` of `boundaryMs`, extending that gap's span to include the tied
+ * millisecond — or, if no such gap currently exists (the common case when
+ * the seam had zero OTHER real traffic and so was never probed into
+ * existence), create a new point-width gap fragment exactly at
+ * `boundaryMs` to hold them. Always marks the result `boundaryUncertain:
+ * true` (see handleOverview's boundary-tie correction pass for what that
+ * means).
+ */
+function mergeForeignIntoGap(
+  gaps: Array<{ startMs: number; endMs: number; summarized: false; stats: ChannelTokenStats; boundaryUncertain?: boolean }>,
+  boundaryMs: number,
+  side: 'before' | 'after',
+  foreign: StoredMessage[],
+): void {
+  const addend = statsFromMessages(foreign);
+  const existing =
+    side === 'before' ? gaps.find((g) => g.endMs === boundaryMs - 1) : gaps.find((g) => g.startMs === boundaryMs + 1);
+
+  if (existing) {
+    existing.stats = mergeStats(existing.stats, addend);
+    if (side === 'before') existing.endMs = boundaryMs;
+    else existing.startMs = boundaryMs;
+    existing.boundaryUncertain = true;
+  } else {
+    gaps.push({ startMs: boundaryMs, endMs: boundaryMs, summarized: false, stats: addend, boundaryUncertain: true });
+  }
 }
 
 function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<string, unknown> {

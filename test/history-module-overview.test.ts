@@ -16,6 +16,22 @@ import type { ToolCall } from '../src/types/events.js';
  */
 
 interface StubMessage {
+  /** Defaults to `m${index in the fixture array}` when omitted — fine for
+   *  any test that doesn't care about specific ids (most of them). */
+  id?: string;
+  /** Defaults to the message's index in the fixture array when omitted —
+   *  fine for any test that doesn't exercise boundary-tie disambiguation
+   *  (see `summary()`'s firstSequence/lastSequence default, which makes
+   *  every message "belong" to every summary unless a test opts in). */
+  sequence?: number;
+  ms: number;
+  channelId: string;
+  tokens: number;
+}
+
+interface NormalizedStubMessage {
+  id: string;
+  sequence: number;
   ms: number;
   channelId: string;
   tokens: number;
@@ -27,7 +43,13 @@ function buildStub(opts: {
   maxSummaryLevel?: number;
 }): { cm: ContextManager; calls: Array<{ method: string; args: unknown }> } {
   const summaries = opts.summaries ?? [];
-  const messages = opts.messages ?? [];
+  const messages: NormalizedStubMessage[] = (opts.messages ?? []).map((m, i) => ({
+    id: m.id ?? `m${i}`,
+    sequence: m.sequence ?? i,
+    ms: m.ms,
+    channelId: m.channelId,
+    tokens: m.tokens,
+  }));
   const calls: Array<{ method: string; args: unknown }> = [];
 
   const cm = {
@@ -67,10 +89,11 @@ function buildStub(opts: {
         byChannel: [...byChannel.entries()].map(([channelId, agg]) => ({ channelId, ...agg })),
       };
     },
-    // Only ever called by HistoryModule.earliestMessageMs() with `{ toMs,
-    // limit: 1 }` — oldest-first by default, so the first returned message
-    // is the earliest one at or before `toMs`. Real matchedCount/paging
-    // fidelity isn't exercised by that caller, so this stub keeps it simple.
+    // Called both by HistoryModule.earliestMessageMs() (`{ toMs, limit: 1
+    // }`) and by boundaryMessagesAt() (`{ fromMs: ms, toMs: ms }`, a
+    // single-point query used for boundary-tie disambiguation) — so, unlike
+    // the previous round's stub, this now needs to return real message
+    // identity (id/sequence/metadata), not just a bare timestamp.
     queryMessagesByTime(args: { fromMs?: number; toMs?: number; limit?: number; offset?: number; reverse?: boolean }) {
       calls.push({ method: 'queryMessagesByTime', args });
       let inRange = messages
@@ -84,7 +107,14 @@ function buildStub(opts: {
       if (args.reverse) inRange = inRange.reverse();
       const offset = args.offset ?? 0;
       const limit = args.limit ?? inRange.length;
-      const page = inRange.slice(offset, offset + limit).map((m) => ({ timestamp: new Date(m.ms) }));
+      const page = inRange.slice(offset, offset + limit).map((m) => ({
+        id: m.id,
+        sequence: m.sequence,
+        timestamp: new Date(m.ms),
+        participant: 'User',
+        content: [],
+        metadata: { channelId: m.channelId },
+      }));
       return { messages: page, matchedCount: inRange.length };
     },
   } as unknown as ContextManager;
@@ -102,7 +132,21 @@ function summary(
   startMs: number,
   endMs: number,
   content: string,
-  opts: { parentId?: string } = {},
+  opts: {
+    parentId?: string;
+    /** Sequence range this summary's source messages actually span —
+     *  defaults to "everything belongs" (-Infinity..Infinity) so tests
+     *  that don't care about boundary-tie disambiguation (the vast
+     *  majority) never trigger it by accident: any message found at a
+     *  boundary ms trivially satisfies a -Infinity..Infinity range and is
+     *  never flagged foreign. Set explicitly (alongside firstMessageId/
+     *  lastMessageId) to exercise handleOverview's boundary-tie
+     *  correction pass. */
+    firstSequence?: number;
+    lastSequence?: number;
+    firstMessageId?: string;
+    lastMessageId?: string;
+  } = {},
 ): TimeRangeSummaryEntry {
   return {
     id,
@@ -113,7 +157,11 @@ function summary(
     endMs,
     createdMs: endMs,
     sourceIds: [`${id}-src`],
-    ...opts,
+    firstMessageId: opts.firstMessageId ?? `${id}-first`,
+    lastMessageId: opts.lastMessageId ?? `${id}-last`,
+    firstSequence: opts.firstSequence ?? Number.NEGATIVE_INFINITY,
+    lastSequence: opts.lastSequence ?? Number.POSITIVE_INFINITY,
+    ...(opts.parentId ? { parentId: opts.parentId } : {}),
   };
 }
 
@@ -625,6 +673,123 @@ describe('HistoryModule.overview', () => {
     assert.equal(data.entries[0]!.summarized, false);
     assert.equal(data.entries[0]!.messageCount, 1);
     assert.equal(data.entries[0]!.from, new Date(5000).toISOString());
+  });
+
+  it("reviewer's exact repro: two distinct messages sharing a timestamp, only one covered by a summary — both correctly and separately accounted for (boundary-tie finding)", async () => {
+    const T = 5000;
+    const { cm } = buildStub({
+      summaries: [
+        summary('s1', 1, T, T, 'covers FIRST only', {
+          firstSequence: 10,
+          lastSequence: 10,
+          firstMessageId: 'FIRST',
+          lastMessageId: 'FIRST',
+        }),
+      ],
+      messages: [
+        { id: 'FIRST', sequence: 10, ms: T, channelId: 'c1', tokens: 5 },
+        { id: 'SECOND', sequence: 11, ms: T, channelId: 'c1', tokens: 7 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(T).toISOString(), to: new Date(T).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: Array<OverviewEntry & { boundaryUncertain?: boolean }> };
+
+    const summarizedEntries = data.entries.filter((e) => e.summarized);
+    const gapEntries = data.entries.filter((e) => !e.summarized);
+    assert.equal(summarizedEntries.length, 1, `expected exactly one summary entry, got ${JSON.stringify(data.entries)}`);
+    assert.equal(gapEntries.length, 1, `expected SECOND to surface as its own gap entry, got ${JSON.stringify(data.entries)}`);
+
+    // FIRST alone — SECOND must no longer be silently folded into the
+    // summary's own count (the reported bug: messageCount: 2 for a summary
+    // that only ever covered FIRST).
+    assert.equal(summarizedEntries[0]!.messageCount, 1);
+    assert.equal(summarizedEntries[0]!.boundaryUncertain, true);
+
+    // SECOND, correctly surfaced as unsummarized — not silently dropped.
+    assert.equal(gapEntries[0]!.messageCount, 1);
+    assert.equal(gapEntries[0]!.boundaryUncertain, true);
+
+    // Nothing lost, nothing double-counted across the whole response.
+    const totalMessages = data.entries.reduce((n, e) => n + e.messageCount, 0);
+    assert.equal(totalMessages, 2);
+  });
+
+  it('a boundary tie between two DIFFERENT channels splits byChannel correctly', async () => {
+    const T = 8000;
+    const { cm } = buildStub({
+      summaries: [
+        summary('s1', 1, T, T, 'covers FIRST only', {
+          firstSequence: 1,
+          lastSequence: 1,
+          firstMessageId: 'FIRST',
+          lastMessageId: 'FIRST',
+        }),
+      ],
+      messages: [
+        { id: 'FIRST', sequence: 1, ms: T, channelId: 'c1', tokens: 5 },
+        { id: 'SECOND', sequence: 2, ms: T, channelId: 'c2', tokens: 9 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(T).toISOString(), to: new Date(T).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+    const summarizedEntry = data.entries.find((e) => e.summarized)!;
+    const gapEntry = data.entries.find((e) => !e.summarized)!;
+    assert.deepEqual(summarizedEntry.byChannel.map((c) => c.channelId), ['c1']);
+    assert.deepEqual(gapEntry.byChannel.map((c) => c.channelId), ['c2']);
+  });
+
+  it('a tied boundary between two ADJACENT summaries routes each stray message back to its true owner, without fabricating a spurious gap', async () => {
+    // E's last covered message and F's first covered message happen to
+    // share the exact same millisecond (both summaries' sourceRanges are
+    // genuinely disjoint by SEQUENCE — this is a timestamp coincidence,
+    // not a real overlap). Neither message is actually unsummarized, so no
+    // gap should appear at all: each summary's stray gets attributed back
+    // to the OTHER summary, which already counts it correctly via its own
+    // inclusive-range call.
+    const tieMs = 9000;
+    const { cm } = buildStub({
+      summaries: [
+        summary('E', 1, 1000, tieMs, 'chapter E', { firstSequence: 0, lastSequence: 1, firstMessageId: 'e1', lastMessageId: 'e2' }),
+        summary('F', 1, tieMs, 20000, 'chapter F', { firstSequence: 2, lastSequence: 3, firstMessageId: 'f1', lastMessageId: 'f2' }),
+      ],
+      messages: [
+        { id: 'e1', sequence: 0, ms: 1000, channelId: 'c1', tokens: 5 },
+        { id: 'e2', sequence: 1, ms: tieMs, channelId: 'c1', tokens: 5 }, // E's own last message
+        { id: 'f1', sequence: 2, ms: tieMs, channelId: 'c1', tokens: 5 }, // F's own first message — SAME ms as e2
+        { id: 'f2', sequence: 3, ms: 20_000, channelId: 'c1', tokens: 5 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(1000).toISOString(), to: new Date(20_000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: Array<OverviewEntry & { boundaryUncertain?: boolean }> };
+    assert.equal(data.entries.length, 2, `expected only E and F, no spurious gap, got ${JSON.stringify(data.entries)}`);
+    assert.ok(
+      data.entries.every((e) => e.summarized),
+      'no unsummarized gap should be fabricated for a tie between two real summaries',
+    );
+    const e = data.entries.find((x) => x.content === 'chapter E')!;
+    const f = data.entries.find((x) => x.content === 'chapter F')!;
+    assert.equal(e.messageCount, 2, "E should report its own 2 genuine messages (e1, e2), not F's stray f1");
+    assert.equal(f.messageCount, 2, "F should report its own 2 genuine messages (f1, f2), not E's stray e2");
+    assert.equal(e.boundaryUncertain, true);
+    assert.equal(f.boundaryUncertain, true);
   });
 
   it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
