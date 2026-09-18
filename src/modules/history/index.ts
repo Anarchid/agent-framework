@@ -853,9 +853,33 @@ export class HistoryModule implements Module {
     // caller knows its tokensEstimate may be off by the small, bounded
     // weight of the message(s) that moved, even though messageCount there
     // is exact.
+    // Messages already routed into a gap by an EARLIER entry's pass in this
+    // same loop — without this, two entries that both touch the same
+    // boundary millisecond (e.g. summary A ends and summary B starts at the
+    // exact same ms, with one genuinely-unsummarized stray message also at
+    // that ms) each independently decide "not mine, not any other fetched
+    // SUMMARY's either" and BOTH call mergeForeignIntoGap for the same
+    // stray — mergeForeignIntoGap's own gap-lookup only checks for a gap
+    // immediately adjacent to ITS OWN entry's boundary, so it can't see the
+    // point-width gap the other entry's pass just created one step away,
+    // and the same message gets double-counted into two separate gap
+    // entries. Tracking ids already merged (not just already-seen) across
+    // the whole loop — not just within one entry's own pass — closes this.
+    const alreadyMergedForeignIds = new Set<string>();
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i]!;
       const own = summarized[i]!;
+      // Defensive: firstSequence/lastSequence are new fields on
+      // TimeRangeSummaryEntry (added alongside this correction pass) — if
+      // this module ever ends up running against an OLDER published
+      // context-manager whose getSummariesInRange doesn't populate them
+      // (undefined, not a type error at runtime), every comparison below
+      // would silently evaluate false, foreignById would always be empty,
+      // and this whole pass would silently no-op — resurrecting the exact
+      // boundary-tie bug it exists to fix, with no error and no
+      // boundaryUncertain signal. Skip explicitly instead of trusting the
+      // type system alone.
+      if (typeof entry.firstSequence !== 'number' || typeof entry.lastSequence !== 'number') continue;
       const boundaryMsList = entry.startMs === entry.endMs ? [entry.startMs] : [entry.startMs, entry.endMs];
       const foreignById = new Map<string, StoredMessage>();
       for (const ms of boundaryMsList) {
@@ -870,9 +894,14 @@ export class HistoryModule implements Module {
       const genuinelyUnsummarized: StoredMessage[] = [];
       for (const m of foreignById.values()) {
         const owner = entries.find(
-          (e) => e.id !== entry.id && m.sequence >= e.firstSequence && m.sequence <= e.lastSequence,
+          (e) =>
+            e.id !== entry.id &&
+            typeof e.firstSequence === 'number' &&
+            typeof e.lastSequence === 'number' &&
+            m.sequence >= e.firstSequence &&
+            m.sequence <= e.lastSequence,
         );
-        if (!owner) genuinelyUnsummarized.push(m);
+        if (!owner && !alreadyMergedForeignIds.has(String(m.id))) genuinelyUnsummarized.push(m);
       }
 
       own.stats = subtractMessagesFromStats(own.stats, [...foreignById.values()]);
@@ -880,8 +909,14 @@ export class HistoryModule implements Module {
 
       const before = genuinelyUnsummarized.filter((m) => m.sequence < entry.firstSequence);
       const after = genuinelyUnsummarized.filter((m) => m.sequence > entry.lastSequence);
-      if (before.length > 0) mergeForeignIntoGap(gaps, entry.startMs, 'before', before);
-      if (after.length > 0) mergeForeignIntoGap(gaps, entry.endMs, 'after', after);
+      if (before.length > 0) {
+        mergeForeignIntoGap(gaps, entry.startMs, 'before', before);
+        for (const m of before) alreadyMergedForeignIds.add(String(m.id));
+      }
+      if (after.length > 0) {
+        mergeForeignIntoGap(gaps, entry.endMs, 'after', after);
+        for (const m of after) alreadyMergedForeignIds.add(String(m.id));
+      }
     }
 
     // Merge summary-backed + gap-filled spans, apply the channel filter

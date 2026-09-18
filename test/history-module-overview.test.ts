@@ -792,6 +792,48 @@ describe('HistoryModule.overview', () => {
     assert.equal(f.boundaryUncertain, true);
   });
 
+  it('a genuinely-unsummarized stray at a millisecond shared by two adjacent summaries is counted ONCE, not merged into two duplicate gaps', async () => {
+    // Same shape as the previous test (E ends and F starts at the same ms),
+    // but this time a THIRD, genuinely-unsummarized message (STRAY) also
+    // sits at that exact millisecond, with a sequence between E's and F's
+    // ranges. Both E's and F's correction passes independently discover
+    // STRAY is foreign to them and belongs to neither the other summary —
+    // each, considered alone, would call mergeForeignIntoGap for it. Without
+    // cross-entry dedup, mergeForeignIntoGap's adjacent-only gap lookup
+    // can't see the OTHER entry's just-created point-width gap one step
+    // away, so STRAY would land in two separate gap entries — double
+    // counted. It must appear exactly once.
+    const tieMs = 9000;
+    const { cm } = buildStub({
+      summaries: [
+        summary('E', 1, 1000, tieMs, 'chapter E', { firstSequence: 0, lastSequence: 1, firstMessageId: 'e1', lastMessageId: 'e2' }),
+        summary('F', 1, tieMs, 20000, 'chapter F', { firstSequence: 3, lastSequence: 4, firstMessageId: 'f1', lastMessageId: 'f2' }),
+      ],
+      messages: [
+        { id: 'e1', sequence: 0, ms: 1000, channelId: 'c1', tokens: 5 },
+        { id: 'e2', sequence: 1, ms: tieMs, channelId: 'c1', tokens: 5 }, // E's own last message
+        { id: 'stray', sequence: 2, ms: tieMs, channelId: 'c1', tokens: 5 }, // genuinely unsummarized, sequence between E and F
+        { id: 'f1', sequence: 3, ms: tieMs, channelId: 'c1', tokens: 5 }, // F's own first message
+        { id: 'f2', sequence: 4, ms: 20_000, channelId: 'c1', tokens: 5 },
+      ],
+    });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', { from: new Date(1000).toISOString(), to: new Date(20_000).toISOString() }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[] };
+
+    const gapEntries = data.entries.filter((e) => !e.summarized);
+    assert.equal(gapEntries.length, 1, `STRAY must appear in exactly one gap entry, not ${gapEntries.length}: ${JSON.stringify(gapEntries)}`);
+    assert.equal(gapEntries[0]!.messageCount, 1);
+
+    const totalMessageCount = data.entries.reduce((sum, e) => sum + e.messageCount, 0);
+    assert.equal(totalMessageCount, 5, `all 5 real messages must be counted exactly once across the whole response, got ${totalMessageCount}`);
+  });
+
   it('surfaces the capability-absent error as a clean tool error, not a crash', async () => {
     const cm = {
       getSummariesInRange() {
