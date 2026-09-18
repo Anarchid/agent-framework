@@ -12,6 +12,136 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.16.0 — 2026-09-18
+
+### Added
+
+- Host quiesce/maintenance mode (#122): `framework.quiesce()` drains
+  in-flight turns (bounded, optional `abandon`), parks every subsequent wake
+  (coalesced per agent+reason), pauses all MCPL data planes (control planes
+  stay live), defers module/API context writes, and persists `hostMode` so a
+  restart boots quiesced with a loud banner. `framework.resume()` gates on a
+  fresh per-agent feasibility preview of the CURRENT settings (`force` to
+  override; `ResumeBlockedError` carries per-agent verdicts), reopens data
+  planes through the existing barrier funnel, flushes deferred writes and
+  releases parked wakes. `framework.maintenanceTick()` runs one
+  compression/maintenance pass on demand. Surfaces: `host/command` verbs
+  `quiesce` / `resume` / `maintain` / `host-status`; WS `host.quiesce` /
+  `host.resume` / `host.status` / `host.maintenanceTick`; HTTP `GET /hostmode`,
+  `POST /quiesce|/resume|/maintenance/tick` (opt-in `ApiServerConfig.adminToken`,
+  `x-admin-token` header always required on the POST verbs to force a CORS
+  preflight). New traces `host:quiesce`, `host:resume`, `host:quiesced_boot`.
+- Runtime-settings feasibility preview: `framework.previewAgentRuntimeSettings()`
+  and `Agent.planRuntimeSettings()` expose the live→effective budget mapping;
+  `updateAgentRuntimeSettings` preflights an immediate budget LOWERING and
+  throws `BudgetPreflightError` when the folded floor cannot fit (paced
+  descents, increases, no-op rewrites and boot restore are never blocked;
+  `allowInfeasible` overrides).
+- Review hardening of the above: `resume()` flushes deferred writes per
+  message (a poison write cannot drop the rest or skip the data-plane
+  reopen, which now runs in a `finally`); writes deferred while quiesced are
+  persisted (`framework/deferred-writes` slot) and restored at a quiesced
+  boot (`HostModeStatus.deferredWrites`); parked wakes coalesce per
+  (reason, addressed) so a DM/mention parked earlier survives ambient
+  traffic parked later; the `[1s, 10m]` drain clamp lives in `quiesce()` for
+  every ingress; a `quiesce()` superseded by a concurrent `resume()` returns
+  without abandoning anything; `resume()` waits for an in-flight maintenance
+  pass instead of skipping the feasibility verdict; `abandon` reports turns
+  it cannot cancel (`unabandonable`); `tool_results_ready` continuations pass
+  the wake gate like budget restarts; `maintenanceTick()` returns `ran`;
+  `nudge`/`unstick` replies carry `quiesced: true` while parked. ApiServer:
+  WebSocket upgrades from foreign browser origins are refused
+  (`ApiServerConfig.allowedOrigins`; same-host and non-browser clients pass),
+  an empty `adminToken` is rejected at construction, `GET /hostmode` requires
+  the token when one is configured, and `host-command` on the MCPL control
+  plane means a surface `/undo` can now run ahead of pushes still buffered
+  behind a startup/reconnect barrier.
+- Review round 2: quiesce state and the deferred-write queue now live OUTSIDE
+  branch history — `<storePath>/recovery/host-mode.json` and
+  `recovery/deferred-writes.json` (`FrameworkConfig.hostModePath` /
+  `deferredWritesPath`; the branch-local slot is only a fallback for
+  store-only configs, with a warning) — so a historical rollback can no
+  longer erase the marker of the surgery it belongs to or orphan the writes
+  it deferred. A wake parked on provider admission behind an in-flight
+  auxiliary call now rechecks quiesce when the auxiliary settles and is
+  requeued instead of starting a turn; `HostModeStatus.parkedAdmissions`
+  counts such wakes and `drained` is false while any exist. The resume flush
+  acknowledges each deferred write durably as it lands and stamps its id into
+  the stored message's metadata; boot recovers the queue regardless of the
+  mode flag, skips ids that already landed, and the durable flag is cleared
+  only after the flush completes — an interrupted resume neither loses nor
+  duplicates a message.
+- Review round 3: a flushed deferred write is removed from the durable
+  recovery queue only AFTER `store.sync()` has made the appended chronicle
+  slots durable (chronicle persists the slot-chain head on sync, not on
+  append). Every deferred-drain path — resume flush, boot recovery, the
+  turn-start / turn-end / puppet-end flushes — hands its batch to an
+  un-acked set, writes, syncs, and only then rewrites the queue; a failed
+  sync keeps the batch queued (retried at the next ack and at `stop()`).
+  Regression coverage uses a real child process that `process.exit`s
+  mid-resume, both right after the first acknowledgement and before the
+  sync: the reopened host replays exactly the un-landed remainder.
+- Review round 4: one durable id per logical deferred write across every
+  hand-off. Every write that originates from the durable queue — the
+  ordinary turn-start, mid-turn-injection, turn-end and puppet-end flushes,
+  not only the resume flush — stamps `metadata.deferredWriteId`, and a
+  re-deferral (target still busy or host still quiesced when a drained entry
+  is written) moves the same entry back to pending under the same id
+  instead of minting a second replayable one. Two more real child-process
+  crash regressions: exit between an ordinary turn-start flush's sync and
+  its queue rewrite, and exit at a re-deferral's recovery-file write.
+- Review round 5: deferred-write entries carry a monotonic `seq` from first
+  deferral; the durable queue is written, restored, drained and flushed in
+  that order whatever the pending/un-acked split, so a re-deferred member
+  of a batch keeps its place. Each hand-off persists a receipt of the
+  target's store position before anything is written; boot dedup scans from
+  that position to the tail (the whole store when a receipt predates it),
+  never a fixed 2,000-message tail — a synced-but-unacked batch of any size
+  is recognised in full. Recovery file/slot format is v2
+  (`{pending, scanFrom}`); v1 is still read.
+
+- `HistoryModule` gains a fourth tool, `overview`, for browsing conversation
+  history when the caller doesn't already know a specific channel/date/search
+  term: returns existing compression summaries as a table of contents (zero
+  new LLM calls), falling back to raw message/channel counts for spans not
+  yet summarized. `stats`/`extract`/`search`/`overview` now all accept a
+  `channelId` as either a channel label (e.g. `#general`, `@name`, `<@id>`)
+  or the raw internal channel id — resolved via a new durable
+  `ChannelRegistry` label-history log, so a channel is still addressable by
+  name even after the bot disconnects from it (the common case for browsing
+  history on a quiet/old channel, where the live channel registry has
+  nothing).
+
+- Live operator surgery on the open store, no restart: `rollbackToMessage()`
+  forks the chronicle at a message and switches to the fork (the source
+  branch keeps everything after it); `suppressMessages()` forks at head,
+  redacts the chosen messages on the fork (body-group shards always
+  together), and switches. Both are the offline-recovery idiom made live and
+  reuse the Discord awareness outbox (markers for messages that left the
+  context; suppression batches activate only after the last redaction and
+  finish at next boot if interrupted). Both refuse — never queue — while the
+  agent is not idle (`OperatorActionError`, code `agent-busy`). The
+  message-granular `host/command undo` now rides on `rollbackToMessage`
+  (reads windowed, blob-free — no longer re-inflates every attachment on the
+  branch). Its stderr line is now `[operator] rollback …` rather than
+  `[host-command] undo-messages …`, and the reply carries the refusal `code`.
+  Body groups are never bisected: a rollback target inside a sharded message
+  snaps to the group's last shard (`tailMessageId` in the result), and a
+  suppression removes the whole group as a range. The idle gate is the
+  scheduler's own (`idle+turn-alive` counts as busy).
+- `DiscordAwarenessOutbox.discard(batchId)` retires a prepared-but-never-
+  activated batch. Live suppression uses it on every failure path so an
+  orphaned explicit batch can no longer re-arm at boot and abort
+  `AgentFramework.create()`.
+- Durable operator log: `<storePath>/operator-actions.jsonl` (config
+  `operatorLogPath`, `false` to disable) records who asked, from where, and
+  why for every operator mutation — rollback, suppress, hide, undo/redo turn,
+  unstick, nudge, runtime-settings update/reset/cancel — plus anything a host
+  records through `recordOperatorAction()` (e.g. quiesce/resume). Each record
+  is also broadcast as an `operator:action` trace; `getOperatorLog()` reads
+  the tail. `undoLastTurn`/`redo`/settings methods accept an optional
+  requester.
+
 ## 0.15.0 — 2026-09-17
 
 ### Added
