@@ -795,7 +795,14 @@ export class HistoryModule implements Module {
     // extract's/search's own ordering convention.
     const totalSpans = filtered.length;
     const truncated = totalSpans > limit;
-    const capped = truncated ? filtered.slice(-limit) : filtered;
+    // NOT `filtered.slice(-limit)`: `slice(-0)` is `slice(+0)` (negative
+    // zero coerces away), so `limit: 0` — a value clampCount explicitly
+    // accepts — would slice from index 0 and return the ENTIRE array while
+    // still reporting truncated:true. Same bug class already fixed twice
+    // elsewhere in this project (search's/extract's own limit:0 bugs);
+    // `filtered.length - limit` has no such cliff, at limit:0 it's
+    // `slice(filtered.length)` -> `[]`, the honest answer.
+    const capped = truncated ? filtered.slice(filtered.length - limit) : filtered;
 
     return {
       success: true,

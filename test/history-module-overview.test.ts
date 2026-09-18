@@ -534,6 +534,33 @@ describe('HistoryModule.overview', () => {
     assert.equal(data.entries[1]!.content, 'chapter 4');
   });
 
+  it('limit:0 returns zero entries, not the whole list (slice(-0) negative-zero regression)', async () => {
+    // clampCount explicitly accepts 0 as a valid non-negative integer — the
+    // same class of bug search/extract already had fixed once: `slice(-0)`
+    // coerces to `slice(0)` (the WHOLE array) rather than "nothing", so a
+    // naive `filtered.slice(-limit)` cap silently reports truncated:true
+    // while returning everything.
+    const summaries = Array.from({ length: 5 }, (_, i) =>
+      summary(`s${i}`, 1, 1000 + i * 10_000, 1000 + i * 10_000 + 100, `chapter ${i}`),
+    );
+    const { cm } = buildStub({ summaries, messages: [] });
+    const h = new HistoryModule();
+    h.bind(cm);
+
+    const result = await h.handleToolCall(
+      call('overview', {
+        from: new Date(0).toISOString(),
+        to: new Date(1000 + 4 * 10_000 + 100).toISOString(),
+        limit: 0,
+      }),
+    );
+    assert.equal(result.success, true, result.error);
+    const data = result.data as { entries: OverviewEntry[]; truncated: boolean; totalSpans: number };
+    assert.equal(data.entries.length, 0);
+    assert.equal(data.totalSpans, 5);
+    assert.equal(data.truncated, true);
+  });
+
   it('caps at the DEFAULT limit (50) when more entries exist than that, with no explicit limit param (no-cap finding)', async () => {
     const summaries = Array.from({ length: 55 }, (_, i) =>
       summary(`s${i}`, 1, i * 10_000, i * 10_000 + 100, `chapter ${i}`),
