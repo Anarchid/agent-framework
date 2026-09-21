@@ -21,6 +21,7 @@ import type {
   FrameworkConfig,
   InferencePolicy,
   ErrorPolicy,
+  ProviderHoldHook,
   ErrorAction,
   FrameworkState,
   TraceEvent,
@@ -744,6 +745,9 @@ interface ProviderAccelerationCooldown {
   heldRequests: InferenceRequest[];
   reason: string;
   failures: number;
+  /** Set on a host-requested hold (config.providerHold): the error to
+   *  re-present to the hook when this slice expires. */
+  hostHoldError?: Error;
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -948,6 +952,7 @@ export class AgentFramework {
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
@@ -1452,6 +1457,7 @@ export class AgentFramework {
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
       new OperatorLog(operatorLogPath),
     );
+    framework.providerHoldHook = config.providerHold;
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -1941,26 +1947,59 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId;
   }
+  private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
+    if (!this.providerHoldHook) return undefined;
+    try {
+      const hold = this.providerHoldHook(error, agentName);
+      if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
+        reason: hold.reason ?? error.message };
+    } catch (err) {
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      return undefined;
+    }
+  }
+  /** A host hold whose slice expired: ask the host again before spending an
+   *  inference on it. True = extended in place (held requests stay held). */
+  private extendHostProviderHold(agentName: string, cooldown: ProviderAccelerationCooldown): boolean {
+    if (!cooldown.hostHoldError) return false;
+    const hold = this.consultProviderHold(cooldown.hostHoldError, agentName);
+    if (!hold) return false;
+    clearTimeout(cooldown.timer);
+    cooldown.until = Date.now() + hold.holdMs;
+    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), hold.holdMs);
+    cooldown.timer.unref?.();
+    if (hold.reason !== cooldown.reason) {
+      cooldown.reason = hold.reason;
+      console.error(`[provider-cooldown] agent=${agentName} host hold extended — ${hold.reason}`);
+    }
+    return true;
+  }
   private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest): boolean {
-    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name) || !isOrganizationAccelerationRateLimit(error)) return false;
-    const now = Date.now(); const delayMs = this.accelerationCooldownMs(agent.name, error);
+    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    const acceleration = isOrganizationAccelerationRateLimit(error);
+    const hostHold = acceleration ? undefined : this.consultProviderHold(error, agent.name);
+    if (!acceleration && !hostHold) return false;
+    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: error.message,
-      failures: (existing?.failures ?? 0) + 1 });
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}) });
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
       failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
-    console.error(`[provider-cooldown] agent=${agent.name} organization acceleration 429 — ` +
+    console.error(`[provider-cooldown] agent=${agent.name} ` +
+      `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
@@ -7322,7 +7361,7 @@ export class AgentFramework {
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
-        if (now < providerCooldown.until) {
+        if (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown)) {
           for (const req of requests) {
             if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
               providerCooldown.heldRequests.push(req);
