@@ -76,7 +76,14 @@ export interface ProviderHold {
   /** Operator-facing explanation, logged with the hold. */
   reason?: string;
 }
-export type ProviderHoldHook = (error: Error, agentName: string) => ProviderHold | undefined;
+/** What the framework knows about the failing call. */
+export interface ProviderHoldContext {
+  /** Model of the agent whose call failed — a quota window may be model-scoped. */
+  model?: string;
+}
+export type ProviderHoldHook = (
+  error: Error, agentName: string, context: ProviderHoldContext,
+) => ProviderHold | undefined;
 
 export interface FrameworkConfig {
   /**
@@ -160,7 +167,11 @@ export interface FrameworkConfig {
 
   /**
    * Host verdict on a failed inference: "this cannot succeed until later".
-   * Consulted before the error policy. A hold parks the agent's provider
+   * Consulted before the error policy and before the built-in
+   * organization-acceleration classification, for a persistent agent's
+   * primary inference and for its auxiliary (compression) calls. Ephemeral
+   * runs (subagents) and conversation forks are NOT covered: they have no
+   * provider-admission gate and keep the ordinary error policy. A hold parks the agent's provider
    * admission (primary and auxiliary) instead of retrying, and — like the
    * built-in organization-acceleration cooldown — records no failed turn and
    * does not feed the hard-down streak. The motivating case is a subscription

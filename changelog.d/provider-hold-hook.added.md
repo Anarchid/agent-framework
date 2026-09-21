@@ -7,3 +7,8 @@
   when a slice expires the hook is asked again before any inference is
   attempted, so a long wait (a spent subscription quota window) costs no
   provider calls and an early reset is noticed within one slice.
+  The hook is asked before the built-in acceleration classification, and
+  receives `{ model }` for the failing agent. A failure in an auxiliary
+  (compression) call arms the hold too, and such a hold releases without
+  synthesising an inference. Ephemeral runs and conversation forks are not
+  covered. `healthSnapshot()` reports `cooldownReason` and `hostHold`.

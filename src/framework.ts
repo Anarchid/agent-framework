@@ -748,6 +748,9 @@ interface ProviderAccelerationCooldown {
   /** Set on a host-requested hold (config.providerHold): the error to
    *  re-present to the hook when this slice expires. */
   hostHoldError?: Error;
+  /** Armed by an auxiliary (compression) failure with no primary involved:
+   *  release reopens auxiliary admission without synthesising an inference. */
+  auxiliaryOrigin?: boolean;
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -1921,6 +1924,14 @@ export class AgentFramework {
     }
     gate.auxiliaryInFlight++;
     try { return await run(); }
+    catch (error) {
+      // Compression can be the first call to find a spent quota (idle agent,
+      // scheduled maintenance). Arm the host hold so later passes wait at the
+      // gate instead of retrying into it; this pass still fails to its caller.
+      const agent = this.agents.get(agentName);
+      if (agent && error instanceof Error) this.holdProviderAcceleration(agent, error, undefined, true);
+      throw error;
+    }
     finally {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
@@ -1950,10 +1961,10 @@ export class AgentFramework {
   private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
     if (!this.providerHoldHook) return undefined;
     try {
-      const hold = this.providerHoldHook(error, agentName);
+      const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
       if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
-        reason: hold.reason ?? error.message };
+        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
     } catch (err) {
       console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
       return undefined;
@@ -1975,10 +1986,13 @@ export class AgentFramework {
     }
     return true;
   }
-  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest): boolean {
+  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
     if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
-    const acceleration = isOrganizationAccelerationRateLimit(error);
-    const hostHold = acceleration ? undefined : this.consultProviderHold(error, agent.name);
+    // The host knows more than the message wording does: ask it first. An
+    // auxiliary failure arms host holds only — the built-in acceleration
+    // cooldown stays a primary-path mechanism.
+    const hostHold = this.consultProviderHold(error, agent.name);
+    const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
     if (!acceleration && !hostHold) return false;
     const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const existing = this.providerAccelerationCooldowns.get(agent.name);
@@ -1988,7 +2002,13 @@ export class AgentFramework {
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
       until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
-      failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}) });
+      failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
+    if (auxiliary && !existing) {
+      console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
+        `holding primary/auxiliary for ${delayMs}ms`);
+      return true;
+    }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
       failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
@@ -2001,6 +2021,12 @@ export class AgentFramework {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
     if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
+      // Nobody asked for an inference while parked: just reopen the gate.
+      console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
+      this.flushAuxiliaryAdmission(agentName);
+      return;
+    }
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
@@ -11388,6 +11414,8 @@ export class AgentFramework {
             auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
             auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
             cooldownUntil: cooldown?.until ?? null,
+            cooldownReason: cooldown?.reason ?? null,
+            hostHold: cooldown?.hostHoldError !== undefined,
             heldRequests: cooldown?.heldRequests.length ?? 0,
             lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
           };
