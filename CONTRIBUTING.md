@@ -66,10 +66,13 @@ the house default; plain descriptive titles are accepted.
   additions plus deletions pass 400 lines, unless it carries `no-greptile`,
   and the review starts when the label lands: within about half an hour of
   the PR opening, passing 400 lines or being marked ready, and later when
-  GitHub's scheduler is busy. A smaller PR gets a Greptile review if a
-  maintainer adds the label. `no-greptile` skips the review. Removing
-  `greptile` from a PR past 400 lines doesn't skip it, since the next run
-  adds the label back.
+  GitHub's scheduler is busy. A PR updated in the two minutes before a run
+  waits for a later one. A smaller PR gets a Greptile review if a maintainer
+  adds the label a minute or more after it's opened, reopened or marked
+  ready. A label added seven seconds after opening has twice started no
+  review, and Greptile's reference counts reopening and marking ready as
+  openings too. `no-greptile` skips the review. Removing `greptile` from a PR
+  past 400 lines doesn't skip it, since a later run adds the label back.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
@@ -116,9 +119,9 @@ never do.
   silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without adding a fragment (or editing
-  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
-  label is applied.
+  enforces it softly: touching `src/` fails the `changelog` check unless the
+  PR adds a fragment, edits a pending one or edits `CHANGELOG.md`, or carries
+  the `no-changelog` label.
 - **What needs an entry:** anything a module developer, host, or downstream
   consumer would notice — behavior, event/trace surfaces, tool namespacing,
   config schema, agent state machine, public exports, defaults. Internal
@@ -146,15 +149,18 @@ never do.
   `Unreleased` above, and refuses to release when there is nothing to
   release; npm then commits and tags. `git push --follow-tags` triggers CI,
   which refuses a tag with no matching changelog section, checks in a job
-  of its own that the packed release installs on its own
-  (`node scripts/pack-installs-alone.mjs` packs it, installs the tarball
-  alone into an empty directory with its dependencies from npm, nested so
-  the package reaches only its own, and checks the installed package, as
-  the script's header lists; to run it by hand, `npm run build` first, for
-  example before `git push --follow-tags`, or dispatch the workflow on a
-  branch, where it publishes nothing), publishes
+  of its own that the packed release installs on its own, publishes
   `@animalabs/agent-framework` to npm once that check has passed, and
-  creates the GitHub release with that section as its notes. The two
+  creates the GitHub release with that section as its notes, cut at an
+  entry's start, with a link to the whole section, when it's longer than
+  120,000 characters, under GitHub's limit of 125,000. The check,
+  `node scripts/pack-installs-alone.mjs`, packs the release and installs
+  the tarball alone into an empty directory with its dependencies from
+  npm. The install is linked, so each package reaches only the
+  dependencies it declares. It then checks the installed package, as the
+  script's header lists. To run it by hand, run `npm run build` first,
+  for example before `git push --follow-tags`, or dispatch the workflow on
+  a branch, where it publishes nothing. The two
   release jobs are independent: some consumers run github-clone checkouts,
   so release notes must exist even when npm publish fails. Both need the
   build job, so a failed build stops both; past it, so do a tag with no
@@ -201,13 +207,18 @@ never do.
 ```bash
 npm install
 npm run build         # tsc; tests run from dist/, so build first
-npm test              # node --test dist/test/*.test.js
+npm test              # node --test --test-force-exit --test-timeout=600000 dist/test/*.test.js, with test/helpers/force-exit-blocking-stdout loaded first
 npx tsc --noEmit      # typecheck
 ```
 
 `npm test` runs the compiled output, so a stale `dist/` will happily test
 code you no longer have — always build before testing, and after switching
 branches. The `pretest` hook copies `test/fixtures/*.mjs` into `dist/`.
+
+`--test-timeout=600000` bounds each test file as a whole under Node 20,
+and each test under Node 24, at ten minutes; the slowest file,
+`mcpl-runtime-lifecycle`, takes about three. Each job in `ci.yml` also has
+a `timeout-minutes` limit, which ends a hang the test timeout doesn't reach.
 
 Push-time CI (`ci.yml`) builds, typechecks and tests every push and PR on
 ubuntu and macos. Lockfiles are deliberately gitignored in this repo, so CI

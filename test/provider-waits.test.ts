@@ -17,7 +17,8 @@ import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { AgentFramework, ApiServer, ProviderWaitNotSleptError } from '../src/index.js';
 import { ProviderWaits, waitDeadline, PROVIDER_WAIT_RECORD_TYPE } from '../src/provider-waits.js';
-import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { HeldStream, MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { forkAgentName } from '../src/mcpl/conversation-router.js';
 
 function withStoreDir<T>(fn: (path: string) => Promise<T> | T): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), 'provider-waits-'));
@@ -917,7 +918,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
   await withStoreDir(async (path) => {
     const log = silence();
     const { fw } = await framework(path, new WaitingMembrane(0, undefined));
-    const stepping = fw as unknown as { waitForRetry(ms: number): Promise<void> };
+    const stepping = fw as unknown as { waitForRetry(ms: number, checkWindow: { abandoned: boolean }): Promise<void> };
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const mocked = globalThis.setTimeout;
     const delays: number[] = [];
@@ -927,7 +928,7 @@ test('a retry wait past one timer waits in steps of at most one timer, and only 
     }) as unknown as typeof setTimeout;
     try {
       let done = false;
-      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000).then(() => { done = true; });
+      const waiting = stepping.waitForRetry(ONE_TIMER_MS + 1_000, { abandoned: false }).then(() => { done = true; });
       t.mock.timers.tick(ONE_TIMER_MS);
       for (let i = 0; i < 20; i++) await Promise.resolve();
       assert.equal(done, false, "still waiting after one timer's worth");
@@ -1857,6 +1858,62 @@ for (const who of ['resident', 'conversation agent'] as const) {
   });
 }
 
+test('a budget restart held at the last boundary is inferring at the event gate again when it runs after the wait', async (t) => {
+  await withStoreDir(async (path) => {
+    const clock = holdClock(t);
+    // Shorter than the retry's 1 s sleep, as in the tests above: the held
+    // clock keeps it binding when the retry wakes, however late that is.
+    const wait = 400;
+    const log = silence();
+    // The restart's stream fails to start, with no stated wait, so the error
+    // policy retries it after 1 s. A wait recorded while it sleeps holds the
+    // retry at the last boundary, which ends its turn at the gate. Once the
+    // wait has passed, the hold queues the restart again, and it runs as a
+    // turn that resumes: like any turn that runs, it is inferring at the gate,
+    // so the gate buffers debounced batches until it ends instead of
+    // delivering them meanwhile. Its stream is held open to read that.
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    class FailsThenHeld extends FailingAt {
+      override streamYielding(request: NormalizedRequest): YieldingStream {
+        if (this.primary === 0) return super.streamYielding(request);
+        this.calls.push(request);
+        this.primary++;
+        return new HeldStream(released, [createMockResponse([{ type: 'text', text: 'zz-resumed' }])]);
+      }
+    }
+    const membrane = new FailsThenHeld(1, 'setup', () => new MembraneError({
+      type: 'server', retryable: true, httpStatus: 500,
+      message: 'zz overloaded, no hint', rawError: { status: 500 },
+    }));
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      gate: { config: { policies: [], default: 'skip' } },
+    });
+    const internal = fw as unknown as NonOwning & { eventGate: { inferenceDiagnostics(): { inferring: string[] } } };
+    try {
+      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-first' }]);
+      internal.pendingRequests.push({ agentName: 'resident', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now() });
+      await waitFor(fw, () => internal.retryWaitWakers.size > 0, 'the restart asleep before its retry');
+      internal.providerWaits.set('resident', 'zz-model', wait, 'zz recorded while the restart slept');
+      await waitFor(fw, () => membrane.primary >= 2 || internal.providerAccelerationCooldowns.has('resident'),
+        'the retry, sent or held');
+      assert.equal(membrane.primary, 1, 'the retry is held, not sent');
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, [], 'the hold ends the turn at the gate');
+
+      // The wait passes, and the hold's timer, a real one, queues the restart.
+      clock.pass(wait);
+      await waitFor(fw, () => membrane.primary >= 2, 'the restart after the wait');
+      assert.deepEqual(internal.eventGate.inferenceDiagnostics().inferring, ['resident'], 'the restart is inferring while it runs');
+      release();
+      await waitFor(fw, () => internal.eventGate.inferenceDiagnostics().inferring.length === 0, 'the restart to end');
+      assert.equal(membrane.primary, 2, 'one call after the wait');
+    } finally { release(); await fw.stop(); log.restore(); }
+  });
+});
+
 /** A direct message on an MCPL channel: with conversation routing, it spawns
  *  a conversation agent (a fork of the template) for its channel. */
 function directMessage(channelId: string, text: string): ProcessEvent {
@@ -1888,7 +1945,7 @@ test("a conversation agent's compression is refused by its own recorded wait, an
     try {
       fw.pushEvent(directMessage('zz:D1', 'zz-hello'));
       await fw.runUntilIdle();
-      const fork = 'conversation-zz-D1-g1';
+      const fork = forkAgentName('conversation', 'zz-server', 'zz:D1', 1);
       const agent = fw.getAgent(fork);
       assert.ok(agent, 'the direct message spawned a conversation agent');
       const compression = (agent.getContextManager() as unknown as {
@@ -2075,6 +2132,32 @@ test("a conversation agent's turn is held, sending nothing, when its own wait is
       clock.pass(wait);
       await waitFor(fw, () => membrane.sent >= 1, 'the held turn after the wait');
       assert.equal(membrane.sent, 1, 'it is sent once, after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a stop made while that hold is reported finds nothing to stop: abortInference() from a listener of its inference:failed reports false", async (t) => {
+  await withStoreDir(async (path) => {
+    holdClock(t);
+    const log = silence();
+    let record: (() => void) | undefined;
+    const membrane = new WaitDuringCompile(() => { record?.(); record = undefined; });
+    const { fw, internal } = await framework(path, membrane);
+    record = () => internal.providerWaits.set('resident', 'zz-model', 400, 'zz recorded while the turn compiled');
+    // The compiled stream is cancelled, and the start's window closed, before
+    // the hold is reported: a host's listener of that report finds no turn
+    // it could stop, rather than a stop it takes and the hold then loses.
+    let taken: boolean | undefined;
+    fw.onTrace((event) => {
+      if (event.type === 'inference:failed' && (event as { agentName?: string }).agentName === 'resident' && taken === undefined) {
+        taken = fw.abortInference('resident', 'user');
+      }
+    });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      assert.equal(taken, false, 'abortInference took no stop');
+      assert.equal(membrane.sent, 0, 'nothing is sent into the wait');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.heldRequests.length, 1, 'the hold has the turn');
     } finally { await fw.stop(); log.restore(); }
   });
 });
