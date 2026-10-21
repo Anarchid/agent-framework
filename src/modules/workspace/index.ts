@@ -6004,9 +6004,6 @@ function globToRegex(pattern: string): RegExp {
   let regex = '';
   let i = 0;
   while (i < pattern.length) {
-    // Whether the part that starts here starts a path segment (see
-    // globPartToRegex).
-    const atSegmentStart = i === 0 || pattern[i - 1] === '/';
     if (pattern[i] === '{') {
       // A brace form this can't read is refused. A `{` that never closes, read
       // as a literal, would almost always answer with no matches, and with it
@@ -6032,7 +6029,7 @@ function globToRegex(pattern: string): RegExp {
         throw new Error(braceRefusal(pattern, 'has a "{" group with no ","; a group needs two or more alternatives, separated by ","'));
       }
       const alternatives = group.split(',');
-      regex += '(?:' + alternatives.map(a => globPartToRegex(a, atSegmentStart)).join('|') + ')';
+      regex += '(?:' + alternatives.map(globPartToRegex).join('|') + ')';
       i = closeIdx + 1;
       continue;
     }
@@ -6043,7 +6040,7 @@ function globToRegex(pattern: string): RegExp {
       i++;
     }
     if (chunk) {
-      regex += globPartToRegex(chunk, atSegmentStart);
+      regex += globPartToRegex(chunk);
     }
   }
   return new RegExp(`^${regex}$`);
@@ -6106,10 +6103,14 @@ function braceRefusal(pattern: string, problem: string): string {
 // any other `**` matches any run of characters.
 const GLOB_TOKENS: Record<string, string> = { '**/': '(?:.*/)?', '**': '.*', '*': '[^/]*', '?': '[^/]' };
 
-// One part of a pattern, between brace groups or inside one. A part that
-// doesn't start a path segment, such as one right after a brace group, reads
-// a `**/` at its start as any run of characters and then a directory.
-function globPartToRegex(part: string, atSegmentStart: boolean): string {
+// One part of a pattern, between brace groups or inside one. Whether a `**/`
+// at its start starts a path segment depends on what comes before it in the
+// path, which after a brace group is whichever alternative matched: so it
+// reads as GLOB_TOKENS' `**/` where the path so far is empty or ends with a
+// `/`, as in `{src/,lib/}**/`, and otherwise as any run of characters and
+// then a directory, as in `draft{s,ing}**/`.
+const PART_START_GLOBSTAR = '(?:(?<=^|/)(?:.*/)?|(?<!^|/).*/)';
+function globPartToRegex(part: string): string {
   return part.replace(/(?<=^|\/)\*\*\/|\*\*|[*?]|[.+^$()|[\]\\]/g, (m, offset: number) =>
-    m === '**/' && offset === 0 && !atSegmentStart ? '.*/' : GLOB_TOKENS[m] ?? `\\${m}`);
+    m === '**/' && offset === 0 ? PART_START_GLOBSTAR : GLOB_TOKENS[m] ?? `\\${m}`);
 }

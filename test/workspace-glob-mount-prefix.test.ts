@@ -99,10 +99,36 @@ test('a `**/` matches zero or more directories, in a relative or a mount-prefixe
   assert.deepEqual(await grepFiles({ pattern: 'export', glob: 'project/src/**/*.ts' }), sources);
 });
 
-test('a `**/` right after a brace group still needs a directory there', async (t) => {
+test("a `**/` right after a brace group needs a directory there where the alternative before it doesn't end one", async (t) => {
   // Not the start of a path segment, so the `**` is any run of characters.
   const { glob } = setup(t, { 'notes/drafts.md': 'drafts', 'notes/drafts/one.md': 'one' });
   assert.deepEqual(await glob({ pattern: 'notes/draft{s,ing}**/*.md' }), ['notes/drafts/one.md']);
+});
+
+test('after a brace group, a `**/` matches zero or more directories after an alternative that ends one', async (t) => {
+  const { glob } = setup(t, { 'notes/draft.md': 'draft', 'notes/drafts/one.md': 'one', 'notes/ac.md': 'ac', 'notes/ab/c.md': 'abc', 'notes/ax/c.md': 'axc' });
+  const sources = ['project/src/lib/util.ts', 'project/src/main.ts'];
+  assert.deepEqual(await glob({ pattern: 'project/{src/,docs/}**/*.ts' }), sources);
+  assert.deepEqual(await glob({ pattern: 'project/{src,docs}/**/*.ts' }), sources);
+  // Beside an alternative that doesn't end one, which still needs a directory.
+  assert.deepEqual(await glob({ pattern: 'notes/{diary/,draft}**/*.md' }), ['notes/diary/2026-10-12.md', 'notes/diary/2026-10-13.md', 'notes/drafts/one.md']);
+  // An empty alternative ends a directory only where the group starts one.
+  assert.deepEqual(await glob({ pattern: 'project/src/{,lib/}**/*.ts' }), sources);
+  assert.deepEqual(await glob({ pattern: 'notes/a{,b/}**/c.md' }), ['notes/ab/c.md', 'notes/ax/c.md']);
+});
+
+test("a `**/` that starts a brace alternative reads as the alternative's place in the path does", async (t) => {
+  const { glob } = setup(t, { 'notes/ac.md': 'ac', 'notes/ax/c.md': 'axc' });
+  // At a segment's start: zero or more directories.
+  assert.deepEqual(await glob({ pattern: 'project/src/{**/,lib/}*.ts' }), ['project/src/lib/util.ts', 'project/src/main.ts']);
+  // Not at a segment's start: any run of characters, then a directory.
+  assert.deepEqual(await glob({ pattern: 'notes/a{**/,b/}c.md' }), ['notes/ax/c.md']);
+});
+
+test("a pattern's other characters match themselves", async (t) => {
+  const { glob } = setup(t, { 'project/src/a+b.ts': 'plus', 'project/src/aaab.ts': 'decoy', 'project/src/a.b(c).ts': 'dots', 'project/src/axbc-ts': 'decoy' });
+  assert.deepEqual(await glob({ pattern: 'project/src/a+b.ts' }), ['project/src/a+b.ts']);
+  assert.deepEqual(await glob({ pattern: 'project/src/a.b(c).ts' }), ['project/src/a.b(c).ts']);
 });
 
 test("grep's glob filter takes a mount-prefixed pattern", async (t) => {
